@@ -190,7 +190,7 @@ def main() -> None:
     args = parse_args()
     if args.num_steps < 1 or args.fps < 1 or args.width < 640 or args.height < 360:
         raise ValueError("num-steps/fps must be positive and video size must be at least 640x360")
-    if not args.checkpoint.is_file() or not args.episode.is_file():
+    if not args.checkpoint.is_file() or not args.episode.exists():
         raise FileNotFoundError("--checkpoint and --episode must both be existing files")
     import torch
     from scripts.serve_quest3_pi05_safety import Quest3JointSafetyPolicy
@@ -203,7 +203,9 @@ def main() -> None:
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("--device requests CUDA but PyTorch cannot access a CUDA device")
 
-    with np.load(args.episode, allow_pickle=False) as data:
+    from safety_module.shards import open_shard
+    policy = Quest3JointSafetyPolicy(args.checkpoint, device_name=device, num_steps=args.num_steps, tokenizer_model=None)
+    with open_shard(args.episode) as data:
         required = ("qpos", "sample_frame_indices", "current_link_points", "target_point_offsets", "target_point_mask", "rgb_front", "task_text")
         missing = [key for key in required if key not in data]
         if missing:
@@ -213,19 +215,24 @@ def main() -> None:
         current_points = np.asarray(data["current_link_points"], dtype=np.float32)
         target_offsets = np.asarray(data["target_point_offsets"], dtype=np.float32)
         target_mask = np.asarray(data["target_point_mask"], dtype=bool)
+        current_mask = np.ones(current_points.shape[:2], dtype=bool)
+        if policy.measured_surface:
+            current_points = np.asarray(data["visual_robot_current_points"], dtype=np.float32)
+            target_offsets = np.asarray(data["visual_robot_future_offsets"], dtype=np.float32)
+            target_mask = np.asarray(data["visual_robot_flow_supervision_mask"], dtype=bool)
+            current_mask = np.asarray(data["current_surface_mask"], dtype=bool)
         rgb_front = np.asarray(data["rgb_front"], dtype=np.uint8)
         task = str(np.asarray(data["task_text"]).item())
     K, camera_to_left_base = _recorded_intrinsics(args.front_calibration, width=rgb_front.shape[2], height=rgb_front.shape[1])
     contexts = _choose_indices(len(current_points), args.start, args.max_contexts)
-    policy = Quest3JointSafetyPolicy(args.checkpoint, device_name=device, num_steps=args.num_steps, tokenizer_model=None)
     shard_hash = ""
-    with np.load(args.episode, allow_pickle=False) as metadata_data:
+    with open_shard(args.episode) as metadata_data:
         shard_hash = str(np.asarray(metadata_data["surface_model_hash"]).item()) if "surface_model_hash" in metadata_data else ""
     checkpoint_hash = str(policy.info.get("surface_model_hash", ""))
     checkpoint_points = len(policy.point_indices)
     input_indices: np.ndarray | None = None
     compatibility_label = ""
-    if (shard_hash and checkpoint_hash and shard_hash != checkpoint_hash) or current_points.shape[1] != checkpoint_points:
+    if (shard_hash and checkpoint_hash and shard_hash != checkpoint_hash) or (not policy.measured_surface and current_points.shape[1] <= int(policy.point_indices.max(initial=-1))):
         if not args.allow_surface_layout_mismatch:
             raise ValueError(
                 "Checkpoint and shard use different robot-surface point identities. "
@@ -262,11 +269,18 @@ def main() -> None:
             else:
                 raise ValueError(f"Checkpoint expects {policy.joint_dim} qpos values but shard provides {qpos_input.shape[0]}")
         points_input = current_points[index] if input_indices is None else current_points[index][input_indices]
-        result = policy.infer({"prompt": task, "rgb_front": rgb_front[source_frame], "qpos": qpos_input, "robot_points": points_input})
-        selected = points_input[policy.point_indices]
+        valid_ids = np.flatnonzero(current_mask[index]) if policy.measured_surface else np.arange(len(points_input))
+        if policy.measured_surface:
+            if len(valid_ids) < checkpoint_points:
+                raise ValueError(f"Frame {index} has insufficient measured surface points for this checkpoint")
+            points_input = points_input[valid_ids]
+        result = policy.infer({"prompt": task, "rgb_front": rgb_front[source_frame], "qpos": qpos_input,
+                               "robot_points": points_input, "current_surface": points_input, "surface_source": "measured_depth_fk_gated"})
+        output_ids = np.asarray(result["selected_point_indices"], dtype=np.int64)
+        selected = points_input[output_ids]
         selected_current.append(selected)
         predicted.append(np.asarray(result["predicted_robot_points"], dtype=np.float32))
-        target_indices = policy.point_indices if input_indices is None else input_indices[policy.point_indices]
+        target_indices = valid_ids[output_ids] if policy.measured_surface else (output_ids if input_indices is None else input_indices[output_ids])
         target.append(selected[None] + target_offsets[index][:, target_indices])
         masks.append(target_mask[index][:, target_indices])
         predicted_actions.append(np.asarray(result["actions"], dtype=np.float32))

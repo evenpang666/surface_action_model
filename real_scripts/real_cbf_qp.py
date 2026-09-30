@@ -13,6 +13,15 @@ class OrientedBox:
     axes: np.ndarray  # [3,3], columns are box axes
     half_sizes: np.ndarray  # [3]
 
+    def __post_init__(self):
+        center, axes, half = map(np.asarray, (self.center, self.axes, self.half_sizes))
+        if center.shape != (3,) or axes.shape != (3, 3) or half.shape != (3,):
+            raise ValueError("Invalid OBB shapes")
+        if not all(np.isfinite(x).all() for x in (center, axes, half)) or np.any(half <= 0):
+            raise ValueError("OBB must be finite with positive half sizes")
+        if not np.allclose(axes.T @ axes, np.eye(3), atol=1e-4):
+            raise ValueError("OBB axes must be orthonormal")
+
 
 @dataclass(frozen=True)
 class PointFlowConstraint:
@@ -72,6 +81,68 @@ def _box_signed_distance(local: np.ndarray, half: np.ndarray) -> np.ndarray:
     return outside + inside
 
 
+def _box_gradient(local: np.ndarray, half: np.ndarray) -> np.ndarray:
+    """A signed-distance subgradient, including deterministic face ties."""
+    delta = np.abs(local) - half
+    outside = np.maximum(delta, 0)
+    signs = np.where(local >= 0, 1., -1.)
+    if np.linalg.norm(outside) > 1e-12:
+        return signs * outside / np.linalg.norm(outside)
+    result = np.zeros(3)
+    axis = int(np.argmax(delta))
+    result[axis] = signs[axis]
+    return result
+
+
+def segments_intersect_box(start, end, box, margin=0.):
+    """Exact slab test on point segments against an expanded OBB."""
+    first = (np.asarray(start) - box.center) @ box.axes
+    last = (np.asarray(end) - box.center) @ box.axes
+    direction = last - first
+    half = box.half_sizes + margin
+    parallel = np.abs(direction) < 1e-12
+    outside = np.any(parallel & (np.abs(first) > half), axis=-1)
+    divisor = np.where(parallel, 1., direction)
+    a, b = (-half - first) / divisor, (half - first) / divisor
+    lower = np.where(parallel, -np.inf, np.minimum(a, b)).max(axis=-1)
+    upper = np.where(parallel, np.inf, np.maximum(a, b)).min(axis=-1)
+    return ~outside & (np.maximum(lower, 0.) <= np.minimum(upper, 1.))
+
+
+def validate_fk_rollout(sampler, qpos, gripper_position, joint_chunk, boxes, *, point_indices,
+                        left_mask, collision_margin_m, inter_arm_margin_m, substeps=4, gripper_chunk=None):
+    """Reject a corrected chunk if its local FK point rollout still collides.
+
+    Segments are checked within each substep. This is a sampled point/rigid-link
+    validation, not a proof about unobserved surfaces or dynamic obstacles.
+    """
+    q = np.asarray(qpos, dtype=float).copy()
+    grip = np.asarray(gripper_position, dtype=float).copy()
+    previous = sampler.link_points(q, grip).reshape(-1, 3)[point_indices]
+    for horizon, delta in enumerate(np.asarray(joint_chunk)):
+        origin = q.copy()
+        origin_grip = grip.copy()
+        target_grip = origin_grip if gripper_chunk is None else np.asarray(gripper_chunk[horizon])
+        for step in range(1, substeps + 1):
+            q = origin + delta * step / substeps
+            grip = origin_grip + (target_grip - origin_grip) * step / substeps
+            current = sampler.link_points(q, grip).reshape(-1, 3)[point_indices]
+            if not np.isfinite(current).all():
+                return False
+            if any(segments_intersect_box(previous, current, box, collision_margin_m).any() for box in boxes):
+                return False
+            # Closest approach between every left/right point pair during this segment.
+            if np.any(left_mask) and np.any(~left_mask):
+                r0 = previous[left_mask, None] - previous[None, ~left_mask]
+                r1 = current[left_mask, None] - current[None, ~left_mask]
+                dr = r1 - r0
+                t = np.clip(-(r0 * dr).sum(-1) / np.maximum((dr * dr).sum(-1), 1e-15), 0, 1)
+                if np.any(np.linalg.norm(r0 + t[..., None] * dr, axis=-1) <= inter_arm_margin_m):
+                    return False
+            previous = current
+    return True
+
+
 def select_point_flow_constraints(
     current_link_points: np.ndarray,
     predicted_link_points: np.ndarray,
@@ -87,11 +158,14 @@ def select_point_flow_constraints(
         raise ValueError(f"Expected current (K,3) or (L,P,3), got {current_source.shape}")
     if predicted_source.shape[1:] != current_source.shape:
         raise ValueError(f"Prediction {predicted_source.shape} does not follow current shape {current_source.shape}")
+    if not predicted_source.size or not current_source.size or not all(np.isfinite(x).all() for x in (current_source, predicted_source)):
+        raise ValueError("Surface trajectories must be nonempty and finite")
+    if collision_margin_m < 0 or trigger_margin_m < 0 or max_constraints < 1:
+        raise ValueError("Invalid constraint selection limits")
     link_shape = current_source.shape[:-1]
     current = current_source.reshape(-1, 3)
     predicted = predicted_source.reshape(predicted_source.shape[0], -1, 3)
     constraints: list[PointFlowConstraint] = []
-    seen: set[tuple[int, int, int]] = set()
     for box_id, box in enumerate(boxes):
         center = np.asarray(box.center, dtype=np.float32).reshape(3)
         axes = np.asarray(box.axes, dtype=np.float32).reshape(3, 3)
@@ -100,16 +174,11 @@ def select_point_flow_constraints(
         predicted_local = (predicted - center) @ axes
         distances = _box_signed_distance(predicted_local, half)
         dangerous = distances <= float(trigger_margin_m)
-        for time_index, flat_point_id in np.argwhere(dangerous):
-            key = (0, int(flat_point_id), box_id)
-            if key in seen:
-                continue
-            seen.add(key)
+        for flat_point_id in np.flatnonzero(dangerous.any(axis=0)):
+            time_index = int(np.argmin(distances[:, flat_point_id]))
             local_current = current_local[flat_point_id]
             local_predicted = predicted_local[time_index, flat_point_id]
-            axis = int(np.argmax(np.maximum(np.abs(local_current) / np.maximum(half, 1e-6), np.abs(local_predicted) / np.maximum(half, 1e-6))))
-            sign = 1.0 if local_predicted[axis] >= 0.0 else -1.0
-            normal = sign * axes[:, axis]
+            normal = axes @ _box_gradient(local_current, half)
             current_h = float(_box_signed_distance(local_current[None], half)[0])
             predicted_h = float(distances[time_index, flat_point_id])
             if len(link_shape) == 2:
@@ -137,6 +206,8 @@ def select_inter_arm_constraints(
     left_mask = np.asarray(left_point_mask, dtype=bool).reshape(-1)
     if len(current) != len(left_mask) or predicted.shape[1:] != current.shape:
         raise ValueError("Inter-arm point arrays and left_point_mask do not align")
+    if not all(np.isfinite(x).all() for x in (current, predicted)):
+        raise ValueError("Inter-arm surface points must be finite")
     left_ids, right_ids = np.flatnonzero(left_mask), np.flatnonzero(~left_mask)
     if not len(left_ids) or not len(right_ids):
         return []
@@ -152,7 +223,7 @@ def select_inter_arm_constraints(
                 distance = float(np.linalg.norm(delta))
                 current_delta = current[first] - current[second]
                 current_distance = float(np.linalg.norm(current_delta))
-                normal = delta / max(distance, 1e-8)
+                normal = current_delta / max(current_distance, 1e-8)
                 item = PointPairFlowConstraint(
                     normal.astype(np.float32), current_distance - minimum_distance_m,
                     distance - minimum_distance_m, first, second, time_id,
@@ -181,6 +252,8 @@ def project_joint_delta_qp(
         raise ValueError("nominal and joint-delta bounds must have the same shape")
     if np.any(low > high):
         raise ValueError("joint-delta lower bounds exceed upper bounds")
+    if not all(np.isfinite(x).all() for x in (nominal, low, high, jacobian)) or not 0 < alpha <= 1:
+        raise ValueError("QP inputs must be finite; alpha must be in (0, 1]")
     delta = np.clip(nominal, low, high)
     if not constraints:
         return delta.astype(np.float32), {"triggered": False, "success": True, "constraint_count": 0, "max_violation": 0.0}
@@ -196,15 +269,19 @@ def project_joint_delta_qp(
             else:
                 point_jacobian = jacobian[item.link_id, item.point_id]
             grad = np.asarray(item.normal, dtype=np.float64) @ np.asarray(point_jacobian, dtype=np.float64)
-        if float(np.linalg.norm(grad)) <= 1e-10:
-            continue
         # h(q + dq) >= (1-alpha) h(q); predicted penetration makes this
         # conservative even before the current point reaches the box.
         barrier_h = min(float(item.current_h), float(item.predicted_h))
+        if not np.isfinite(barrier_h) or not np.isfinite(grad).all():
+            raise ValueError("Invalid barrier or gradient")
+        if float(np.linalg.norm(grad)) <= 1e-10:
+            if barrier_h < 0:
+                return np.zeros_like(nominal, dtype=np.float32), {"triggered": True, "success": False, "constraint_count": len(constraints), "max_violation": -barrier_h, "reason": "uncontrollable_barrier"}
+            continue
         rows.append(grad)
         rhs.append(-float(alpha) * barrier_h)
     if not rows:
-        return delta.astype(np.float32), {"triggered": True, "success": False, "constraint_count": len(constraints), "max_violation": float("inf")}
+        return delta.astype(np.float32), {"triggered": True, "success": True, "constraint_count": len(constraints), "max_violation": 0.0}
     matrix = np.stack(rows)
     rhs_array = np.asarray(rhs)
     from scipy.optimize import Bounds, LinearConstraint, minimize

@@ -1,5 +1,8 @@
 # 环境安装
 
+> 本文属于历史 Pika/Sci-VLA 工具。当前双臂 Surface Action Model 请使用
+> [仓库根环境说明](../../README.md#环境)，不要混用下面的版本与安装路径。
+
 服务端与机器人端使用独立 Python 环境：服务端运行 Sci-VLA/OpenPI 和 GPU 推理；机器人端只运行本项目、相机、Pika 与 `openpi-client`。
 
 ## pi0.5 服务端

@@ -19,6 +19,7 @@ import cv2
 import h5py
 import numpy as np
 import yaml
+from scipy.spatial import cKDTree
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -26,17 +27,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from real_scripts.real_robot_adapter import CameraCalibration, robot_depth_keep_mask  # noqa: E402
 from real_scripts.ur7e_collision_mesh import render_surface_points_depth  # noqa: E402
+from safety_module.shards import open_shard
 
 
-DEFAULT_COTRACKER_REPO = Path("/home/mypc/.cache/torch/hub/facebookresearch_co-tracker_main")
-DEFAULT_COTRACKER_CHECKPOINT = Path("/home/mypc/.cache/torch/hub/checkpoints/scaled_offline.pth")
+DEFAULT_COTRACKER_REPO = Path.home() / ".cache/torch/hub/facebookresearch_co-tracker_main"
+DEFAULT_COTRACKER_CHECKPOINT = Path.home() / ".cache/torch/hub/checkpoints/scaled_offline.pth"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episode", type=Path, required=True)
-    parser.add_argument("--mesh-surface-npz", type=Path, required=True, help="Canonical preprocess_quest3_hdf5.py shard; fixed_link_points are used only for FK depth gates, never emitted as observations.")
-    parser.add_argument("--calibration", type=Path, default=REPO_ROOT.parent / "quest3_collect" / "config" / "calibration" / "left_base_to_front_camera.yaml")
+    parser.add_argument("--geometry-shard", "--mesh-surface-npz", dest="mesh_surface_npz", type=Path, required=True, help="FK gate shard; mesh points are not emitted as measured observations.")
+    parser.add_argument("--calibration", type=Path, required=True, help="Calibration valid at the recording time; never infer from the current camera pose")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--visualization", type=Path, required=True)
     parser.add_argument("--preview", type=Path, required=True, help="Front RGB overview with measured CoTracker points only.")
@@ -46,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_COTRACKER_CHECKPOINT)
     parser.add_argument("--repo", type=Path, default=DEFAULT_COTRACKER_REPO)
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--absolute-depth-tolerance-m", type=float, default=.015)
     parser.add_argument("--relative-depth-tolerance", type=float, default=.015)
     parser.add_argument("--depth-dilation-pixels", type=int, default=3)
@@ -89,7 +92,6 @@ def _rendered_depth(points: np.ndarray, calibration: CameraCalibration, *, heigh
 def _seed_pixels(depth_m: np.ndarray, rendered_depth: np.ndarray, *, max_seeds: int, stride: int, absolute_tolerance_m: float, relative_tolerance: float, dilation_pixels: int) -> np.ndarray:
     environment = robot_depth_keep_mask(depth_m, rendered_depth, absolute_tolerance_m=absolute_tolerance_m, relative_tolerance=relative_tolerance, dilation_pixels=dilation_pixels)
     candidate = ~environment
-    candidate[::stride, ::stride] &= True
     grid = np.zeros_like(candidate, dtype=bool); grid[::stride, ::stride] = True
     v, u = np.nonzero(candidate & grid)
     if len(u) == 0:
@@ -98,17 +100,17 @@ def _seed_pixels(depth_m: np.ndarray, rendered_depth: np.ndarray, *, max_seeds: 
     return pixels if len(pixels) <= max_seeds else pixels[np.linspace(0, len(pixels) - 1, max_seeds, dtype=np.int64)]
 
 
-def _track_cotracker(video: np.ndarray, seeds_xy: np.ndarray, *, repo: Path, checkpoint: Path, chunk_size: int) -> tuple[np.ndarray, np.ndarray]:
+def _track_cotracker(video: np.ndarray, seeds_xy: np.ndarray, *, repo: Path, checkpoint: Path, chunk_size: int, device="cuda") -> tuple[np.ndarray, np.ndarray]:
     import torch
 
     if not repo.is_dir() or not checkpoint.is_file():
         raise FileNotFoundError("CoTracker repository or scaled_offline checkpoint is absent; this workflow intentionally does not fall back to synthetic mesh points")
-    if not torch.cuda.is_available():
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CoTracker observation extraction requires CUDA on this episode; CUDA is not available")
     model = torch.hub.load(str(repo), "cotracker3_offline", source="local", pretrained=False)
     state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model.model.load_state_dict(state_dict)
-    model = model.to("cuda").eval()
+    model = model.to(device).eval()
     tracked_parts: list[np.ndarray] = []
     visible_parts: list[np.ndarray] = []
     current_xy = np.asarray(seeds_xy, dtype=np.float32).copy()
@@ -116,8 +118,8 @@ def _track_cotracker(video: np.ndarray, seeds_xy: np.ndarray, *, repo: Path, che
     while start < len(video):
         end = min(start + int(chunk_size), len(video))
         query = np.concatenate((np.zeros((len(current_xy), 1), dtype=np.float32), current_xy), axis=1)[None]
-        video_tensor = torch.from_numpy(np.ascontiguousarray(video[start:end])).permute(0, 3, 1, 2).unsqueeze(0).float().to("cuda")
-        query_tensor = torch.from_numpy(query).to("cuda")
+        video_tensor = torch.from_numpy(np.ascontiguousarray(video[start:end])).permute(0, 3, 1, 2).unsqueeze(0).float().to(device)
+        query_tensor = torch.from_numpy(query).to(device)
         with torch.inference_mode():
             tracks, visibility = model(video_tensor, queries=query_tensor)
         local_xy = tracks[0].detach().cpu().numpy().astype(np.float32)
@@ -283,11 +285,14 @@ def main() -> None:
     args = parse_args()
     if args.max_seeds < 1 or args.seed_stride < 1 or args.chunk_size < 2 or not 0.0 < args.tracking_scale <= 1.0 or args.depth_unit_m <= 0.0:
         raise ValueError("invalid seed/tracker/depth arguments")
-    with np.load(args.mesh_surface_npz, allow_pickle=False) as mesh:
+    with open_shard(args.mesh_surface_npz) as mesh:
         mesh_points = np.asarray(mesh["fixed_link_points"], dtype=np.float32)
         mesh_qpos = np.asarray(mesh["qpos"], dtype=np.float32)
+        link_names = np.asarray(mesh["link_names"])
+        surface_arm_count = int(mesh["surface_arm_count"]) if "surface_arm_count" in mesh else int(mesh["arm_count"])
     with h5py.File(args.episode, "r") as source:
-        rgb = np.asarray(source["observations/images/front/rgb"], dtype=np.uint8)
+        from scripts.preprocess_quest3_hdf5 import _decode_rgb
+        rgb = _decode_rgb(source["observations/images/front/rgb"])
         timestamps_ns = np.asarray(source["timestamps_ns"], dtype=np.int64)
         depth0 = np.asarray(source["observations/images/front/depth"][0], dtype=np.float32) * args.depth_unit_m
     if len(rgb) != len(mesh_points) or len(mesh_qpos) != len(rgb):
@@ -297,9 +302,15 @@ def main() -> None:
     calibration = CameraCalibration("front", K, camera_to_world)
     initial_rendered = _rendered_depth(mesh_points[0], calibration, height=height, width=width, splat_pixels=args.render_splat_pixels)
     seeds = _seed_pixels(depth0, initial_rendered, max_seeds=args.max_seeds, stride=args.seed_stride, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance, dilation_pixels=args.depth_dilation_pixels)
+    seed_points, seed_valid = _lift_measured_tracks(depth0, initial_rendered, seeds, np.ones(len(seeds), bool), calibration, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance)
+    seeds, seed_points = seeds[seed_valid], seed_points[seed_valid]
+    _, nearest = cKDTree(mesh_points[0].reshape(-1, 3)).query(seed_points)
+    track_link_ids = nearest // mesh_points.shape[2]
+    if surface_arm_count == 2 and not all(any(str(link_names[link]).startswith(arm) for link in track_link_ids) for arm in ("left_", "right_")):
+        raise RuntimeError("Both arms must have measured seeds in the initial view; use a recording/calibration with visibility of both arms")
     scaled_size = (int(round(width * args.tracking_scale)), int(round(height * args.tracking_scale)))
     video = np.stack([cv2.resize(frame, scaled_size, interpolation=cv2.INTER_AREA) for frame in rgb]) if args.tracking_scale != 1.0 else rgb
-    tracks, tracker_visible = _track_cotracker(video, seeds * args.tracking_scale, repo=args.repo, checkpoint=args.checkpoint, chunk_size=args.chunk_size)
+    tracks, tracker_visible = _track_cotracker(video, seeds * args.tracking_scale, repo=args.repo, checkpoint=args.checkpoint, chunk_size=args.chunk_size, device=args.device)
     tracks /= args.tracking_scale
     observed = np.zeros((len(rgb), len(seeds), 3), dtype=np.float32); visible = np.zeros((len(rgb), len(seeds)), dtype=bool)
     with h5py.File(args.episode, "r") as source:
@@ -308,6 +319,11 @@ def main() -> None:
             depth_m = np.asarray(depth_dataset[index], dtype=np.float32) * args.depth_unit_m
             rendered = _rendered_depth(mesh_points[index], calibration, height=height, width=width, splat_pixels=args.render_splat_pixels)
             observed[index], visible[index] = _lift_measured_tracks(depth_m, rendered, tracks[index], tracker_visible[index], calibration, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance)
+            for link in np.unique(track_link_ids):
+                ids = np.flatnonzero((track_link_ids == link) & visible[index])
+                if len(ids):
+                    distance, _ = cKDTree(mesh_points[index, link]).query(observed[index, ids])
+                    visible[index, ids] &= distance <= .04
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output, source_episode=np.asarray(str(Path(args.episode).resolve())), coordinate_frame=np.asarray("left_base"), point_source=np.asarray("measured_d455_depth_lifted_cotracker_fk_gated"), mesh_points_emitted=np.asarray(False), tracks_xy=tracks.astype(np.float32), tracker_visible=tracker_visible.astype(bool), observed_points=observed, observed_visible=visible, seed_xy=seeds, timestamps_ns=timestamps_ns, intrinsics=K, camera_to_world=camera_to_world, depth_unit_m=np.asarray(args.depth_unit_m, dtype=np.float32), rendered_depth_tolerance_m=np.asarray(args.absolute_depth_tolerance_m, dtype=np.float32), rendered_depth_relative_tolerance=np.asarray(args.relative_depth_tolerance, dtype=np.float32), tracker=np.asarray("CoTracker3 offline scaled_offline"))
     _write_preview(args.preview, rgb, tracks, visible)

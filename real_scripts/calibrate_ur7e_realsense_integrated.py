@@ -33,8 +33,28 @@ from real_scripts.calibrate_d435i_to_ur_base import (  # noqa: E402
     camera_to_base_from_board_pose,
     rigid_transform_from_correspondences,
 )
-from real_scripts.ur7e_controller import ROBOT_IP, UR7eVectorController  # noqa: E402
 from real_scripts.ur7e_realsense_adapter import D435iCameraConfig, RealSenseD435iSource  # noqa: E402
+
+
+class ReadOnlyTCPProbe:
+    """Calibration must never create an RTDE control or gripper connection."""
+    def __init__(self, robot_ip):
+        self.robot_ip = robot_ip
+        self.receiver = None
+
+    def connect(self):
+        from rtde_receive import RTDEReceiveInterface
+        self.receiver = RTDEReceiveInterface(self.robot_ip)
+
+    def get_current_tcp_pose(self):
+        value = np.asarray(self.receiver.getActualTCPPose(), dtype=float)
+        if value.shape != (6,) or not np.isfinite(value).all():
+            raise ValueError("Invalid measured active TCP pose")
+        return value
+
+    def close(self):
+        if self.receiver is not None:
+            self.receiver.disconnect()
 
 
 @dataclass(frozen=True)
@@ -59,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serials", nargs="+", required=True, metavar="SERIAL", help="RealSense serial numbers to calibrate.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for all session artifacts.")
     parser.add_argument("--output", type=Path, default=None, help="Final UR-base calibration JSON (default: OUTPUT_DIR/camera_calibration.json).")
-    parser.add_argument("--robot-ip", default=ROBOT_IP, help="UR controller IP used only to read the configured TCP pose.")
+    parser.add_argument("--robot-ip", required=True, help="UR controller IP used only to read the configured TCP pose.")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
@@ -322,7 +342,7 @@ def _wait_for_valid_placement(
 
 
 def _probe_board_with_tcp(
-    controller: UR7eVectorController,
+    controller: ReadOnlyTCPProbe,
     probe_corners: Sequence[ProbeCorner],
     *, max_rms_m: float, max_retries: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -426,7 +446,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(output_dir / "camera_extrinsics_charuco_board.json", board_extrinsics)
     print("[done] all camera extrinsics were calculated in the ChArUco-board frame.")
 
-    controller = UR7eVectorController(robot_ip=args.robot_ip, strict_gripper_connection=False)
+    controller = ReadOnlyTCPProbe(robot_ip=args.robot_ip)
     controller.connect()
     try:
         board_points, base_points, probe_report = _probe_board_with_tcp(

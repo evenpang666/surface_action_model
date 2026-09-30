@@ -31,30 +31,53 @@ for path in (REPO_ROOT, OPENPI_CLIENT):
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler  # noqa: E402
 from real_scripts.real_cbf_qp import (  # noqa: E402
     OrientedBox, point_jacobian_fd, project_joint_delta_qp,
-    select_inter_arm_constraints, select_point_flow_constraints,
+    select_inter_arm_constraints, select_point_flow_constraints, validate_fk_rollout,
 )
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path  # noqa: E402
+from safety_module.runtime_contract import validate_prediction, validate_snapshot
+from safety_module.measured_surface import MeasuredSurfaceSampler, associate_surface
+from safety_module.command_watchdog import CommandWatchdog
 
 
 EXECUTE_ACK = "I_UNDERSTAND_DUAL_UR7E_WILL_MOVE"
+LEGACY_LEFT_ACTION_ONLY_ACK = "I_UNDERSTAND_LEGACY_LEFT_POLICY_HAS_NO_VALID_CBF"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--project-config", type=Path, default=DEFAULT_PROJECT_CONFIG)
-    parser.add_argument("--policy-host", default="127.0.0.1")
+    parser.add_argument("--policy-host", default=None)
     parser.add_argument("--policy-port", type=int, default=8000)
     parser.add_argument("--obstacle-url", default=None)
     parser.add_argument("--points-per-link", type=int, default=None)
-    parser.add_argument("--poll-hz", type=float, default=5.0)
+    parser.add_argument("--poll-hz", type=float, default=None, help="Default is the checkpoint action period")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--dry-run-stale-timeout-s", type=float, default=None,
+        help="Optional relaxed snapshot-age limit for non-executing diagnostics only; --execute always uses config safety.stale_timeout_s.",
+    )
+    parser.add_argument(
+        "--allow-legacy-left-only-dry-run",
+        action="store_true",
+        help="Validation only: adapt a legacy 6-state/7-action/8-points-per-link left-only checkpoint. "
+        "It pads the right action with zeros, omits right-arm CBF constraints, and is incompatible with --execute.",
+    )
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--execute-grippers", action="store_true", help="With --execute, command both 2F-85 grippers only after the surface rollout check")
+    parser.add_argument(
+        "--execute-left-arm-only", action="store_true",
+        help="With --execute, open an RTDE command channel only to the left UR7e and force all right-arm joint deltas to zero.",
+    )
+    parser.add_argument(
+        "--execute-legacy-left-action-only", action="store_true",
+        help="One-step, left-UR-only legacy-policy test without obstacle/inter-arm CBF. Requires the separate legacy acknowledgement.",
+    )
     parser.add_argument(
         "--execute-left-gripper",
         action="store_true",
-        help="With --execute, send the PI05 left 2F-85 target only when no point-flow CBF constraint is active. Right EPick is never commanded.",
+        help="With --execute, send the PI05 left 2F-85 target only when no point-flow CBF constraint is active. Right 2F-85 is never commanded.",
     )
     parser.add_argument("--left-gripper-speed", type=int, default=40)
     parser.add_argument("--left-gripper-force", type=int, default=25)
@@ -66,8 +89,11 @@ def parse_args() -> argparse.Namespace:
         default=REPO_ROOT.parent / "quest3_collect" / "config" / "calibration" / "left_base_to_front_camera.yaml",
         help="^left_baseT_front-camera calibration used by --video-output.",
     )
-    parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Allow provisional EPick FK in dry-run only.")
-    parser.add_argument("--execute-ack", default="", help=f"With --execute, must equal {EXECUTE_ACK!r}.")
+    parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Allow provisional 2F-85 FK in dry-run only.")
+    parser.add_argument(
+        "--execute-ack", default="",
+        help=f"With --execute, must equal {EXECUTE_ACK!r}; legacy action-only mode requires {LEGACY_LEFT_ACTION_ONLY_ACK!r}.",
+    )
     return parser.parse_args()
 
 
@@ -77,6 +103,7 @@ def _snapshot(url: str, timeout_s: float) -> dict:
         value = json.loads(response.read())
     if value.get("schema") != "dual_ur7e_obstacle_snapshot_v2" or value.get("coordinate_frame") != "left_base":
         raise ValueError("Obstacle endpoint does not expose the v2 left_base safety snapshot")
+    validate_snapshot(value, timeout_s)
     return value
 
 
@@ -100,14 +127,50 @@ def _qpos(snapshot: dict) -> np.ndarray:
 
 
 def _gripper(snapshot: dict) -> np.ndarray:
-    value = snapshot.get("gripper_position", {})
-    return np.asarray((value.get("left", 0.0), value.get("right", 0.0)), dtype=np.float32)
+    value = snapshot["gripper_position"]
+    result = np.asarray((value["left"], value["right"]), dtype=np.float32)
+    if not np.isfinite(result).all() or np.any(result < 0) or np.any(result > 1):
+        raise ValueError("Both measured gripper closing fractions must be in [0,1]")
+    return result
 
 
 def _joint_delta(action: np.ndarray) -> np.ndarray:
     if action.shape != (14,):
         raise ValueError(f"Dual-arm executor requires one 14-D action, got {action.shape}")
     return np.concatenate((action[:6], action[7:13])).astype(np.float32)
+
+
+def _validate_policy_metadata(
+    metadata: object, sampler: DualUR7eSurfacePointSampler, *, points_per_link: int, allow_legacy_left_only_dry_run: bool
+) -> bool:
+    """Fail before a live snapshot/request when a checkpoint is not deployable here."""
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Policy server did not provide checkpoint metadata during the WebSocket handshake")
+    joint_dim = metadata.get("joint_dim")
+    action_dim = metadata.get("logical_action_dim")
+    legacy_left_only = joint_dim == 6 and action_dim == 7 and metadata.get("points_per_link") == 8
+    if legacy_left_only and allow_legacy_left_only_dry_run:
+        return True
+    errors: list[str] = []
+    if joint_dim != 12:
+        errors.append(f"joint_dim={joint_dim!r} (dual UR7e executor requires 12)")
+    if action_dim != 14:
+        errors.append(f"logical_action_dim={action_dim!r} (dual UR7e executor requires 14: 6+gripper per arm)")
+    if metadata.get("points_per_link") != points_per_link:
+        errors.append(
+            f"points_per_link={metadata.get('points_per_link')!r} "
+            f"(executor is configured for {points_per_link})"
+        )
+    surface_hash = str(metadata.get("surface_model_hash", ""))
+    if surface_hash not in (sampler.model_hash(1), sampler.model_hash(2)):
+        errors.append("surface_model_hash does not match the current UR7e + 2F-85/2F-85 mesh sampler")
+    if errors:
+        raise RuntimeError(
+            "Incompatible policy checkpoint on the inference server: " + "; ".join(errors) + ". "
+            "Do not use a legacy 6-DOF/7-action/8-points-per-link checkpoint for this dual-arm cell. "
+            "Restart the server with a retrained 12-DOF, 14-action, 128-points-per-link checkpoint."
+        )
+    return False
 
 
 def _recorded_intrinsics(calibration_path: Path, *, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
@@ -171,6 +234,11 @@ class DualRTDECommander:
 
         self.controls = (RTDEControlInterface(left_ip), RTDEControlInterface(right_ip))
         self.period_s = float(period_s)
+        self.watchdog = CommandWatchdog(self.stop, max(.25, 2 * self.period_s))
+
+    def stop(self):
+        for control in self.controls:
+            control.servoStop(1.)
 
     def send(self, qpos: np.ndarray, safe_delta: np.ndarray) -> None:
         targets = (qpos[:6] + safe_delta[:6], qpos[6:] + safe_delta[6:])
@@ -179,17 +247,45 @@ class DualRTDECommander:
             control, target = pair
             return bool(control.servoJ(target.tolist(), 0.10, 0.30, self.period_s, 0.10, 300))
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(command, zip(self.controls, targets, strict=True)))
+        with self.watchdog.lock:
+            self.watchdog.renew()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(command, zip(self.controls, targets, strict=True)))
         if not all(results):
             raise RuntimeError("At least one UR controller rejected servoJ")
 
     def close(self) -> None:
+        self.watchdog.close()
         for control in self.controls:
             try:
                 control.servoStop(1.0)
             finally:
                 control.disconnect()
+
+
+class LeftRTDECommander:
+    """Explicit left-only servoJ writer; the right controller is never opened."""
+
+    def __init__(self, left_ip: str, period_s: float) -> None:
+        from rtde_control import RTDEControlInterface
+
+        self.control = RTDEControlInterface(left_ip)
+        self.period_s = float(period_s)
+        self.watchdog = CommandWatchdog(lambda: self.control.servoStop(1.), max(.25, 2 * self.period_s))
+
+    def send(self, qpos: np.ndarray, safe_delta: np.ndarray) -> None:
+        target = qpos[:6] + safe_delta[:6]
+        with self.watchdog.lock:
+            self.watchdog.renew()
+            if not bool(self.control.servoJ(target.tolist(), 0.10, 0.30, self.period_s, 0.10, 300)):
+                raise RuntimeError("Left UR controller rejected servoJ")
+
+    def close(self) -> None:
+        self.watchdog.close()
+        try:
+            self.control.servoStop(1.0)
+        finally:
+            self.control.disconnect()
 
 
 class LeftRobotiqCommander:
@@ -219,20 +315,55 @@ class LeftRobotiqCommander:
 def run(args: argparse.Namespace) -> None:
     config, config_path = load_project_config(args.project_config)
     safety = config["safety"]
+    if not safety.get("camera_calibration_valid", False):
+        raise RuntimeError("Front/side extrinsics are invalid. Complete and validate a new dual-view calibration before live inference.")
     points_per_link = int(args.points_per_link or config["preprocess"]["points_per_link"])
     obstacle_url = args.obstacle_url or str(safety["obstacle_url"])
-    period_s = 1.0 / float(args.poll_hz)
-    if args.execute and args.execute_ack != EXECUTE_ACK:
-        raise ValueError(f"Physical execution requires --execute-ack {EXECUTE_ACK}")
+    snapshot_age_limit_s = float(args.dry_run_stale_timeout_s or safety["stale_timeout_s"])
+    period_s = 1.0 / float(args.poll_hz or 5.)
+    required_ack = LEGACY_LEFT_ACTION_ONLY_ACK if args.execute_legacy_left_action_only else EXECUTE_ACK
+    if args.execute and args.execute_ack != required_ack:
+        raise ValueError(f"Physical execution requires --execute-ack {required_ack}")
     if args.execute_left_gripper and not args.execute:
         raise ValueError("--execute-left-gripper requires --execute")
+    if args.execute_grippers and not args.execute:
+        raise ValueError("--execute-grippers requires --execute")
+    if args.execute_left_arm_only and not args.execute:
+        raise ValueError("--execute-left-arm-only requires --execute")
+    if args.execute_legacy_left_action_only:
+        raise ValueError("Legacy action-only execution is disabled in the Surface Action safety runtime; legacy checkpoints are offline replay only")
     if args.video_fps is not None and args.video_fps <= 0:
         raise ValueError("--video-fps must be positive")
+    if args.dry_run_stale_timeout_s is not None and args.dry_run_stale_timeout_s <= 0:
+        raise ValueError("--dry-run-stale-timeout-s must be positive")
+    if args.execute and args.dry_run_stale_timeout_s is not None:
+        raise ValueError("--dry-run-stale-timeout-s is not permitted with --execute")
+    if args.execute and args.allow_legacy_left_only_dry_run and not args.execute_legacy_left_action_only:
+        raise ValueError("--allow-legacy-left-only-dry-run is intentionally incompatible with --execute")
     from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
-    policy = WebsocketClientPolicy(host=args.policy_host, port=args.policy_port)
+    policy = WebsocketClientPolicy(host=args.policy_host or safety.get("policy_host", "192.168.124.64"), port=args.policy_port, timeout_s=float(safety["stale_timeout_s"]))
     sampler = DualUR7eSurfacePointSampler(points_per_link=points_per_link, project_config=config_path)
-    if not sampler.tcp_transform_verified["right_arm"]:
+    legacy_left_only = _validate_policy_metadata(
+        policy.get_server_metadata(), sampler, points_per_link=points_per_link,
+        allow_legacy_left_only_dry_run=args.allow_legacy_left_only_dry_run,
+    )
+    legacy_sampler = DualUR7eSurfacePointSampler(points_per_link=8, project_config=config_path) if legacy_left_only else None
+    measured_surface = policy.get_server_metadata().get("point_target") == "visual"
+    trained_period = policy.get_server_metadata().get("action_period_s")
+    if trained_period is not None:
+        if args.poll_hz is not None and not np.isclose(period_s, float(trained_period), rtol=.05):
+            raise ValueError("Control period must match the checkpoint action period")
+        period_s = float(trained_period)
+    elif args.execute:
+        raise ValueError("Checkpoint lacks an action period; rebuild data and retrain before execution")
+    args.poll_hz = 1. / period_s
+    if args.execute and policy.get_server_metadata().get("model_type") != "SurfaceActionModelPytorch":
+        raise RuntimeError("Legacy regression checkpoints are replay-only; retrain SurfaceActionModelPytorch before execution")
+    if legacy_left_only:
+        mode = "legacy left action-only execute: obstacle/inter-arm CBF disabled" if args.execute_legacy_left_action_only else "legacy dry-run"
+        print(f"[{mode}] Using legacy left-only 6-state/7-action checkpoint; right action is fixed to zero and right-arm CBF is disabled.")
+    if not legacy_left_only and not sampler.tcp_transform_verified["right_arm"]:
         if args.execute or not args.allow_unverified_right_tcp:
             raise RuntimeError(
                 "Right flange-to-active-TCP is not verified; physical execution is blocked. "
@@ -240,6 +371,7 @@ def run(args: argparse.Namespace) -> None:
             )
     commander = None
     left_gripper_commander = None
+    right_gripper_commander = None
     video_writer: cv2.VideoWriter | None = None
     video_K: np.ndarray | None = None
     video_camera_to_left_base: np.ndarray | None = None
@@ -247,21 +379,29 @@ def run(args: argparse.Namespace) -> None:
         with resolve_repo_path(config["quest3"]["hardware_config"]).open(encoding="utf-8") as handle:
             import yaml
             hardware = yaml.safe_load(handle)
-        commander = DualRTDECommander(str(hardware["arms"]["left_arm"]["robot_ip"]), str(hardware["arms"]["right_arm"]["robot_ip"]), period_s)
-        if args.execute_left_gripper:
+        if args.execute_left_arm_only:
+            commander = LeftRTDECommander(str(hardware["arms"]["left_arm"]["robot_ip"]), period_s)
+            print("[execute] left-only UR servoJ enabled; no RTDE control channel is opened to the right UR.")
+        else:
+            commander = DualRTDECommander(str(hardware["arms"]["left_arm"]["robot_ip"]), str(hardware["arms"]["right_arm"]["robot_ip"]), period_s)
+        if args.execute_left_gripper or args.execute_grippers:
             left_gripper_commander = LeftRobotiqCommander(
                 str(hardware["arms"]["left_arm"]["robot_ip"]), speed=args.left_gripper_speed, force=args.left_gripper_force
             )
-            print("[execute] left 2F-85 output enabled; it is held whenever a point-flow CBF constraint is active. Right EPick remains disabled.")
+            if args.execute_grippers and not args.execute_left_arm_only:
+                right_gripper_commander = LeftRobotiqCommander(
+                    str(hardware["arms"]["right_arm"]["robot_ip"]), speed=args.left_gripper_speed, force=args.left_gripper_force
+                )
+            print("[execute] left 2F-85 output enabled; it is held whenever a point-flow CBF constraint is active. Both grippers are held while CBF constraints are active.")
         else:
             print("[execute] arm servoJ enabled; both gripper outputs remain disabled")
     last_frame = -1
     try:
         for step in range(args.max_steps):
             began = time.monotonic()
-            snap = _snapshot(obstacle_url, timeout_s=float(safety["stale_timeout_s"]))
+            snap = _snapshot(obstacle_url, timeout_s=snapshot_age_limit_s)
             age_s = (time.monotonic_ns() - int(snap["host_timestamp_ns"])) / 1e9
-            if age_s < -0.1 or age_s > float(safety["stale_timeout_s"]):
+            if age_s < -0.1 or age_s > snapshot_age_limit_s:
                 raise RuntimeError(f"Obstacle snapshot is stale or from another clock domain: age={age_s:.3f}s")
             if int(snap["frame"]) == last_frame:
                 time.sleep(max(0.0, period_s - (time.monotonic() - began)))
@@ -270,19 +410,47 @@ def run(args: argparse.Namespace) -> None:
             qpos, grip = _qpos(snap), _gripper(snap)
             full_points = sampler.link_points(qpos, grip).reshape(-1, 3)
             rgb = _rgb(snap)
-            result = policy.infer({"prompt": args.prompt, "rgb_front": rgb, "qpos": qpos, "robot_points": full_points})
+            # The old single-arm model was trained on a separate 8-points-per-link
+            # left mesh.  Feed it exactly that historical contract; passing the
+            # 12-DOF/current 128-points-per-link representation would silently
+            # scramble its point identities.
+            legacy_full_points = None
+            if legacy_left_only:
+                assert legacy_sampler is not None
+                legacy_full_points = legacy_sampler.link_points(qpos, grip).reshape(-1, 3)[: len(legacy_sampler.left_link_names) * 8]
+                request_qpos, request_points = qpos[:6], legacy_full_points
+            else:
+                request_qpos, request_points = qpos, full_points
+            if measured_surface:
+                request_points = np.asarray(snap["current_surface"], dtype=np.float32).reshape(-1, 3)
+                _, valid = associate_surface(request_points, sampler.link_points(qpos, grip))
+                request_points = request_points[valid]
+            result = policy.infer({"prompt": args.prompt, "rgb_front": rgb, "qpos": request_qpos,
+                                  "robot_points": request_points, "current_surface": request_points,
+                                  "surface_source": snap.get("surface_source")})
+            validate_snapshot(snap, snapshot_age_limit_s)
             actions = np.asarray(result["actions"], dtype=np.float32)
             prediction = np.asarray(result["predicted_robot_points"], dtype=np.float32)
-            selected = np.asarray(result["selected_point_indices"], dtype=np.int64)
+            selected = np.asarray(result["selected_point_indices"])
+            validate_prediction(actions, prediction, selected, action_dim=7 if legacy_left_only else 14,
+                                point_count=len(request_points), horizon=int(policy.get_server_metadata()["action_horizon"]))
             checkpoint_hash = str(result.get("surface_model_hash", ""))
-            left_only_flow = checkpoint_hash == sampler.model_hash(1)
-            if checkpoint_hash not in (sampler.model_hash(1), sampler.model_hash(2)):
+            left_only_flow = legacy_left_only or checkpoint_hash == sampler.model_hash(1)
+            if not legacy_left_only and checkpoint_hash not in (sampler.model_hash(1), sampler.model_hash(2)):
                 raise ValueError("Policy checkpoint surface mesh/hash differs from the live UR7e tool sampler")
-            if int(result.get("points_per_link", 0)) != points_per_link:
+            if not legacy_left_only and int(result.get("points_per_link", 0)) != points_per_link:
                 raise ValueError("Policy checkpoint points_per_link differs from the executor")
-            if actions.ndim != 2 or actions.shape[1] != 14 or prediction.ndim != 3 or prediction.shape[1:] != (len(selected), 3):
+            expected_action_dim = 7 if legacy_left_only else 14
+            if actions.ndim != 2 or actions.shape[1] != expected_action_dim or prediction.ndim != 3 or prediction.shape[1:] != (len(selected), 3):
                 raise ValueError(f"Policy contract mismatch: actions={actions.shape}, points={prediction.shape}")
-            current = full_points[selected]
+            if legacy_left_only:
+                assert legacy_full_points is not None
+                current = legacy_full_points[selected]
+                padded_actions = np.zeros((actions.shape[0], 14), dtype=np.float32)
+                padded_actions[:, :7] = actions
+                actions = padded_actions
+            else:
+                current = request_points[selected]
             # Left-only Quest3 episodes retain a 14-D action interface by
             # padding the inactive right arm, but supervise only left surface
             # flow.  Add a stationary right-arm geometry subset for safety;
@@ -290,24 +458,36 @@ def run(args: argparse.Namespace) -> None:
             # never move the unmodelled right arm.
             safety_current, safety_prediction, safety_indices = current, prediction, selected
             left_full_count = len(sampler.left_link_names) * points_per_link
-            if left_only_flow:
+            if left_only_flow and measured_surface:
+                raise ValueError("Live measured-surface control requires a genuinely dual-arm training checkpoint")
+            if left_only_flow and not legacy_left_only:
                 right_indices = np.linspace(left_full_count, len(full_points) - 1, min(len(selected), len(full_points) - left_full_count), dtype=np.int64)
                 right_current = full_points[right_indices]
                 safety_current = np.concatenate((current, right_current), axis=0)
                 safety_prediction = np.concatenate((prediction, np.broadcast_to(right_current, (prediction.shape[0], *right_current.shape))), axis=1)
                 safety_indices = np.concatenate((selected, right_indices))
             boxes = _boxes(snap)
-            obstacle_constraints = select_point_flow_constraints(safety_current, safety_prediction, boxes, collision_margin_m=float(safety["collision_margin_m"]), trigger_margin_m=float(safety["trigger_margin_m"]))
-            arm_constraints = select_inter_arm_constraints(safety_current, safety_prediction, safety_indices < left_full_count, minimum_distance_m=float(safety["inter_arm_margin_m"]), trigger_margin_m=float(safety["trigger_margin_m"]))
+            geometry_sampler = legacy_sampler if legacy_left_only else sampler
+            left_mask = safety_indices < left_full_count
+            if measured_surface:
+                geometry_sampler = MeasuredSurfaceSampler(sampler, qpos, grip, safety_current)
+                left_mask = geometry_sampler.link_ids < len(sampler.left_link_names)
+                safety_indices = np.arange(len(safety_current))
+            obstacle_constraints = [] if args.execute_legacy_left_action_only else select_point_flow_constraints(safety_current, safety_prediction, boxes, collision_margin_m=float(safety["collision_margin_m"]), trigger_margin_m=float(safety["trigger_margin_m"]))
+            arm_constraints = [] if legacy_left_only or args.execute_legacy_left_action_only else select_inter_arm_constraints(safety_current, safety_prediction, left_mask, minimum_distance_m=float(safety["inter_arm_margin_m"]), trigger_margin_m=float(safety["trigger_margin_m"]))
             constraints = [*obstacle_constraints, *arm_constraints]
             nominal = _joint_delta(actions[0])
-            if left_only_flow:
+            if left_only_flow or args.execute_left_arm_only:
                 nominal[6:] = 0.0
             limit = float(safety["max_joint_step_rad"])
+            gripper_chunk = np.broadcast_to(grip, (len(actions), 2)).copy()
+            if not constraints:
+                if left_gripper_commander is not None: gripper_chunk[:, 0] = np.clip(actions[:, 6], 0, 1)
+                if right_gripper_commander is not None: gripper_chunk[:, 1] = np.clip(actions[:, 13], 0, 1)
             if constraints:
-                jacobian = point_jacobian_fd(sampler, qpos, gripper_position=grip, point_indices=safety_indices)
+                jacobian = point_jacobian_fd(geometry_sampler, qpos, gripper_position=grip, point_indices=safety_indices)
                 lower, upper = np.full(12, -limit), np.full(12, limit)
-                if left_only_flow:
+                if left_only_flow or args.execute_left_arm_only:
                     lower[6:] = upper[6:] = 0.0
                 safe_delta, info = project_joint_delta_qp(nominal, jacobian, constraints, lower_delta=lower, upper_delta=upper, alpha=float(safety["cbf_alpha"]), iterations=int(safety["cbf_iterations"]))
             else:
@@ -315,6 +495,20 @@ def run(args: argparse.Namespace) -> None:
                 info = {"triggered": False, "success": True, "constraint_count": 0, "max_violation": 0.0}
             if not bool(info["success"]):
                 safe_delta = np.zeros(12, dtype=np.float32)
+                corrected_chunk = np.zeros((len(actions), 12), dtype=np.float32)
+            elif not args.execute_legacy_left_action_only:
+                corrected_chunk = np.stack([_joint_delta(action) for action in actions])
+                corrected_chunk[0] = safe_delta
+                if left_only_flow or args.execute_left_arm_only:
+                    corrected_chunk[:, 6:] = 0
+                if not validate_fk_rollout(geometry_sampler, qpos, grip, corrected_chunk, boxes,
+                                          point_indices=safety_indices, left_mask=left_mask,
+                                          gripper_chunk=gripper_chunk,
+                                          collision_margin_m=float(safety["collision_margin_m"]),
+                                          inter_arm_margin_m=float(safety["inter_arm_margin_m"])):
+                    safe_delta = np.zeros(12, dtype=np.float32)
+                    corrected_chunk = np.zeros((len(actions), 12), dtype=np.float32)
+                    info.update(success=False, reason="corrected_fk_rollout_collision")
             if args.video_output is not None:
                 if video_writer is None:
                     K, camera_to_left_base = _recorded_intrinsics(args.front_calibration, width=rgb.shape[1], height=rgb.shape[0])
@@ -327,21 +521,37 @@ def run(args: argparse.Namespace) -> None:
                 assert video_K is not None and video_camera_to_left_base is not None
                 video_writer.write(_video_frame(rgb, safety_current, safety_prediction[-1], step=step, constraints=len(constraints), K=video_K, camera_to_left_base=video_camera_to_left_base))
             if commander is not None:
-                commander.send(qpos, safe_delta)
+                # Include network inference, geometry and QP time in the deadline.
+                validate_snapshot(snap, snapshot_age_limit_s)
+                fresh = _snapshot(obstacle_url, timeout_s=snapshot_age_limit_s)
+                if np.max(np.abs(_qpos(fresh) - qpos)) > float(safety.get("max_state_drift_rad", 0.01)):
+                    raise RuntimeError("Robot state changed during policy inference; discarding action")
+                if not np.allclose(_gripper(fresh), grip, atol=.02):
+                    raise RuntimeError("Gripper state changed during inference; replan before moving")
+                if not validate_fk_rollout(geometry_sampler, _qpos(fresh), _gripper(fresh), corrected_chunk, _boxes(fresh),
+                                          point_indices=safety_indices, left_mask=left_mask,
+                                          gripper_chunk=gripper_chunk,
+                                          collision_margin_m=float(safety["collision_margin_m"]),
+                                          inter_arm_margin_m=float(safety["inter_arm_margin_m"])):
+                    raise RuntimeError("Corrected chunk is unsafe against the latest obstacle snapshot")
+                validate_snapshot(fresh, snapshot_age_limit_s)
+                commander.send(_qpos(fresh), safe_delta)
             left_gripper_sent = False
-            if left_gripper_commander is not None and not constraints:
+            if left_gripper_commander is not None and not constraints and bool(info["success"]):
                 # The present QP differentiates only 12 UR joints.  Holding
                 # the gripper whenever any future point enters a safety active
                 # set prevents a finger-only closure from bypassing that QP.
                 left_gripper_sent = left_gripper_commander.send_if_changed(float(actions[0, 6]))
+            if right_gripper_commander is not None and not constraints and bool(info["success"]):
+                right_gripper_commander.send_if_changed(float(actions[0, 13]))
             print(json.dumps({
                 "step": step, "source_frame": last_frame, "snapshot_age_s": round(age_s, 4), "obbs": len(boxes),
                 "obstacle_constraints": len(obstacle_constraints), "inter_arm_constraints": len(arm_constraints), "cbf": info,
                 "nominal_joint_delta": nominal.tolist(), "safe_joint_delta": safe_delta.tolist(),
-                "left_gripper_target": float(actions[0, 6]), "right_epick_target_not_executed": float(actions[0, 13]),
+                "left_gripper_target": float(actions[0, 6]), "right_gripper_target": float(actions[0, 13]),
                 "left_gripper_command_sent": left_gripper_sent,
                 "left_only_surface_flow": left_only_flow,
-                "mode": "execute_arms_and_left_gripper" if left_gripper_commander is not None else ("execute_arms_only" if commander is not None else "dry_run"),
+                "mode": "execute_left_arm_and_left_gripper" if left_gripper_commander is not None and args.execute_left_arm_only else ("execute_arms_and_left_gripper" if left_gripper_commander is not None else ("execute_left_arm_only" if commander is not None and args.execute_left_arm_only else ("execute_arms_only" if commander is not None else "dry_run"))),
             }, ensure_ascii=False))
             if args.once:
                 break
@@ -351,6 +561,8 @@ def run(args: argparse.Namespace) -> None:
             commander.close()
         if left_gripper_commander is not None:
             left_gripper_commander.close()
+        if right_gripper_commander is not None:
+            right_gripper_commander.close()
         if video_writer is not None:
             video_writer.release()
             print(f"[video] saved predicted-point overlay: {args.video_output}")

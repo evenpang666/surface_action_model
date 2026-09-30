@@ -20,6 +20,18 @@ def load_project_config(path: Path | str = DEFAULT_PROJECT_CONFIG) -> tuple[dict
         raise ValueError(f"Unsupported or missing project schema in {config_path}")
     if config.get("scene") != "ur7e_dual_quest3" or config.get("coordinate_frame") != "left_base":
         raise ValueError("The canonical project config must describe ur7e_dual_quest3 in left_base")
+    import math
+    safety = config.get("safety", {})
+    for name in ("stale_timeout_s", "max_joint_step_rad", "inter_arm_margin_m"):
+        value = float(safety[name])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"safety.{name} must be finite and positive")
+    for name in ("collision_margin_m", "trigger_margin_m"):
+        value = float(safety[name])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"safety.{name} must be finite and nonnegative")
+    if not 0 < float(safety["cbf_alpha"]) <= 1:
+        raise ValueError("safety.cbf_alpha must be in (0,1]")
     return config, config_path
 
 

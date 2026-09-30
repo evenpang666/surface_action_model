@@ -1,0 +1,12 @@
+# Install openpi and its locked dependencies first; extensions load from the repo.
+-e ../openpi
+-e ../openpi/packages/openpi-client
+-e ..
+transformers==4.53.2
+torch==2.7.1
+numpy==1.26.4
+h5py==3.12.1
+scipy==1.14.1
+PyYAML==6.0.2
+trimesh==4.5.1
+pytest==8.3.4

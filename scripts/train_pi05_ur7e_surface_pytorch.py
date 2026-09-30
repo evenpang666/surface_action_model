@@ -35,25 +35,21 @@ for path in (REPO_ROOT, OPENPI_SRC):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-MODEL_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+from safety_module.tokenizer import MODEL_IMAGE_KEYS, _Tokenizer
+from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
+from safety_module.shards import open_shard, SampleArray
 DEFAULT_PRETRAINED = REPO_ROOT / "outputs" / "pretrained" / "pi05_base_pytorch" / "model.safetensors"
-DEFAULT_TOKENIZER_REPOSITORY = "google/paligemma-3b-pt-224"
-DEFAULT_TOKENIZER_FILENAME = "tokenizer.model"
 
 
-def _cached_huggingface_tokenizer() -> Path | None:
-    """Find a tokenizer even in a manually copied Hugging Face snapshot cache."""
-    hub_root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
-    snapshot_root = hub_root / "models--google--paligemma-3b-pt-224" / "snapshots"
-    candidates = sorted(snapshot_root.glob(f"*/{DEFAULT_TOKENIZER_FILENAME}"))
-    return candidates[-1] if candidates else None
+
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-config", type=Path, default=DEFAULT_PROJECT_CONFIG)
     parser.add_argument("--dataset", type=Path, nargs="+", required=True, help="Preprocessed .npz files or directories.")
     parser.add_argument("--output", type=Path, required=True, help="Output PyTorch checkpoint (.pt).")
-    parser.add_argument("--pretrained", type=Path, default=DEFAULT_PRETRAINED, help="Override the default converted PI05 backbone.")
+    parser.add_argument("--pretrained", type=Path, default=None, help="Override model.pretrained in project config.")
     parser.add_argument("--allow-random-init", action="store_true", help="Testing only: train without a pretrained PI05 backbone.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -64,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--action-horizon", type=int, default=None, help="Defaults to the horizon stored in the dataset.")
     parser.add_argument("--max-points", type=int, default=128, help="Stable evenly-spaced point subset; use 0 for all points.")
-    parser.add_argument("--point-target", choices=("fixed", "visual"), default="fixed")
+    parser.add_argument("--point-target", choices=("fixed", "visual"), default="visual")
     parser.add_argument(
         "--camera-map",
         action="append",
@@ -76,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=("float32", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--freeze-base", action="store_true", help="Train only the new point-token and point-flow layers.")
+    parser.add_argument("--freeze-base", action=argparse.BooleanOptionalAction, default=True, help="Freeze VLM only (default); action expert and point DiT remain trainable.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Optimizer steps after this many per-rank batches; effective global batch is world_size × batch_size × this value.")
     parser.add_argument("--distributed", action="store_true", help="Require torchrun distributed launch; one DDP process per CUDA device.")
     parser.add_argument("--no-gradient-checkpointing", action="store_true", help="Disable activation checkpointing (normally unsuitable for 16 GB GPUs).")
@@ -95,8 +91,11 @@ def parse_args() -> argparse.Namespace:
 def _resolve_shards(paths: list[Path]) -> list[Path]:
     shards: list[Path] = []
     for path in paths:
-        if path.is_dir():
+        if path.is_dir() and path.suffix == ".shard":
+            shards.append(path)
+        elif path.is_dir():
             shards.extend(sorted(path.glob("*.npz")))
+            shards.extend(sorted(path.glob("*.shard")))
         elif path.suffix == ".npz":
             shards.append(path)
         else:
@@ -124,37 +123,6 @@ def _parse_camera_map(values: list[str], rgb_names: list[str]) -> dict[str, str]
     return mapping
 
 
-class _Tokenizer:
-    def __init__(self, max_len: int, model_path: Path | None):
-        self.max_len = int(max_len)
-        if model_path is None:
-            model_path = _cached_huggingface_tokenizer()
-        if model_path is None:
-            try:
-                from huggingface_hub import hf_hub_download
-
-                model_path = Path(
-                    hf_hub_download(repo_id=DEFAULT_TOKENIZER_REPOSITORY, filename=DEFAULT_TOKENIZER_FILENAME)
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not obtain the PaliGemma tokenizer from the Hugging Face cache or Hub. "
-                    "Check network access or pass --tokenizer-model explicitly."
-                ) from exc
-        import sentencepiece
-
-        self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
-
-    def tokenize(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        clean = prompt.strip().replace("_", " ").replace("\n", " ")
-        bins = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        text = f"Task: {clean}, State: {' '.join(map(str, bins))};\nAction: "
-        tokens = self._processor.encode(text, add_bos=True)[: self.max_len]
-        mask = np.zeros((self.max_len,), dtype=bool)
-        mask[: len(tokens)] = True
-        result = np.zeros((self.max_len,), dtype=np.int32)
-        result[: len(tokens)] = tokens
-        return result, mask
 
 
 @dataclass
@@ -176,6 +144,8 @@ class _Episode:
     point_identity_version: str
     points_per_link: int
     arm_count: int
+    current_mask: np.ndarray
+    action_step_mask: np.ndarray
 
 
 class Ur7eSurfaceDataset(Dataset):
@@ -212,7 +182,8 @@ class Ur7eSurfaceDataset(Dataset):
                     raise ValueError("All RGB views must share a shape before batching")
             episode_index = len(self.episodes)
             self.episodes.append(episode)
-            self.index.extend((episode_index, sample_index) for sample_index in range(episode.sample_count))
+            self.index.extend((episode_index, sample_index) for sample_index in range(episode.sample_count)
+                              if episode.current_mask[sample_index].any() and episode.action_step_mask[sample_index].any())
         if not self.index or image_shape is None:
             raise ValueError("Dataset contains no samples or RGB frames")
         self.image_shape = image_shape
@@ -226,11 +197,13 @@ class Ur7eSurfaceDataset(Dataset):
         return np.linspace(0, point_count - 1, max_points, dtype=np.int64)
 
     def _load_episode(self, path: Path, *, max_points: int, point_target: str, action_horizon: int | None) -> _Episode:
-        with np.load(path, allow_pickle=False) as data:
+        with open_shard(path) as data:
             required = ("task_text", "qpos", "action_chunks", "sample_frame_indices", "coordinate_frame")
             missing = [key for key in required if key not in data]
             if missing:
                 raise ValueError(f"{path} is not a preprocessed PI05 surface shard; missing {missing}")
+            if str(data["coordinate_frame"].item()) != "left_base":
+                raise ValueError(f"{path}: surface coordinate frame must be left_base")
             if point_target == "visual":
                 required_points = ("visual_robot_current_points", "visual_robot_future_offsets", "visual_robot_flow_supervision_mask")
                 missing = [key for key in required_points if key not in data]
@@ -239,14 +212,17 @@ class Ur7eSurfaceDataset(Dataset):
                 current = np.asarray(data["visual_robot_current_points"], dtype=np.float32)
                 offsets = np.asarray(data["visual_robot_future_offsets"], dtype=np.float32)
                 mask = np.asarray(data["visual_robot_flow_supervision_mask"], dtype=bool)
+                current_mask = np.asarray(data["current_surface_mask"], dtype=bool) if "current_surface_mask" in data else mask.any(axis=1)
             else:
                 current = np.asarray(data["current_link_points"], dtype=np.float32)
                 offsets = np.asarray(data["target_point_offsets"], dtype=np.float32)
                 mask = np.asarray(data["target_point_mask"], dtype=bool) if "target_point_mask" in data else np.ones(offsets.shape[:-1], dtype=bool)
+                current_mask = np.ones(current.shape[:2], dtype=bool)
             actions = np.asarray(data["action_chunks"], dtype=np.float32)
+            action_step_mask = np.asarray(data["action_step_mask"], dtype=bool) if "action_step_mask" in data else np.ones(actions.shape[:2], dtype=bool)
             sample_frames = np.asarray(data["sample_frame_indices"], dtype=np.int64)
             qpos = np.asarray(data["qpos"], dtype=np.float32)[sample_frames]
-            rgb = {key[4:]: np.asarray(data[key], dtype=np.uint8)[sample_frames] for key in data.files if key.startswith("rgb_")}
+            rgb = {key[4:]: SampleArray(np.asarray(data[key], dtype=np.uint8), frames=sample_frames) for key in data.files if key.startswith("rgb_")}
             task_text = str(np.asarray(data["task_text"]).item()).strip()
             task_text_source = (
                 str(np.asarray(data["task_text_source"]).item())
@@ -280,9 +256,9 @@ class Ur7eSurfaceDataset(Dataset):
             task_text_source=task_text_source,
             qpos=qpos,
             actions=actions,
-            current_points=current[:, ids],
-            target_offsets=offsets[:, :, ids],
-            target_mask=mask[:, :, ids],
+            current_points=SampleArray(current, points=ids),
+            target_offsets=SampleArray(offsets, points=ids, point_axis=2),
+            target_mask=SampleArray(mask, points=ids, point_axis=2),
             rgb=rgb,
             sample_count=actions.shape[0],
             action_dim=actions.shape[-1],
@@ -292,6 +268,8 @@ class Ur7eSurfaceDataset(Dataset):
             point_identity_version=point_identity_version,
             points_per_link=points_per_link,
             arm_count=arm_count,
+            current_mask=current_mask[:, ids],
+            action_step_mask=action_step_mask,
         )
 
     def set_camera_map(self, mapping: dict[str, str]) -> None:
@@ -306,6 +284,11 @@ class Ur7eSurfaceDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, np.ndarray]:
         episode_index, sample_index = self.index[index]
         episode = self.episodes[episode_index]
+        valid_ids = np.flatnonzero(episode.current_mask[sample_index])
+        if not len(valid_ids):
+            raise ValueError(f"No visible current surface at {episode.path}:{sample_index}")
+        # A point ID is stable within the chunk; ordering across samples is not a model input.
+        ids = valid_ids[np.linspace(0, len(valid_ids) - 1, self.point_count, dtype=np.int64)]
         qpos = (episode.qpos[sample_index] - self.qpos_mean) / self.qpos_std
         state = np.zeros((32,), dtype=np.float32)
         state[: len(qpos)] = qpos
@@ -324,20 +307,22 @@ class Ur7eSurfaceDataset(Dataset):
             "tokenized_prompt": tokens.astype(np.int64),
             "tokenized_prompt_mask": token_mask,
             "actions": actions,
-            "robot_points": episode.current_points[sample_index],
+            "robot_points": episode.current_points[sample_index, ids],
             "joint_positions": qpos,
-            "target_point_offsets": episode.target_offsets[sample_index],
-            "target_point_mask": episode.target_mask[sample_index],
+            "target_point_offsets": episode.target_offsets[sample_index][:, ids],
+            "target_point_mask": episode.target_mask[sample_index][:, ids],
+            "action_mask": (np.arange(32) < episode.action_dim)[None] & episode.action_step_mask[sample_index, :, None],
         }
 
 
 def _normalization_stats(paths: list[Path]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int]:
     qpos_values, action_values, horizon, action_dim, joint_dim = [], [], None, None, None
     for path in paths:
-        with np.load(path, allow_pickle=False) as data:
+        with open_shard(path) as data:
             qpos = np.asarray(data["qpos"], dtype=np.float32)
             sample_frames = np.asarray(data["sample_frame_indices"], dtype=np.int64)
             actions = np.asarray(data["action_chunks"], dtype=np.float32)
+            valid = np.asarray(data["action_step_mask"], dtype=bool) if "action_step_mask" in data else np.ones(actions.shape[:2], dtype=bool)
         if actions.ndim != 3 or not 1 <= actions.shape[-1] <= 32:
             raise ValueError(f"{path} must contain action_chunks[N,H,A], 1<=A<=32")
         if horizon is not None and horizon != actions.shape[1]:
@@ -349,7 +334,7 @@ def _normalization_stats(paths: list[Path]) -> tuple[np.ndarray, np.ndarray, np.
         horizon = actions.shape[1]
         action_dim, joint_dim = actions.shape[2], qpos.shape[1]
         qpos_values.append(qpos[sample_frames])
-        action_values.append(actions.reshape(-1, action_dim))
+        action_values.append(actions[valid])
     qpos_all, action_all = np.concatenate(qpos_values), np.concatenate(action_values)
     return (
         qpos_all.mean(axis=0).astype(np.float32),
@@ -381,7 +366,7 @@ def _to_observation(batch: dict[str, Any], device: torch.device) -> SimpleNamesp
 
 def _save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, metadata: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_type": "PI05SafetyPytorch", "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch, "metadata": metadata}, path)
+    torch.save({"model_type": "SurfaceActionModelPytorch", "schema_version": 3, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch, "metadata": metadata}, path)
 
 
 def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, int, bool]:
@@ -402,6 +387,9 @@ def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, i
 
 def main() -> None:
     args = parse_args()
+    project, _ = load_project_config(args.project_config)
+    if args.pretrained is None:
+        args.pretrained = resolve_repo_path(project["model"]["pretrained"])
     if args.epochs < 1 or args.batch_size < 1 or args.max_points < 0:
         raise ValueError("epochs and batch-size must be positive; max-points must be >= 0")
     if args.max_train_batches is not None and args.max_train_batches < 1:
@@ -412,13 +400,28 @@ def main() -> None:
         raise ValueError("--max-steps must be positive when supplied")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device, rank, world_size, is_distributed = _distributed_context(args)
+    device, rank, world_size, is_distributed = (torch.device("cpu"), 0, 1, False) if args.validate_only else _distributed_context(args)
     is_primary = rank == 0
     if device.type == "cuda" and args.precision == "bfloat16" and torch.cuda.get_device_capability(device)[0] < 8:
         raise ValueError("bfloat16 requires Ampere-or-newer CUDA hardware. V100 requires --precision float16.")
     if device.type == "cuda" and not args.freeze_base and torch.cuda.get_device_properties(device).total_memory < 48 * 2**30:
         raise ValueError("Full PI05 AdamW fine-tuning needs roughly 48+ GiB per GPU. On V100 use --freeze-base; DDP replicates rather than shards the backbone.")
     shards = _resolve_shards(args.dataset)
+    periods = []
+    for path in shards:
+        with open_shard(path) as shard:
+            if "action_dt_s" in shard:
+                dt = np.asarray(shard["action_dt_s"])
+                valid = np.asarray(shard["action_step_mask"], bool)
+                values = dt[valid]
+                if not len(values) or not np.isfinite(values).all() or np.any(values <= 0):
+                    raise ValueError(f"{path}: invalid action timing")
+                period = float(np.median(values))
+                if np.max(np.abs(values - period)) > .2 * period:
+                    raise ValueError(f"{path}: irregular sample intervals; resample the episode before fixed-period training")
+                periods.append(period)
+    if periods and max(periods) - min(periods) > .05 * np.median(periods):
+        raise ValueError("Shards use different action periods")
     qpos_mean, qpos_std, action_mean, action_std, detected_horizon, logical_action_dim, joint_dim = _normalization_stats(shards)
     horizon = detected_horizon if args.action_horizon is None else args.action_horizon
     tokenizer = None if args.validate_only else _Tokenizer(max_len=200, model_path=args.tokenizer_model)
@@ -434,7 +437,8 @@ def main() -> None:
         action_std=action_std,
     )
     rgb_names = sorted(dataset.episodes[0].rgb)
-    dataset.set_camera_map(_parse_camera_map(args.camera_map, rgb_names))
+    camera_values = args.camera_map or [f"{source}={target}" for source, target in project["quest3"]["camera_to_model"].items()]
+    dataset.set_camera_map(_parse_camera_map(camera_values, rgb_names))
     reference = dataset.episodes[0]
     for episode in dataset.episodes[1:]:
         if (episode.surface_model_hash, episode.point_identity_version, episode.points_per_link, episode.arm_count) != (
@@ -464,14 +468,16 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler, num_workers=args.num_workers, drop_last=True)
     try:
         from openpi.models.pi0_config import Pi0Config
-        from openpi.models_pytorch.pi0_pytorch import PI05SafetyPytorch
+        from openpi.models_pytorch.surface_action_pytorch import SurfaceActionModelPytorch
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "OpenPI dependencies are unavailable. Run this script in the OpenPI environment, for example: "
             "cd openpi && uv run --project . ../scripts/train_pi05_ur7e_surface_pytorch.py ..."
         ) from exc
     config = Pi0Config(action_dim=32, action_horizon=horizon, pi05=True, dtype=args.precision)
-    model = PI05SafetyPytorch(config, joint_dim=joint_dim).to(device)
+    model = SurfaceActionModelPytorch(config, joint_dim=joint_dim).to(device)
+    if not args.freeze_base:
+        raise ValueError("Surface Action Model freezes the VLM by design; omit --no-freeze-base")
     if pretrained is not None:
         from safetensors.torch import load_model
 
@@ -488,14 +494,30 @@ def main() -> None:
         if is_primary:
             print(f"[weights] PI05 backbone complete; new_surface_keys={len(missing)}")
     if args.freeze_base:
+        trainable_prefixes = (
+            "paligemma_with_expert.gemma_expert.",
+            "action_in_proj.", "action_out_proj.", "time_mlp_", "surface_",
+        )
         for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name.startswith("surface_"))
+            parameter.requires_grad_(name.startswith(trainable_prefixes))
+        if is_primary:
+            trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+            total = sum(parameter.numel() for parameter in model.parameters())
+            print(f"[freeze-base] frozen=PaliGemma trunk; trainable=action expert + action/surface heads ({trainable:,}/{total:,} parameters)")
     if not args.no_gradient_checkpointing:
         model.gradient_checkpointing_enable()
+    # FP16 optimizer updates need FP32 master parameters and loss scaling.
+    if args.precision == "float16":
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.float()
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.precision == "float16")
     if is_distributed:
         model = DistributedDataParallel(model, device_ids=[device.index], output_device=device.index, broadcast_buffers=False)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     metadata = {
+        "schema_version": 3,
+        "action_period_s": float(np.median(periods)) if periods else None,
         "dataset": [str(path) for path in shards], "point_target": args.point_target, "point_count": dataset.point_count,
         "camera_map": dataset.camera_map,
         "action_mean": action_mean.tolist(), "action_std": action_std.tolist(),
@@ -531,7 +553,8 @@ def main() -> None:
             accumulation_size = min(args.gradient_accumulation_steps, requested_batches - accumulation_start + 1)
             should_step = batch_index == accumulation_start + accumulation_size - 1
             sync_context = model.no_sync() if is_distributed and not should_step else nullcontext()
-            with sync_context:
+            amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if device.type == "cuda" and args.precision == "float16" else nullcontext()
+            with sync_context, amp_context:
                 losses = model(
                     _to_observation(batch, device),
                 batch["actions"].to(device=device, dtype=torch.float32),
@@ -540,11 +563,14 @@ def main() -> None:
                 batch["target_point_offsets"].to(device=device, dtype=torch.float32),
                 batch["target_point_mask"].to(device=device, dtype=torch.bool),
                 point_loss_weight=args.point_loss_weight,
+                action_mask=batch["action_mask"].to(device=device),
                 )
-                (losses["loss"] / accumulation_size).backward()
+                scaler.scale(losses["loss"] / accumulation_size).backward()
             if should_step:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                optimizer.step()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, error_if_nonfinite=True)
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 completed_steps += 1
                 reached_step_limit = args.max_steps is not None and completed_steps >= args.max_steps

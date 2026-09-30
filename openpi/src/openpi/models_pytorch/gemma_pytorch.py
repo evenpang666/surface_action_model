@@ -3,6 +3,10 @@ from typing import Literal
 import pytest
 import torch
 from torch import nn
+from openpi.models_pytorch.transformers_runtime import install_repository_extensions
+
+install_repository_extensions()
+
 from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING

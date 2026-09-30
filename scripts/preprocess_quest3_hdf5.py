@@ -2,7 +2,7 @@
 """Convert Quest3 single/dual-arm HDF5 episodes into PI05 safety shards.
 
 The default scene is the current left-base dual UR7e cell: a left Robotiq
-2F-85 and a right Robotiq EPick.  Single-arm recordings emit only the recorded
+2F-85 and a right Robotiq 2F-85.  Single-arm recordings emit only the recorded
 left robot by default; ``--pad-inactive-right-arm`` gives them the deployed
 12-D state / 14-D action interface while retaining supervision exclusively on
 the genuinely observed left-arm surface.  Actions are stored per arm as six
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 import sys
 
@@ -51,7 +52,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rgb-view", action="append", default=[], help="RGB view to retain; repeat for multiple. Default follows project camera_to_model (front only).")
     parser.add_argument("--measured-flow-npz", type=Path, default=None, help="Optional CoTracker observation NPZ to merge as masked auxiliary targets.")
-    parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Permit provisional right EPick FK labels (never recommended for safety training).")
+    parser.add_argument("--geometry-only", action="store_true", help="Create FK gate data for the CoTracker extraction stage; not measured training data.")
+    parser.add_argument("--complete-windows-only", action="store_true", help="Legacy behavior: drop incomplete windows instead of padding with explicit masks.")
+    parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Permit provisional right 2F-85 FK labels (never recommended for safety training).")
     parser.add_argument(
         "--left-gripper-position-convention",
         choices=("closing_fraction", "opening_fraction"),
@@ -155,16 +158,22 @@ def _merge_visual(path: Path, *, episode_path: Path, sample_indices: np.ndarray,
         have |= valid
         filled[frame, have] = last[have]
     current = filled[sample_indices]
-    current_visible = visible[sample_indices]
+    current_visible = visible[sample_indices] & np.isfinite(observed[sample_indices]).all(axis=-1)
     offsets = np.zeros((len(sample_indices), horizon, observed.shape[1], 3), dtype=np.float32)
     mask = np.zeros(offsets.shape[:-1], dtype=bool)
     for row, start in enumerate(sample_indices):
-        future = observed[start + 1 : start + horizon + 1]
-        valid = current_visible[row][None, :] & visible[start + 1 : start + horizon + 1]
+        future_ids = start + 1 + np.arange(horizon)
+        inside = future_ids < frame_count
+        future_ids = np.minimum(future_ids, frame_count - 1)
+        future = observed[future_ids]
+        valid = current_visible[row][None, :] & visible[future_ids] & inside[:, None]
         valid &= np.isfinite(future).all(axis=-1)
         offsets[row] = np.where(valid[..., None], future - current[row][None, ...], 0.0)
         mask[row] = valid
     return {
+        "current_surface": current,
+        "surface_chunk": current[:, None] + offsets,
+        "current_surface_mask": current_visible,
         "visual_robot_current_points": current,
         "visual_robot_future_offsets": offsets,
         "visual_robot_flow_supervision_mask": mask,
@@ -175,6 +184,8 @@ def _merge_visual(path: Path, *, episode_path: Path, sample_indices: np.ndarray,
 
 def main() -> None:
     args = parse_args()
+    if args.measured_flow_npz is None and not args.geometry_only:
+        raise ValueError("Surface Action training requires --measured-flow-npz; use --geometry-only to prepare the FK gate first")
     config, config_path = load_project_config(args.project_config)
     defaults = config["preprocess"]
     points_per_link = int(args.points_per_link or defaults["points_per_link"])
@@ -184,7 +195,7 @@ def main() -> None:
     if points_per_link < 2 or horizon < 1:
         raise ValueError("points-per-link must be >=2 and future-horizon must be positive")
     episode_path = args.episode.expanduser().resolve()
-    output = args.output or (REPO_ROOT / "outputs" / "quest3_pi05" / f"{episode_path.stem}.npz")
+    output = args.output or (REPO_ROOT / "outputs" / "quest3_pi05" / f"{episode_path.stem}.shard")
     with h5py.File(episode_path, "r") as source:
         task, task_source = _resolve_task_text(args.task, source.attrs, str(defaults["task_text"]))
         required = ("observations/qpos", "observations/gripper_position", "action", "executed_action", "gripper_action", "action_valid", "timestamps_ns")
@@ -259,14 +270,18 @@ def main() -> None:
         fixed[frame] = sampler.link_points(
             qpos[frame, : recorded_arm_count * 6], surface_gripper_position[frame, :recorded_arm_count]
         )
-    sample_indices = _window_starts(action_valid, horizon)
+    sample_indices = _window_starts(action_valid, horizon) if args.complete_windows_only else np.arange(frame_count)
     if not len(sample_indices):
         raise ValueError("Episode has no complete valid action/flow window")
     flat = fixed.reshape(frame_count, -1, 3)
-    chunks = np.stack([actions[start : start + horizon] for start in sample_indices])
-    offsets = np.stack([flat[start + 1 : start + horizon + 1] - flat[start] for start in sample_indices])
+    action_ids = sample_indices[:, None] + np.arange(horizon)[None, :]
+    future_ids = np.minimum(action_ids + 1, frame_count - 1)
+    step_mask = (action_ids + 1 < frame_count) & action_valid[np.minimum(action_ids, frame_count - 1)]
+    chunks = np.where(step_mask[..., None], actions[np.minimum(action_ids, frame_count - 1)], 0.)
+    offsets = flat[future_ids] - flat[sample_indices, None]
+    dt = (timestamps_ns[future_ids] - timestamps_ns[np.minimum(action_ids, frame_count - 1)]) / 1e9
     payload: dict[str, np.ndarray] = {
-        "format_version": np.asarray(2, dtype=np.int32),
+        "format_version": np.asarray(3, dtype=np.int32),
         "schema": np.asarray("quest3_pi05_surface_flow"),
         "project_config": np.asarray(str(config_path)),
         "source_episode": np.asarray(str(episode_path)),
@@ -293,12 +308,18 @@ def main() -> None:
         "timestamps_ns": timestamps_ns,
         "sample_frame_indices": sample_indices,
         "action_chunks": chunks.astype(np.float32),
+        "action_chunk": chunks.astype(np.float32),
+        "commanded_actions": commanded,
+        "executed_actions": executed,
+        "action_dt_s": dt.astype(np.float32),
+        "action_step_mask": step_mask,
+        "surface_source": np.asarray("mesh_gate_only" if args.geometry_only else "measured_depth_cotracker"),
         "fixed_link_points": fixed,
         "current_link_points": flat[sample_indices],
         "target_point_offsets": offsets.astype(np.float32),
-        "target_point_mask": np.ones(offsets.shape[:-1], dtype=bool),
+        "target_point_mask": np.broadcast_to(step_mask[..., None], offsets.shape[:-1]),
         "link_names": np.asarray(link_names),
-        "point_ids": sampler.point_ids(arm_count),
+        "point_ids": sampler.point_ids(surface_arm_count),
         "points_per_link": np.asarray(points_per_link, dtype=np.int32),
         "point_identity_version": np.asarray(sampler.point_identity_version),
         "surface_model_hash": np.asarray(sampler.model_hash(surface_arm_count)),
@@ -307,12 +328,25 @@ def main() -> None:
     for name, frames in rgb.items():
         payload[f"rgb_{name}"] = frames
     if args.measured_flow_npz is not None:
-        if arm_count != 1:
-            raise ValueError("The current measured CoTracker flow extractor supports left-only episodes")
         payload.update(_merge_visual(args.measured_flow_npz, episode_path=episode_path, sample_indices=sample_indices, horizon=horizon, frame_count=frame_count))
+        payload["visual_robot_flow_supervision_mask"] &= step_mask[..., None]
+    if np.any(np.diff(timestamps_ns) <= 0):
+        raise ValueError("Episode timestamps must be strictly increasing")
     output = Path(output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output, **payload)
+    original_copy = output.with_suffix(".source.hdf5")
+    if original_copy.exists():
+        raise FileExistsError(f"Preserved source already exists: {original_copy}; choose a new output path")
+    shutil.copy2(episode_path, original_copy)
+    payload["source_episode_relative"] = np.asarray(original_copy.name)
+    if output.suffix == ".npz":
+        np.savez_compressed(output, **payload)
+    elif output.suffix == ".shard":
+        output.mkdir(exist_ok=False)
+        for name, value in payload.items():
+            np.save(output / f"{name}.npy", value, allow_pickle=False)
+    else:
+        raise ValueError("Output must end in .shard (mmap) or .npz (legacy)")
     print(json.dumps({
         "output": str(output), "frames": frame_count, "samples": len(sample_indices), "arms": arm_count,
         "action_dim": arm_count * 7, "action_source": action_source, "links": len(link_names),

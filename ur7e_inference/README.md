@@ -1,5 +1,8 @@
 # UR7e + Pika + D435i 远程 pi0.5 推理
 
+> 历史独立采集/推理工具说明，不是当前双臂 Surface Action Model 部署主线。
+> 当前环境、地址及安全前置条件以[根 README](../README.md)为准。
+
 文档：
 
 - [环境安装](docs/environment_setup.md)

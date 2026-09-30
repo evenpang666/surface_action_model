@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only real-time tabletop obstacle model for two UR7e arms and one front D455.
+"""Read-only real-time tabletop obstacle model for two UR7e arms and front and side D455 cameras.
 
 The model uses ``quest3_collect/config/hardware_dual_teleop.yaml`` and its two
 ``base -> front_camera`` calibrations.  All output is expressed in ``left_base``.
@@ -8,7 +8,7 @@ arm or either gripper.
 
 The official UR7e collision meshes are rendered for both arms.  The installed
 Robotiq 2F-85 uses upstream collision meshes driven by a read-only ``GET POS``
-query; EPick uses its upstream body mesh plus the source URDF's cup primitive.
+query; both arms use the articulated Robotiq 2F-85 vendor collision mesh.
 Both are rendered at their configured active TCPs.  Verify the physical
 mount/cup dimensions before treating the result as motion-planning geometry.
 """
@@ -48,13 +48,14 @@ from real_scripts.ur7e_collision_mesh import (
     render_surface_points_depth,
 )
 from real_scripts.ur7e_realsense_adapter import D435iCameraConfig, RealSenseD435iSource
-from real_scripts.tool_urdf_collision import sample_collision_surface
-from real_scripts.robotiq_vendor_visual_models import robotiq_2f85_points_in_active_tcp, robotiq_epick_points_in_active_tcp
+from real_scripts.robotiq_vendor_visual_models import robotiq_2f85_points_in_active_tcp
+from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
+from real_scripts.preprocess_left_vr_hdf5_cotracker_observations import _lift_measured_tracks
 
 
 VIEWER_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Dual UR7e obstacle model</title>
 <script src="/plotly.min.js"></script><style>html,body,#scene{margin:0;width:100%;height:100%;overflow:hidden;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000c;padding:10px 13px;border-radius:7px;line-height:1.6;pointer-events:none}#pause{pointer-events:auto;margin-top:6px;padding:4px 9px;border:1px solid #6c7784;border-radius:4px;background:#17212b;color:#e6edf3;cursor:pointer}.robot{color:#ff6b55}.obstacle{color:#45ff9b}.warning{color:#ffd166}</style></head>
-<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（left_base）</b><br><span id="s">等待首帧…</span><br><span class="robot">红/橙：左 Robotiq 2F-85、右 Robotiq EPick 与双臂</span> · <span class="obstacle">绿：桌面连接障碍物 OBB</span><br><span class="warning">仅 RTDE 读取；不会发送运动或夹爪命令。</span><br><button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button></div><div id="scene"></div>
+<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（left_base）</b><br><span id="s">等待首帧…</span><br><span class="robot">红/橙：双 Robotiq 2F-85 与双臂</span> · <span class="obstacle">绿：桌面连接障碍物 OBB</span><br><span class="warning">仅 RTDE 读取；不会发送运动或夹爪命令。</span><br><button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button></div><div id="scene"></div>
 <script>const G=document.getElementById('scene'),S=document.getElementById('s'),P=document.getElementById('pause'),E=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];let paused=false;function setPaused(value){paused=value;P.textContent=paused?'继续显示（空格）':'暂停显示（空格）';P.setAttribute('aria-pressed',String(paused))}P.addEventListener('click',()=>setPaused(!paused));document.addEventListener('keydown',e=>{if(e.code==='Space'&&!e.repeat){e.preventDefault();setPaused(!paused)}});function pts(g,n,s){let p=g.points,c=g.colors;return{type:'scatter3d',mode:'markers',name:n,x:p.map(q=>q[0]),y:p.map(q=>q[1]),z:p.map(q=>q[2]),marker:{size:s,opacity:.8,color:c.map(v=>`rgb(${v[0]},${v[1]},${v[2]})`)},hoverinfo:'skip'}}function boxes(b){let r=[];for(let k=0;k<b.length;k++){let q=b[k].corners,x=[],y=[],z=[];for(let[a,d]of E)x.push(q[a][0],q[d][0],null),y.push(q[a][1],q[d][1],null),z.push(q[a][2],q[d][2],null);r.push({type:'scatter3d',mode:'lines',name:`障碍物 ${k+1}`,x,y,z,line:{color:'#45ff9b',width:6},hoverinfo:'skip'})}return r}function draw(d){S.textContent=`帧 ${d.frame} · ${d.status} · 环境 ${d.environment.points.length} 点 · 双臂 ${d.robot.points.length} 点 · ${d.obbs.length} 个障碍物`;Plotly.react(G,[pts(d.environment,'environment',.7),pts(d.robot,'dual robots',1.1),...boxes(d.obbs)],{uirevision:'keep-orbit',showlegend:false,paper_bgcolor:'#080a0d',margin:{l:0,r:0,t:0,b:0},scene:{bgcolor:'#080a0d',aspectmode:'data',camera:{eye:{x:1.5,y:-1.5,z:1.15},up:{x:0,y:0,z:1}},xaxis:{title:'left_base X (m)'},yaxis:{title:'left_base Y (m)'},zaxis:{title:'left_base Z (m)'}}},{displaylogo:false,responsive:true,scrollZoom:true})}async function poll(){if(!paused)try{let r=await fetch('/snapshot.json?'+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(!paused)draw(d)}catch(e){if(!paused)S.textContent='读取快照失败，正在重试：'+e}setTimeout(poll,900)}poll();</script></body></html>"""
 
 
@@ -104,15 +105,15 @@ class ReadOnlyRobotiq2FPosition:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hardware-config", type=Path, default=REPO_ROOT.parent / "quest3_collect" / "config" / "hardware_dual_teleop.yaml")
+    parser.add_argument("--project-config", type=Path, default=DEFAULT_PROJECT_CONFIG)
     parser.add_argument("--front-serial", default=None, help="Override front D455 serial; default is hardware config.")
+    parser.add_argument("--side-serial", default=None)
     parser.add_argument("--width", type=int, default=1280); parser.add_argument("--height", type=int, default=720); parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--warmup-frames", type=int, default=20); parser.add_argument("--point-stride", type=int, default=3)
     parser.add_argument("--samples-per-face", type=int, default=16); parser.add_argument("--absolute-tolerance-m", type=float, default=.015); parser.add_argument("--relative-tolerance", type=float, default=.015); parser.add_argument("--dilation-pixels", type=int, default=3)
     add_lingbot_depth_cli_args(parser)
-    # This scene has one D455.  The shared helper normally assumes a front and
-    # side reconstruction pair, but a side camera is deliberately absent here.
-    parser.set_defaults(lingbot_camera_names=("front",), lingbot_depth=True)
+    # Two fixed D455 views; wrist D435i cameras belong to policy observations.
+    parser.set_defaults(lingbot_camera_names=("front", "side"), lingbot_depth=True)
     parser.add_argument("--workspace-bounds", nargs=6, type=float, default=(-0.85, 0.85, -0.85, 0.85, -0.12, 0.70), metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="left_base crop for point cloud and OBBs.")
     parser.add_argument("--plane-threshold-m", type=float, default=.012); parser.add_argument("--min-height-m", type=float, default=.020); parser.add_argument("--max-height-m", type=float, default=.35); parser.add_argument("--outlier-neighbour-m", type=float, default=.020)
     parser.add_argument("--cluster-eps-m", type=float, default=.010, help="Exact point-to-point DBSCAN radius; unlike voxel adjacency, this is a physical distance.")
@@ -121,11 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-depth-support-pixels", type=int, default=2, help="LingBot pixels must be within this many pixels of raw, non-robot D455 depth; 0 permits raw pixels only.")
     parser.add_argument("--temporal-persistence-frames", type=int, default=3, help="Consecutive observations required before an obstacle OBB is shown; use 1 to disable.")
     parser.add_argument("--temporal-track-distance-m", type=float, default=.035, help="Maximum centre displacement when associating an OBB across frames.")
-    parser.add_argument("--left-tool-urdf", type=Path, default=REPO_ROOT / "assets" / "robot_models" / "robotiq_2f85" / "urdf" / "robotiq_2f85_active_tcp_collision.urdf", help="Fixed collision URDF rooted at left active TCP.")
-    parser.add_argument("--right-tool-urdf", type=Path, default=REPO_ROOT / "assets" / "robot_models" / "robotiq_epick" / "urdf" / "robotiq_epick_active_tcp_collision.urdf", help="Fixed collision URDF rooted at right active TCP.")
     parser.add_argument("--left-tool-from-tcp", type=Path, default=None, help="Optional JSON/YAML ^active_tcpT_left_tool_urdf_root; identity for the bundled URDF.")
     parser.add_argument("--right-tool-from-tcp", type=Path, default=None, help="Optional JSON/YAML ^active_tcpT_right_tool_urdf_root; identity for the bundled URDF.")
-    parser.add_argument("--tool-margin-m", type=float, default=.012, help="Safety margin added to every URDF collision primitive.")
     parser.add_argument("--left-robotiq-read-port", type=int, default=63352, help="Left 2F-85 URCap port used only for GET POS.")
     parser.add_argument("--left-finger-angle-rad", type=float, default=0.0, help="Fallback 2F-85 finger angle if GET POS is unavailable; 0=open, 0.8=closed.")
     parser.add_argument("--display-max-points", type=int, default=45000); parser.add_argument("--port", type=int, default=8766); parser.add_argument("--bind-host", default="127.0.0.1"); parser.add_argument("--once", action="store_true"); parser.add_argument("--no-browser", action="store_true")
@@ -163,15 +161,20 @@ def load_calibration(path: Path) -> tuple[np.ndarray, np.ndarray, str, dict]:
 
 
 def load_arms(args: argparse.Namespace) -> tuple[Arm, Arm, CameraCalibration, dict]:
-    config_path = args.hardware_config.resolve()
+    project, _ = load_project_config(args.project_config)
+    if not project["safety"].get("camera_calibration_valid", False):
+        raise RuntimeError("Front calibration expired and side is uncalibrated; install a newly validated calibration before starting live_obstacle_detection")
+    config_path = resolve_repo_path(project["quest3"]["hardware_config"])
     with config_path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     arms_config = config["arms"]
     left_cfg, right_cfg = arms_config["left_arm"], arms_config["right_arm"]
-    left_path = (config_path.parent / left_cfg["front_calibration"]).resolve()
-    right_path = (config_path.parent / right_cfg["front_calibration"]).resolve()
-    left_to_camera, K, serial, left_report = load_calibration(left_path)
-    right_to_camera, right_K, right_serial, right_report = load_calibration(right_path)
+    left_path = resolve_repo_path(project["safety"]["front_calibration"])
+    right_path = resolve_repo_path(project["safety"]["right_front_calibration"])
+    T_left_base_from_front, K, serial, left_report = load_calibration(left_path)
+    T_right_base_from_front, right_K, right_serial, right_report = load_calibration(right_path)
+    if left_report.get("parent_frame") != "left_base" or right_report.get("parent_frame") != "right_base":
+        raise ValueError("Front calibrations must explicitly name left_base and right_base")
     if serial != right_serial:
         raise ValueError(f"Calibration cameras differ: left={serial}, right={right_serial}")
     # The two independent hand-eye fits record the D455 intrinsics at different
@@ -185,10 +188,10 @@ def load_arms(args: argparse.Namespace) -> tuple[Arm, Arm, CameraCalibration, di
         raise ValueError(f"Configured front serial {requested_serial} does not match calibration serial {serial}")
     # T_left_camera maps front-camera coordinates into left_base.  Right collision
     # geometry is mapped through the shared camera frame into left_base.
-    right_to_left = left_to_camera @ np.linalg.inv(right_to_camera)
+    right_to_left = T_left_base_from_front @ np.linalg.inv(T_right_base_from_front)
     left = Arm("left", str(left_cfg["robot_ip"]), np.eye(4), "Robotiq 2F-85", matrix_from_file(args.left_tool_from_tcp))
-    right = Arm("right", str(right_cfg["robot_ip"]), right_to_left, "Robotiq EPick", matrix_from_file(args.right_tool_from_tcp))
-    calibration = CameraCalibration("front", K, left_to_camera)
+    right = Arm("right", str(right_cfg["robot_ip"]), right_to_left, "Robotiq 2F-85", matrix_from_file(args.right_tool_from_tcp))
+    calibration = CameraCalibration("front", K, T_left_base_from_front)
     report = {"camera_serial": serial, "left_touch_rms_mm": left_report["touch_rms_mm"], "right_touch_rms_mm": right_report["touch_rms_mm"], "calibration_intrinsics_max_delta_px": intrinsics_delta_px, "right_base_to_left_base": right_to_left.astype(float).tolist()}
     return left, right, calibration, report
 
@@ -205,29 +208,6 @@ def rotvec_transform(pose: np.ndarray) -> np.ndarray:
     return transform
 
 
-def box_surface(half: tuple[float, float, float], step: float = .012) -> np.ndarray:
-    """Dense deterministic points on an axis-aligned box, sufficient for a depth z-buffer."""
-    hx, hy, hz = half; x = np.arange(-hx, hx + step, step); y = np.arange(-hy, hy + step, step); z = np.arange(-hz, hz + step, step)
-    out = []
-    for fixed, a, b in ((0, y, z), (1, x, z), (2, x, y)):
-        for sign in (-1., 1.):
-            aa, bb = np.meshgrid(a, b, indexing="ij"); point = np.zeros((aa.size, 3)); point[:, fixed] = sign * (hx, hy, hz)[fixed]; point[:, (fixed + 1) % 3] = aa.ravel(); point[:, (fixed + 2) % 3] = bb.ravel(); out.append(point)
-    return np.unique(np.concatenate(out), axis=0).astype(np.float32)
-
-
-def tool_proxy_points(tool: str, margin: float) -> np.ndarray:
-    """Conservative local surfaces around the active TCP; dimensions are metres."""
-    m = max(float(margin), 0.)
-    if tool == "Robotiq 2F-85":
-        # palm and both fingers; the TCP calibration transform positions this model.
-        palm = box_surface((.045 + m, .035 + m, .040 + m)) + np.array((0., 0., .035))
-        fingers = [box_surface((.012 + m, .012 + m, .055 + m)) + np.array((0., sign * .035, .105)) for sign in (-1., 1.)]
-        return np.concatenate((palm, *fingers)).astype(np.float32)
-    # EPick body + suction cup. It is deliberately padded because vacuum cup
-    # orientation/length varies with the installed bracket.
-    body = box_surface((.040 + m, .040 + m, .050 + m)) + np.array((0., 0., .045))
-    cup = box_surface((.030 + m, .030 + m, .012 + m)) + np.array((0., 0., .105))
-    return np.concatenate((body, cup)).astype(np.float32)
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -381,8 +361,13 @@ def combine_depth(depths: list[np.ndarray]) -> np.ndarray:
 
 def main() -> None:
     args = parse_args(); left, right, calibration, report = load_arms(args)
-    if (args.width, args.height) != (1280, 720):
-        print("[model] warning: the checked calibration is 1280x720; use a matching RealSense stream or recalibrate intrinsics.")
+    project, _ = load_project_config(args.project_config)
+    side_transform, side_K, side_serial, side_report = load_calibration(resolve_repo_path(project["safety"]["side_calibration"]))
+    if side_report.get("parent_frame") != "left_base":
+        raise ValueError("side calibration must map the camera into left_base")
+    if args.side_serial and args.side_serial != side_serial:
+        raise ValueError("Side camera serial differs from calibration")
+    calibrations = {"front": calibration, "side": CameraCalibration("side", side_K, side_transform)}
     print(json.dumps({"mode": "read-only", "calibration": report, "left_ip": left.ip, "right_ip": right.ip}, indent=2))
     from rtde_receive import RTDEReceiveInterface
     # Model construction/download is intentionally opt-in: on a CPU-only host
@@ -394,23 +379,14 @@ def main() -> None:
     else:
         print(json.dumps({"depth_refinement": "raw D455 depth (--no-lingbot-depth selected)"}, indent=2))
     samples = collision_surface_samples(samples_per_face=args.samples_per_face)
-    tool_urdfs = {left.name: args.left_tool_urdf.resolve(), right.name: args.right_tool_urdf.resolve()}
-    for arm in (left, right):
-        if not tool_urdfs[arm.name].is_file():
-            raise FileNotFoundError(f"{arm.name} tool collision URDF does not exist: {tool_urdfs[arm.name]}")
-    # The rendered tool surface uses vendor meshes.  EPick's public model
-    # represents its configurable cup as a URDF cylinder, so that exact
-    # primitive is appended to its vendor body mesh.
-    epick_cup_and_mount = sample_collision_surface(tool_urdfs[right.name], margin_m=args.tool_margin_m)
-    print(json.dumps({"left_tool_mesh": "PickNik Robotiq 2F-85 collision meshes; live GET POS finger angle", "right_tool_mesh": "PickNik EPick body mesh + official URDF cup/mount collision primitives", "left_tool_collision_urdf": str(tool_urdfs[left.name]), "right_tool_collision_urdf": str(tool_urdfs[right.name]), "tool_margin_m": args.tool_margin_m}, indent=2))
     latest: dict = {"frame": 0, "status": "initializing", "environment": {"points": [], "colors": []}, "robot": {"points": [], "colors": []}, "obbs": []}; lock = threading.Lock(); stop = threading.Event()
 
     def process() -> None:
         nonlocal latest
         receivers = {left.name: RTDEReceiveInterface(left.ip), right.name: RTDEReceiveInterface(right.ip)}
-        source = RealSenseD435iSource(cameras=(D435iCameraConfig("front", args.front_serial or report["camera_serial"]),), width=args.width, height=args.height, fps=args.fps)
-        left_gripper: ReadOnlyRobotiq2FPosition | None = None
-        finger_angle = float(np.clip(args.left_finger_angle_rad, 0., .8))
+        source = RealSenseD435iSource(cameras=(D435iCameraConfig("front", args.front_serial or report["camera_serial"]), D435iCameraConfig("side", args.side_serial or side_serial)), width=args.width, height=args.height, fps=args.fps)
+        left_gripper: ReadOnlyRobotiq2FPosition | None = None; right_gripper: ReadOnlyRobotiq2FPosition | None = None
+        finger_angle = float(np.clip(args.left_finger_angle_rad, 0., .8)); right_finger_angle = finger_angle
         gripper_status = f"2F-85 fixed angle {finger_angle:.3f} rad"
         obstacle_gate = TemporalOBBGate(
             required_hits=args.temporal_persistence_frames,
@@ -418,21 +394,35 @@ def main() -> None:
         )
         try:
             left_gripper = ReadOnlyRobotiq2FPosition(left.ip, port=args.left_robotiq_read_port)
+            right_gripper = ReadOnlyRobotiq2FPosition(right.ip, port=args.left_robotiq_read_port)
             gripper_status = "2F-85 GET POS connected (read-only)"
         except Exception as exc:
-            print(f"[model] warning: left 2F-85 GET POS unavailable; using fallback angle {finger_angle:.3f} rad ({type(exc).__name__})")
+            if left_gripper is not None: left_gripper.close()
+            for receiver in receivers.values(): receiver.disconnect()
+            raise RuntimeError("Both 2F-85 state readers must connect before perception starts") from exc
         frame_no = 0
         try:
             source.start()
+            for name, info in source.get_color_calibrations().items():
+                # Use actual color-stream intrinsics for the requested resolution.
+                calibrations[name] = CameraCalibration(name, np.asarray(info["intrinsics"]), calibrations[name].camera_to_world)
             for _ in range(max(1, args.warmup_frames)): source.read()
             while not stop.is_set():
-                began = time.perf_counter(); q0 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}; captured = source.read()["front"]; q1 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}
+                began = time.perf_counter(); q0 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}; frames = source.read(); captured = frames["front"]; q1 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}
+                stamps = [frame.host_timestamp_ns for frame in frames.values()]
+                if (max(stamps) - min(stamps)) / 1e9 > project["safety"]["max_camera_skew_s"]:
+                    raise RuntimeError("Front/side capture skew exceeded the configured limit")
                 robots, robot_col, depths = [], [], []
                 if left_gripper is not None:
                     try:
                         closing = left_gripper.closing_fraction(); finger_angle = .8 * closing; gripper_status = f"2F-85 GET POS={closing:.3f}, q={finger_angle:.3f} rad"
                     except Exception as exc:
-                        gripper_status = f"2F-85 GET POS failed; retaining q={finger_angle:.3f} rad ({type(exc).__name__})"
+                        raise RuntimeError("Left gripper state unavailable") from exc
+                if right_gripper is not None:
+                    try: right_finger_angle = .8 * right_gripper.closing_fraction()
+                    except Exception as exc: raise RuntimeError("Right gripper state unavailable") from exc
+                if left_gripper is None or right_gripper is None:
+                    raise RuntimeError("Both measured gripper states are required")
                 for arm, color in ((left, np.array((255, 70, 45), np.uint8)), (right, np.array((255, 165, 45), np.uint8))):
                     q = (q0[arm.name] + q1[arm.name]) * .5
                     if q.shape != (6,) or not np.isfinite(q).all(): raise RuntimeError(f"{arm.name} invalid RTDE joint state: {q}")
@@ -441,24 +431,31 @@ def main() -> None:
                     # UR-side active TCP setting used for the installed tool.
                     tcp = np.asarray(receivers[arm.name].getActualTCPPose(), dtype=np.float64)
                     if tcp.shape != (6,) or not np.isfinite(tcp).all(): raise RuntimeError(f"{arm.name} invalid RTDE TCP pose: {tcp}")
-                    local_tool = robotiq_2f85_points_in_active_tcp(finger_angle_rad=finger_angle) if arm.name == left.name else np.concatenate((robotiq_epick_points_in_active_tcp(), epick_cup_and_mount))
+                    local_tool = robotiq_2f85_points_in_active_tcp(finger_angle_rad=finger_angle if arm.name == left.name else right_finger_angle)
                     tool_points = transform_points(local_tool, arm.base_to_left @ rotvec_transform(tcp) @ arm.tool_from_tcp)
                     points = np.concatenate((arm_points, tool_points)); robots.append(points); robot_col.append(np.tile(color, (len(points), 1)))
-                    depths.append(render_surface_points_depth(points, calibration.camera_to_world, calibration.intrinsics, width=captured.rgb.shape[1], height=captured.rgb.shape[0], splat_radius_pixels=3))
-                rendered = combine_depth(depths); keep = robot_depth_keep_mask(captured.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
-                # Build this mask from the raw, measured D455 map *before*
-                # refinement.  LingBot can plausibly complete depth behind an
-                # arm, but those completed pixels must never reintroduce the
-                # robot into the obstacle cloud.
-                depth_frame = captured
-                if refiner is not None:
-                    depth_frame = refiner.refine((captured,), {"front": calibration})[0]
-                raw_support = raw_depth_support_mask(captured.depth_m, keep, args.raw_depth_support_pixels)
-                refined_keep = raw_support & np.isfinite(depth_frame.depth_m) & (depth_frame.depth_m > 0.0)
-                env, ecol = depth_to_world_points(depth_frame, calibration, stride=args.point_stride, max_depth=2.5, keep_mask=refined_keep)
                 robot = np.concatenate(robots); rcol = np.concatenate(robot_col)
+                refined_frames = frames if refiner is None else {f.camera_name: f for f in refiner.refine(tuple(frames.values()), calibrations)}
+                clouds, colors, measured_surface = [], [], []
+                support_pixels = 0
+                for name, raw in frames.items():
+                    view = calibrations[name]
+                    refined = refined_frames[name]
+                    rendered = render_surface_points_depth(robot, view.camera_to_world, view.intrinsics, width=raw.rgb.shape[1], height=raw.rgb.shape[0], splat_radius_pixels=3)
+                    raw_keep = robot_depth_keep_mask(raw.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                    refined_keep = robot_depth_keep_mask(refined.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                    raw_support = raw_depth_support_mask(raw.depth_m, raw_keep, args.raw_depth_support_pixels)
+                    keep = refined_keep & raw_support
+                    cloud, color = depth_to_world_points(refined, view, stride=args.point_stride, max_depth=2.5, keep_mask=keep)
+                    clouds.append(cloud); colors.append(color); support_pixels += int(raw_support.sum())
+                    v, u = np.nonzero(~raw_keep & (raw.depth_m > 0))
+                    pixels = np.c_[u, v][::max(1, args.point_stride)]
+                    observed, visible = _lift_measured_tracks(raw.depth_m, rendered, pixels, np.ones(len(pixels), bool), view, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance)
+                    measured_surface.append(observed[visible])
+                env, ecol = np.concatenate(clouds), np.concatenate(colors)
+                surface_points = np.concatenate(measured_surface)
                 xmin,xmax,ymin,ymax,zmin,zmax = args.workspace_bounds; mask = (env[:,0]>=xmin)&(env[:,0]<=xmax)&(env[:,1]>=ymin)&(env[:,1]<=ymax)&(env[:,2]>=zmin)&(env[:,2]<=zmax); env,ecol = env[mask],ecol[mask]
-                local = env[(env[:,0]>=xmin)&(env[:,0]<=xmax)&(env[:,1]>=ymin)&(env[:,1]<=ymax)&(env[:,2]>=zmin)&(env[:,2]<=zmax)]
+                local = env
                 if len(local) < 80: raise RuntimeError("not enough robot-filtered points to fit the tabletop")
                 normal, offset, _ = estimate_dominant_plane(local, threshold=args.plane_threshold_m, ransac_iterations=300)
                 # ``left_base`` need not have its +Z along the physical table
@@ -479,20 +476,25 @@ def main() -> None:
                         if box is not None: candidate_boxes.append(expanded_obb(box, args.box_margin_m))
                     else:
                         floating_components += 1
-                boxes = obstacle_gate.update(candidate_boxes)
+                display_boxes = obstacle_gate.update(candidate_boxes)
+                # Safety sees new candidates immediately and retains one missed frame.
+                boxes = [track.box for track in obstacle_gate._tracks]
                 frame_no += 1; ep,ec = cap(env,ecol,args.display_max_points); rp,rc = cap(robot,rcol,args.display_max_points//2)
                 qdelta = max(float(np.max(np.abs(q1[a.name]-q0[a.name]))) for a in (left,right))
-                diagnostics = {"environment_points": int(len(env)), "object_candidate_points": int(len(op)), "table_connected_components": connected_components, "floating_components": floating_components, "candidate_obbs": len(candidate_boxes), "confirmed_obbs": len(boxes), "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": int(raw_support.sum()), "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
+                diagnostics = {"environment_points": int(len(env)), "object_candidate_points": int(len(op)), "table_connected_components": connected_components, "floating_components": floating_components, "candidate_obbs": len(candidate_boxes), "confirmed_obbs": len(display_boxes), "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": support_pixels, "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
                 refinement = f" · LingBot {refiner.last_inference_seconds:.2f}s" if refiner is not None else ""
                 ok, encoded_rgb = cv2.imencode(".jpg", captured.rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if not ok:
                     raise RuntimeError("front RGB JPEG encoding failed")
                 snapshot = {
                     "schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
-                    "frame": frame_no, "host_timestamp_ns": int(captured.host_timestamp_ns or time.monotonic_ns()),
+                    "frame": frame_no, "host_timestamp_ns": int(min(stamps)),
                     "status": f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个桌面连接障碍物",
                     "qpos": {a.name: ((q0[a.name] + q1[a.name]) * .5).astype(float).tolist() for a in (left, right)},
-                    "gripper_position": {"left": float(finger_angle / .8), "right": 0.0},
+                    "gripper_position": {"left": float(finger_angle / .8), "right": float(right_finger_angle / .8)},
+                    "current_surface": surface_points.tolist(),
+                    "surface_source": "measured_depth_fk_gated",
+                    "camera_names": ["front", "side"],
                     "rgb_front_jpeg_base64": base64.b64encode(encoded_rgb.tobytes()).decode("ascii"),
                     "environment": {"points":ep,"colors":ec}, "robot":{"points":rp,"colors":rc},
                     "obbs":[{
@@ -516,11 +518,14 @@ def main() -> None:
             source.stop()
             for receiver in receivers.values(): receiver.disconnect()
             if left_gripper is not None: left_gripper.close()
+            if right_gripper is not None: right_gripper.close()
 
     worker = threading.Thread(target=process, daemon=True); worker.start()
     if args.once:
         worker.join()
-        print(json.dumps({"schema": latest.get("schema"), "coordinate_frame": latest.get("coordinate_frame"), "frame": latest["frame"], "host_timestamp_ns": latest.get("host_timestamp_ns"), "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": latest["obbs"], "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {})}, ensure_ascii=False, indent=2)); return
+        if str(latest["status"]).startswith("error") or "schema" not in latest:
+            raise RuntimeError(f"Obstacle acquisition failed: {latest['status']}")
+        print(json.dumps({"schema": latest.get("schema"), "coordinate_frame": latest.get("coordinate_frame"), "frame": latest["frame"], "host_timestamp_ns": latest.get("host_timestamp_ns"), "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": latest["obbs"], "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {})}, ensure_ascii=False, indent=2)); return latest
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):

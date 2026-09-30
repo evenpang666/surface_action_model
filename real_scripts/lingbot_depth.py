@@ -132,7 +132,7 @@ class LingBotDepthRefiner:
         except ImportError as exc:
             raise ImportError(
                 "LingBot-Depth is not installed. Install it in the same environment with "
-                "'python -m pip install -e git+https://github.com/Robbyant/lingbot-depth.git#egg=mdm'."
+                "'python -m pip install --no-deps -e ./lingbot-depth' after installing requirements/runtime.txt."
             ) from exc
 
         self.camera_names = names

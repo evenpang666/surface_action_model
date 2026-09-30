@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "surface-action-model"
+version = "0.3.0"
+requires-python = ">=3.11,<3.13"
+description = "PI0.5 surface/action flow matching and dual-UR7e perception runtime"
+dependencies = ["numpy>=1.24,<2", "PyYAML>=6", "scipy>=1.11"]
+
+[tool.setuptools.packages.find]
+include = ["safety_module*", "real_scripts*"]
+exclude = ["real_scripts.ur7e_robotiq_d435i_collector.pika_sdk*"]

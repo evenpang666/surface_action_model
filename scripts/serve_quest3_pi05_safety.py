@@ -19,15 +19,34 @@ for path in (REPO_ROOT, REPO_ROOT / "openpi" / "src", REPO_ROOT / "openpi" / "pa
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-MODEL_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-DEFAULT_TOKENIZER_REPOSITORY = "google/paligemma-3b-pt-224"
-DEFAULT_TOKENIZER_FILENAME = "tokenizer.model"
+from safety_module.tokenizer import MODEL_IMAGE_KEYS, _Tokenizer
 
 
-def _cached_huggingface_tokenizer() -> Path | None:
-    hub_root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
-    candidates = sorted((hub_root / "models--google--paligemma-3b-pt-224" / "snapshots").glob("*/tokenizer.model"))
-    return candidates[-1] if candidates else None
+def _verify_cuda_runtime(torch: object, device: object) -> None:
+    """Fail at startup when this PyTorch wheel has no kernels for the GPU."""
+    if getattr(device, "type", None) != "cuda":
+        return
+    try:
+        properties = torch.cuda.get_device_properties(device)
+        compiled_arches = torch.cuda.get_arch_list()
+        # ``to(cuda)`` alone can succeed even when the first CUDA kernel cannot
+        # run. Exercise the same elementary tensor path used by image ingest.
+        torch.zeros((1,), device=device, dtype=torch.float32).add_(1).cpu()
+    except RuntimeError as exc:
+        name = getattr(locals().get("properties"), "name", "unknown")
+        capability = getattr(locals().get("properties"), "major", "?")
+        minor = getattr(locals().get("properties"), "minor", "?")
+        arches = locals().get("compiled_arches", [])
+        raise RuntimeError(
+            "The installed PyTorch CUDA build cannot execute a basic kernel on "
+            f"GPU {name} (compute capability sm_{capability}{minor}); "
+            f"torch={torch.__version__}, torch CUDA={torch.version.cuda}, compiled architectures={arches}. "
+            "Install a PyTorch build that supports this GPU (for H100, include sm_90; "
+            "for RTX 50-series, include sm_120), then restart the policy server."
+        ) from exc
+
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,33 +59,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-class _Tokenizer:
-    def __init__(self, model_path: Path | None) -> None:
-        self.max_len = 200
-        if model_path is None:
-            model_path = _cached_huggingface_tokenizer()
-        if model_path is None:
-            try:
-                from huggingface_hub import hf_hub_download
-
-                model_path = Path(hf_hub_download(repo_id=DEFAULT_TOKENIZER_REPOSITORY, filename=DEFAULT_TOKENIZER_FILENAME))
-            except Exception as exc:
-                raise RuntimeError(
-                    "PaliGemma tokenizer is absent from the Hugging Face cache and could not be downloaded. "
-                    "Copy tokenizer.model to the normal cache or pass --tokenizer-model."
-                ) from exc
-        import sentencepiece
-
-        self._processor = sentencepiece.SentencePieceProcessor(model_file=str(model_path))
-
-    def tokenize(self, prompt: str, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        bins = np.digitize(state, bins=np.linspace(-1, 1, 257)[:-1]) - 1
-        text = f"Task: {prompt.strip().replace('_', ' ').replace(chr(10), ' ')}, State: {' '.join(map(str, bins))};\nAction: "
-        tokens = self._processor.encode(text, add_bos=True)[: self.max_len]
-        values = np.zeros((self.max_len,), dtype=np.int32)
-        mask = np.zeros((self.max_len,), dtype=bool)
-        values[: len(tokens)], mask[: len(tokens)] = tokens, True
-        return values, mask
 
 
 class Quest3JointSafetyPolicy:
@@ -74,18 +66,23 @@ class Quest3JointSafetyPolicy:
         import torch
         from openpi.models.pi0_config import Pi0Config
         from openpi.models_pytorch.pi0_pytorch import PI05SafetyPytorch
+        from openpi.models_pytorch.surface_action_pytorch import SurfaceActionModelPytorch
 
         self.torch = torch
         self.device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
+        _verify_cuda_runtime(torch, self.device)
         # Keep parameter tensors memory-mapped until ``assign=True`` hands
         # their storage directly to the module.  A conventional torch.load +
         # copy produces a state dict, an initialized model and then a CUDA
         # model at once; that can exhaust both 32 GB host RAM and 16 GB GPUs.
         # The checkpoint is a zip-format torch.save file, which supports mmap.
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-        if payload.get("model_type") != "PI05SafetyPytorch":
+        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch"):
             raise ValueError(f"{checkpoint} is not a jointly trained PI05SafetyPytorch checkpoint")
         self.info = dict(payload["metadata"])
+        model_class = SurfaceActionModelPytorch if payload["model_type"] == "SurfaceActionModelPytorch" else PI05SafetyPytorch
+        self.model_type = payload["model_type"]
+        self.measured_surface = self.info.get("point_target") == "visual"
         required = ("action_mean", "action_std", "qpos_mean", "qpos_std", "action_horizon", "logical_action_dim", "joint_dim", "selected_point_indices", "camera_map")
         missing = [key for key in required if key not in self.info]
         if missing:
@@ -109,24 +106,29 @@ class Quest3JointSafetyPolicy:
         # complete extra CUDA state dict.  Some rotary buffers are not stored
         # in the checkpoint, so assigning tensor storage directly is unsafe.
         with torch.device("meta"):
-            self.model = PI05SafetyPytorch(config, joint_dim=self.joint_dim)
+            self.model = model_class(config, joint_dim=self.joint_dim)
         self.model.to_empty(device=self.device)
         self.model.load_state_dict(payload["model_state_dict"], strict=True)
+        from safety_module.checkpoint_loading import restore_nonpersistent_buffers
+
+        restore_nonpersistent_buffers(self.model)
         del payload
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         self.model.eval()
-        self.tokenizer = _Tokenizer(tokenizer_model)
+        self.tokenizer = _Tokenizer(max_len=200, model_path=tokenizer_model)
         self.num_steps = int(num_steps)
         self.metadata = {
-            "model_type": "PI05SafetyPytorch", "joint_action_and_point_flow": True,
+            "model_type": self.model_type, "joint_action_and_point_flow": True,
             "coordinate_frame": self.info.get("coordinate_frame", "left_base"),
             "action_horizon": int(self.info["action_horizon"]), "logical_action_dim": self.logical_action_dim,
             "joint_dim": self.joint_dim, "point_count": len(self.point_indices), "camera_map": self.camera_map,
             "surface_model_hash": self.info.get("surface_model_hash"),
             "point_identity_version": self.info.get("point_identity_version"),
             "points_per_link": self.info.get("points_per_link"),
+            "point_target": self.info.get("point_target", "fixed"),
+            "action_period_s": self.info.get("action_period_s"),
         }
 
     def _points(self, value: object) -> np.ndarray:
@@ -135,7 +137,11 @@ class Quest3JointSafetyPolicy:
             points = points.reshape(-1, 3)
         if points.ndim != 2 or points.shape[-1] != 3:
             raise ValueError(f"robot_points must have shape [K,3] or [L,P,3], got {points.shape}")
-        if len(points) == len(self.point_indices):
+        if self.measured_surface:
+            if len(points) < len(self.point_indices):
+                raise ValueError("Not enough measured current surface points for this checkpoint")
+            selected = points[np.linspace(0, len(points) - 1, len(self.point_indices), dtype=np.int64)]
+        elif len(points) == len(self.point_indices):
             selected = points
         elif len(points) > int(self.point_indices.max(initial=-1)):
             selected = points[self.point_indices]
@@ -162,8 +168,8 @@ class Quest3JointSafetyPolicy:
                 if image.ndim != 3 or image.shape[-1] != 3:
                     raise ValueError(f"{key} must be HxWx3 RGB")
                 available[target] = image
-        if not available:
-            raise KeyError(f"No checkpoint camera was provided; expected {[f'rgb_{name}' for name in self.camera_map]}")
+        if set(available) != set(self.camera_map.values()):
+            raise KeyError(f"All checkpoint cameras are required: {[f'rgb_{name}' for name in self.camera_map]}")
         shape = next(iter(available.values())).shape
         images, masks = {}, {}
         for key in MODEL_IMAGE_KEYS:
@@ -177,7 +183,10 @@ class Quest3JointSafetyPolicy:
             tokenized_prompt_mask=torch.from_numpy(token_mask).to(self.device)[None],
             token_ar_mask=None, token_loss_mask=None,
         )
-        current = self._points(obs["robot_points"])
+        current = self._points(obs.get("current_surface", obs.get("robot_points")))
+        if self.measured_surface and obs.get("surface_source") != "measured_depth_fk_gated":
+            raise ValueError("Measured-surface checkpoint requires measured depth input, never synthetic FK points")
+        selected_indices = np.linspace(0, len(obs["current_surface"]) - 1, len(self.point_indices), dtype=np.int64) if self.measured_surface else self.point_indices
         robot_points = torch.from_numpy(current).to(self.device)[None]
         joints = torch.from_numpy(normalized_qpos).to(self.device)[None]
         with torch.inference_mode():
@@ -188,10 +197,14 @@ class Quest3JointSafetyPolicy:
         actions = normalized * self.action_std[None, :] + self.action_mean[None, :]
         point_offsets = offsets[0].float().cpu().numpy()
         return {
+            "schema_version": 3 if self.model_type == "SurfaceActionModelPytorch" else 2,
+            "action_chunk": actions.astype(np.float32),
+            "current_surface": current,
+            "surface_chunk": (current[None, ...] + point_offsets).astype(np.float32),
             "actions": actions.astype(np.float32),
             "point_offsets": point_offsets.astype(np.float32),
             "predicted_robot_points": (current[None, ...] + point_offsets).astype(np.float32),
-            "selected_point_indices": self.point_indices,
+            "selected_point_indices": selected_indices,
             "surface_model_hash": self.info.get("surface_model_hash", ""),
             "point_identity_version": self.info.get("point_identity_version", ""),
             "points_per_link": int(self.info.get("points_per_link", 0)),

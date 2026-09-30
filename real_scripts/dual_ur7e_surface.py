@@ -11,9 +11,7 @@ import yaml
 from real_scripts.robotiq_vendor_visual_models import (
     TWO_F85_LINK_NAMES,
     robotiq_2f85_points_in_active_tcp,
-    robotiq_epick_points_in_active_tcp,
 )
-from real_scripts.tool_urdf_collision import sample_collision_surface
 from real_scripts.ur7e_collision_mesh import UR7eCollisionSurfacePointSampler, flange_transform
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
 
@@ -34,6 +32,8 @@ def _matrix(value: object, *, name: str) -> np.ndarray:
     result = np.asarray(value, dtype=np.float64)
     if result.shape != (4, 4) or not np.isfinite(result).all() or not np.allclose(result[3], (0, 0, 0, 1)):
         raise ValueError(f"{name} must be a finite homogeneous 4x4 matrix")
+    if not np.allclose(result[:3, :3].T @ result[:3, :3], np.eye(3), atol=1e-4) or np.linalg.det(result[:3, :3]) < .99:
+        raise ValueError(f"{name} rotation must be proper orthonormal")
     return result
 
 
@@ -43,21 +43,21 @@ def _right_base_to_left_base(hardware_path: Path) -> np.ndarray:
     left_path = (hardware_path.parent / hardware["arms"]["left_arm"]["front_calibration"]).resolve()
     right_path = (hardware_path.parent / hardware["arms"]["right_arm"]["front_calibration"]).resolve()
     with left_path.open(encoding="utf-8") as handle:
-        left_to_camera = _matrix(yaml.safe_load(handle)["matrix"], name=str(left_path))
+        T_left_base_from_front = _matrix(yaml.safe_load(handle)["matrix"], name=str(left_path))
     with right_path.open(encoding="utf-8") as handle:
-        right_to_camera = _matrix(yaml.safe_load(handle)["matrix"], name=str(right_path))
-    return left_to_camera @ np.linalg.inv(right_to_camera)
+        T_right_base_from_front = _matrix(yaml.safe_load(handle)["matrix"], name=str(right_path))
+    return T_left_base_from_front @ np.linalg.inv(T_right_base_from_front)
 
 
 class DualUR7eSurfacePointSampler:
-    """Generate stable UR7e + 2F-85/EPick collision points in ``left_base``.
+    """Generate stable dual-UR7e + 2F-85 collision points in ``left_base``.
 
     A six-joint input emits the recorded left arm only.  A twelve-joint input
     emits both arms in configured order.  This prevents single-arm Quest3
     episodes from inventing a stationary right-arm target.
     """
 
-    point_identity_version = "dual_ur7e_2f85_epick_collision_surface_v1"
+    point_identity_version = "dual_ur7e_dual_2f85_collision_surface_v1"
 
     def __init__(self, *, points_per_link: int = 128, project_config: Path | str = DEFAULT_PROJECT_CONFIG) -> None:
         if int(points_per_link) < 2:
@@ -65,6 +65,8 @@ class DualUR7eSurfacePointSampler:
         self.points_per_link = int(points_per_link)
         self.config, self.config_path = load_project_config(project_config)
         robot = self.config["robot"]
+        if any(robot["tools"][arm] != "robotiq_2f85" for arm in ("left_arm", "right_arm")):
+            raise ValueError("This surface model requires two Robotiq 2F-85 tools")
         self.tcp_transform_verified = {
             arm: bool(robot["flange_to_active_tcp"][arm].get("verified", False))
             for arm in ("left_arm", "right_arm")
@@ -79,16 +81,7 @@ class DualUR7eSurfacePointSampler:
         self.left_link_names = tuple(f"left_ur7e_{name}" for name in UR_NAMES) + tuple(
             f"left_{name}" for name in TWO_F85_LINK_NAMES
         )
-        self.right_link_names = tuple(f"right_ur7e_{name}" for name in UR_NAMES) + ("right_robotiq_epick",)
-        epick_urdf = Path(__file__).resolve().parents[1] / "assets" / "robot_models" / "robotiq_epick" / "urdf" / "robotiq_epick_active_tcp_collision.urdf"
-        epick_cloud = np.concatenate(
-            (
-                robotiq_epick_points_in_active_tcp(samples=max(self.points_per_link * 4, 512)),
-                sample_collision_surface(epick_urdf, margin_m=0.0, resolution_m=0.005),
-            )
-        )
-        indices = np.linspace(0, len(epick_cloud) - 1, self.points_per_link, dtype=np.int64)
-        self.epick_local = np.asarray(epick_cloud[indices], dtype=np.float32)
+        self.right_link_names = tuple(f"right_ur7e_{name}" for name in UR_NAMES) + tuple(f"right_{name}" for name in TWO_F85_LINK_NAMES)
         left_hasher = hashlib.sha256()
         left_hasher.update(self.point_identity_version.encode())
         left_hasher.update(self.ur.mesh_model_hash.encode())
@@ -102,7 +95,7 @@ class DualUR7eSurfacePointSampler:
         dual_hasher.update(self.ur.mesh_model_hash.encode())
         dual_hasher.update(self.flange_to_tcp["right_arm"].tobytes())
         dual_hasher.update(self.right_base_to_left_base.tobytes())
-        dual_hasher.update(self.epick_local.tobytes())
+        dual_hasher.update(robotiq_2f85_points_in_active_tcp(finger_angle_rad=0.0, samples_per_link=self.points_per_link).tobytes())
         self.dual_surface_model_hash = dual_hasher.hexdigest()
 
     @staticmethod
@@ -144,7 +137,8 @@ class DualUR7eSurfacePointSampler:
             right_q = q[6:12]
             right_ur = _transform(self.ur.link_points(right_q), self.right_base_to_left_base)
             right_tool_tf = self.right_base_to_left_base @ flange_transform(right_q) @ self.flange_to_tcp["right_arm"]
-            right_tool = _transform(self.epick_local, right_tool_tf)[None, ...]
+            right_tool_local = robotiq_2f85_points_in_active_tcp(finger_angle_rad=float(np.clip(grip[1], 0.0, 1.0) * 0.8), samples_per_link=self.points_per_link).reshape(len(TWO_F85_LINK_NAMES), self.points_per_link, 3)
+            right_tool = _transform(right_tool_local, right_tool_tf)
             parts.extend((right_ur, right_tool))
         return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
 

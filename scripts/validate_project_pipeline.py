@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler  # noqa: E402
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config  # noqa: E402
+from safety_module.shards import open_shard
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +59,7 @@ def main() -> None:
             if qpos.shape[1] not in (6, 12) or action.shape != qpos.shape or not episode["complete"]:
                 errors.append("raw episode contract is invalid")
     if args.shard is not None:
-        with np.load(args.shard, allow_pickle=False) as data:
+        with open_shard(args.shard) as data:
             shard_points_per_link = int(np.asarray(data["points_per_link"]).item())
             shard_arm_count = int(np.asarray(data["arm_count"]).item())
             shard = {
@@ -74,7 +75,8 @@ def main() -> None:
             if str(data["coordinate_frame"]) != "left_base" or offsets.shape[:2] != actions.shape[:2] or offsets.shape[2:] != current.shape[1:]:
                 errors.append("processed shard contract is invalid")
             shard_sampler = DualUR7eSurfacePointSampler(points_per_link=shard_points_per_link, project_config=config_path)
-            if str(np.asarray(data["surface_model_hash"]).item()) != shard_sampler.model_hash(shard_arm_count):
+            surface_arm_count = int(data["surface_arm_count"]) if "surface_arm_count" in data else shard_arm_count
+            if str(np.asarray(data["surface_model_hash"]).item()) != shard_sampler.model_hash(surface_arm_count):
                 errors.append("processed shard surface hash differs from current robot/TCP configuration")
     if args.checkpoint is not None:
         import torch
@@ -86,7 +88,7 @@ def main() -> None:
             "logical_action_dim": metadata.get("logical_action_dim"), "joint_dim": metadata.get("joint_dim"),
             "action_horizon": metadata.get("action_horizon"), "point_count": len(metadata.get("selected_point_indices", [])),
         }
-        if payload.get("model_type") != "PI05SafetyPytorch" or metadata.get("coordinate_frame") != "left_base":
+        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch") or metadata.get("coordinate_frame") != "left_base":
             errors.append("joint PI05 checkpoint contract is invalid")
     if args.obstacle_url is not None:
         with urlopen(args.obstacle_url, timeout=2.0) as response:
@@ -95,6 +97,11 @@ def main() -> None:
             "schema": snapshot.get("schema"), "coordinate_frame": snapshot.get("coordinate_frame"),
             "frame": snapshot.get("frame"), "obbs": len(snapshot.get("obbs", [])),
         }
+        from safety_module.runtime_contract import validate_snapshot
+        try:
+            validate_snapshot(snapshot, float(config["safety"]["stale_timeout_s"]))
+        except (ValueError, RuntimeError, KeyError) as exc:
+            errors.append(str(exc))
         if snapshot.get("schema") != "dual_ur7e_obstacle_snapshot_v2" or snapshot.get("coordinate_frame") != "left_base":
             errors.append("obstacle snapshot contract is invalid")
     print(json.dumps({"ok": not errors, "checks": checks, "errors": errors}, ensure_ascii=False, indent=2, default=list))

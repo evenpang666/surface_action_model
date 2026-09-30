@@ -5,7 +5,7 @@ coordinate_frame: left_base
 # Paths are resolved relative to this repository.  The Quest3 collector is a
 # sibling project in the default workstation layout.
 quest3:
-  hardware_config: ../quest3_collect/config/hardware_dual_teleop.yaml
+  hardware_config: configs/hardware/hardware_dual_teleop.yaml
   data_globs:
     - ../quest3_collect/data/left_vr_episodes/*.hdf5
     - ../quest3_collect/data/dual_vr_episodes/*.hdf5
@@ -24,7 +24,7 @@ robot:
     - wrist_3_joint
   tools:
     left_arm: robotiq_2f85
-    right_arm: robotiq_epick
+    right_arm: robotiq_2f85
   # ^flange T_active_tcp, measured receive-only from both controllers on 2026-09-10.
   flange_to_active_tcp:
     left_arm:
@@ -57,6 +57,14 @@ model:
   source_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi05_base
 
 safety:
+  camera_calibration_valid: false
+  calibration_invalid_reason: "2026-09-22: user confirmed front calibration invalid and side uncalibrated"
+  front_calibration: configs/hardware/calibration/front_current.yaml
+  right_front_calibration: configs/hardware/calibration/right_front_current.yaml
+  side_calibration: configs/hardware/calibration/side_current.yaml
+  max_camera_skew_s: 0.10
+  policy_host: 192.168.124.64
+  max_state_drift_rad: 0.01
   obstacle_url: http://127.0.0.1:8766/snapshot.json
   stale_timeout_s: 1.5
   collision_margin_m: 0.010
