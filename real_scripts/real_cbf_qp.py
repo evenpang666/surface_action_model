@@ -151,6 +151,8 @@ def select_point_flow_constraints(
     collision_margin_m: float = 0.0,
     trigger_margin_m: float = 0.02,
     max_constraints: int = 32,
+    rounded_margin: bool = False,
+    normal_at_prediction: bool = False,
 ) -> list[PointFlowConstraint]:
     current_source = np.asarray(current_link_points, dtype=np.float32)
     predicted_source = np.asarray(predicted_link_points, dtype=np.float32)
@@ -169,17 +171,23 @@ def select_point_flow_constraints(
     for box_id, box in enumerate(boxes):
         center = np.asarray(box.center, dtype=np.float32).reshape(3)
         axes = np.asarray(box.axes, dtype=np.float32).reshape(3, 3)
-        half = np.asarray(box.half_sizes, dtype=np.float32).reshape(3) + float(collision_margin_m)
+        # The replay collision checker uses Euclidean distance to the original
+        # OBB (rounded corners), while the legacy selector expands each axis.
+        # Keep the legacy behavior for existing callers unless requested.
+        half = np.asarray(box.half_sizes, dtype=np.float32).reshape(3)
+        if not rounded_margin:
+            half = half + float(collision_margin_m)
         current_local = (current - center) @ axes
         predicted_local = (predicted - center) @ axes
-        distances = _box_signed_distance(predicted_local, half)
+        offset = float(collision_margin_m) if rounded_margin else 0.0
+        distances = _box_signed_distance(predicted_local, half) - offset
         dangerous = distances <= float(trigger_margin_m)
         for flat_point_id in np.flatnonzero(dangerous.any(axis=0)):
             time_index = int(np.argmin(distances[:, flat_point_id]))
             local_current = current_local[flat_point_id]
             local_predicted = predicted_local[time_index, flat_point_id]
-            normal = axes @ _box_gradient(local_current, half)
-            current_h = float(_box_signed_distance(local_current[None], half)[0])
+            normal = axes @ _box_gradient(local_predicted if normal_at_prediction else local_current, half)
+            current_h = float(_box_signed_distance(local_current[None], half)[0]) - offset
             predicted_h = float(distances[time_index, flat_point_id])
             if len(link_shape) == 2:
                 link_id, point_id = np.unravel_index(int(flat_point_id), link_shape)
@@ -197,6 +205,7 @@ def select_inter_arm_constraints(
     minimum_distance_m: float = 0.035,
     trigger_margin_m: float = 0.02,
     max_constraints: int = 24,
+    normal_at_prediction: bool = False,
 ) -> list[PointPairFlowConstraint]:
     """Select predicted left/right point pairs that violate arm separation."""
     from scipy.spatial import cKDTree
@@ -223,7 +232,8 @@ def select_inter_arm_constraints(
                 distance = float(np.linalg.norm(delta))
                 current_delta = current[first] - current[second]
                 current_distance = float(np.linalg.norm(current_delta))
-                normal = current_delta / max(current_distance, 1e-8)
+                direction = delta if normal_at_prediction and distance > 1e-8 else current_delta
+                normal = direction / max(float(np.linalg.norm(direction)), 1e-8)
                 item = PointPairFlowConstraint(
                     normal.astype(np.float32), current_distance - minimum_distance_m,
                     distance - minimum_distance_m, first, second, time_id,
@@ -243,6 +253,8 @@ def project_joint_delta_qp(
     upper_delta: np.ndarray,
     alpha: float = 1.0,
     iterations: int = 32,
+    use_current_barrier: bool = False,
+    use_predicted_linearization: bool = False,
 ) -> tuple[np.ndarray, dict[str, float | int | bool | str]]:
     """Solve ``min 0.5||dq-dq_nom||²`` with bounds and linear CBF constraints."""
     nominal = np.asarray(nominal_delta, dtype=np.float64).reshape(-1)
@@ -254,6 +266,8 @@ def project_joint_delta_qp(
         raise ValueError("joint-delta lower bounds exceed upper bounds")
     if not all(np.isfinite(x).all() for x in (nominal, low, high, jacobian)) or not 0 < alpha <= 1:
         raise ValueError("QP inputs must be finite; alpha must be in (0, 1]")
+    if use_current_barrier and use_predicted_linearization:
+        raise ValueError("Choose only one CBF linearization reference")
     delta = np.clip(nominal, low, high)
     if not constraints:
         return delta.astype(np.float32), {"triggered": False, "success": True, "constraint_count": 0, "max_violation": 0.0}
@@ -269,17 +283,24 @@ def project_joint_delta_qp(
             else:
                 point_jacobian = jacobian[item.link_id, item.point_id]
             grad = np.asarray(item.normal, dtype=np.float64) @ np.asarray(point_jacobian, dtype=np.float64)
-        # h(q + dq) >= (1-alpha) h(q); predicted penetration makes this
-        # conservative even before the current point reaches the box.
-        barrier_h = min(float(item.current_h), float(item.predicted_h))
-        if not np.isfinite(barrier_h) or not np.isfinite(grad).all():
+        current_h, predicted_h = float(item.current_h), float(item.predicted_h)
+        if not all(np.isfinite(x) for x in (current_h, predicted_h)) or not np.isfinite(grad).all():
             raise ValueError("Invalid barrier or gradient")
+        if use_predicted_linearization:
+            # Linearize the future clearance around the nominal action:
+            # h(q+dq_nom) + grad_future @ (dq-dq_nom) >= (1-alpha) h(q).
+            # This optimizes the action that caused the predicted intrusion.
+            required = (1. - alpha) * current_h - predicted_h + float(grad @ nominal)
+        else:
+            # Legacy callers retain their original conservative constraint.
+            barrier_h = current_h if use_current_barrier else min(current_h, predicted_h)
+            required = -alpha * barrier_h
         if float(np.linalg.norm(grad)) <= 1e-10:
-            if barrier_h < 0:
-                return np.zeros_like(nominal, dtype=np.float32), {"triggered": True, "success": False, "constraint_count": len(constraints), "max_violation": -barrier_h, "reason": "uncontrollable_barrier"}
+            if required > 0:
+                return np.zeros_like(nominal, dtype=np.float32), {"triggered": True, "success": False, "constraint_count": len(constraints), "max_violation": required, "reason": "uncontrollable_barrier"}
             continue
         rows.append(grad)
-        rhs.append(-float(alpha) * barrier_h)
+        rhs.append(required)
     if not rows:
         return delta.astype(np.float32), {"triggered": True, "success": True, "constraint_count": len(constraints), "max_violation": 0.0}
     matrix = np.stack(rows)

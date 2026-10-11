@@ -8,7 +8,7 @@ import json
 
 import numpy as np
 import trimesh
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, minimum_filter
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -322,6 +322,8 @@ def render_surface_points_depth(
     width: int,
     height: int,
     splat_radius_pixels: int = 2,
+    distortion: np.ndarray | None = None,
+    distortion_model: str = "brown_conrady",
 ) -> np.ndarray:
     """Z-buffer a base-frame point-sampled mesh into a colour-camera depth map."""
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
@@ -329,20 +331,16 @@ def render_surface_points_depth(
     camera = (world_to_camera @ np.concatenate((points, np.ones((len(points), 1))), axis=1).T).T[:, :3]
     z = camera[:, 2]
     valid = np.isfinite(camera).all(axis=1) & (z > 1e-5)
-    fx, fy, cx, cy = float(intrinsics[0, 0]), float(intrinsics[1, 1]), float(intrinsics[0, 2]), float(intrinsics[1, 2])
-    u = np.rint(fx * camera[:, 0] / z + cx).astype(np.int64)
-    v = np.rint(fy * camera[:, 1] / z + cy).astype(np.int64)
+    from real_scripts.camera_geometry import project_pixels
+    uv = np.zeros((len(camera), 2), dtype=float)
+    uv[valid] = project_pixels(camera[valid], intrinsics, distortion, distortion_model)
+    u, v = np.rint(uv).astype(np.int64).T
     valid &= (u >= 0) & (u < int(width)) & (v >= 0) & (v < int(height))
     depth = np.full((int(height), int(width)), np.inf, dtype=np.float32)
     np.minimum.at(depth, (v[valid], u[valid]), z[valid].astype(np.float32))
     radius = max(0, int(splat_radius_pixels))
     if radius:
-        source = depth.copy()
-        padded = np.pad(source, ((radius, radius), (radius, radius)), constant_values=np.inf)
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                if dx or dy:
-                    depth = np.minimum(depth, padded[radius + dy : radius + dy + height, radius + dx : radius + dx + width])
+        depth = minimum_filter(depth, size=2 * radius + 1, mode="constant", cval=np.inf)
     depth[~np.isfinite(depth)] = 0.0
     return depth
 

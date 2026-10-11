@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol, Sequence
 
 import numpy as np
+from scipy.ndimage import minimum_filter
 
 
 UR7E_LINK_NAMES = (
@@ -37,6 +38,8 @@ class CameraCalibration:
     name: str
     intrinsics: np.ndarray
     camera_to_world: np.ndarray
+    distortion: np.ndarray | None = None
+    distortion_model: str = "brown_conrady"
 
     def __post_init__(self) -> None:
         intrinsics = np.asarray(self.intrinsics, dtype=np.float64)
@@ -47,6 +50,11 @@ class CameraCalibration:
             raise ValueError(f"camera_to_world must have shape (4, 4), got {camera_to_world.shape}")
         object.__setattr__(self, "intrinsics", intrinsics)
         object.__setattr__(self, "camera_to_world", camera_to_world)
+        if self.distortion is not None:
+            distortion = np.asarray(self.distortion, dtype=float).reshape(-1)
+            if not np.isfinite(distortion).all():
+                raise ValueError("Non-finite camera lens distortion")
+            object.__setattr__(self, "distortion", distortion)
 
 
 @dataclass(frozen=True)
@@ -252,7 +260,9 @@ def depth_to_world_points(
     if abs(fx) <= 1e-12 or abs(fy) <= 1e-12:
         raise ValueError("camera intrinsics fx/fy must be non-zero")
 
-    camera_points = np.stack(((u - cx) * z / fx, (v - cy) * z / fy, z), axis=1)
+    from real_scripts.camera_geometry import pixel_rays
+    camera_points = pixel_rays(np.column_stack((u, v)), calibration.intrinsics,
+                               calibration.distortion, calibration.distortion_model)*z[:, None]
     homogeneous = np.concatenate([camera_points, np.ones((camera_points.shape[0], 1), dtype=np.float64)], axis=1)
     world_points = (calibration.camera_to_world @ homogeneous.T).T[:, :3]
     colors = rgb[v, u]
@@ -294,14 +304,8 @@ def robot_depth_keep_mask(
         raise ValueError("dilation_pixels must be non-negative")
 
     expanded = np.where(np.isfinite(rendered) & (rendered > 0.0), rendered, np.inf)
-    for _ in range(int(dilation_pixels)):
-        padded = np.pad(expanded, 1, mode="constant", constant_values=np.inf)
-        neighbours = [
-            padded[row_offset : row_offset + expanded.shape[0], col_offset : col_offset + expanded.shape[1]]
-            for row_offset in range(3)
-            for col_offset in range(3)
-        ]
-        expanded = np.minimum.reduce(neighbours)
+    if dilation_pixels:
+        expanded = minimum_filter(expanded, size=2 * int(dilation_pixels) + 1, mode="constant", cval=np.inf)
 
     robot_visible = np.isfinite(expanded)
     measured_valid = np.isfinite(measured) & (measured > 0.0)

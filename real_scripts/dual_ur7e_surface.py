@@ -14,6 +14,7 @@ from real_scripts.robotiq_vendor_visual_models import (
 )
 from real_scripts.ur7e_collision_mesh import UR7eCollisionSurfacePointSampler, flange_transform
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
+from safety_module.dual_camera_calibration import calibration_from_project
 
 
 UR_NAMES = ("base", "shoulder", "upperarm", "forearm", "wrist1", "wrist2", "wrist3")
@@ -76,7 +77,10 @@ class DualUR7eSurfacePointSampler:
             for arm in ("left_arm", "right_arm")
         }
         hardware_path = resolve_repo_path(self.config["quest3"]["hardware_config"])
-        self.right_base_to_left_base = _right_base_to_left_base(hardware_path)
+        calibration = calibration_from_project(self.config)
+        self.calibration_digest = calibration.digest if calibration is not None else None
+        self.right_base_to_left_base = (calibration.right_base_to_left_base if calibration is not None
+                                        else _right_base_to_left_base(hardware_path))
         self.ur = UR7eCollisionSurfacePointSampler(points_per_link=self.points_per_link)
         self.left_link_names = tuple(f"left_ur7e_{name}" for name in UR_NAMES) + tuple(
             f"left_{name}" for name in TWO_F85_LINK_NAMES

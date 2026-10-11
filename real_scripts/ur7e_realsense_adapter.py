@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
+import warnings
 from typing import Protocol, Sequence
 
 import numpy as np
@@ -59,6 +60,8 @@ class RealSenseD435iSource:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        depth_width: int | None = None,
+        depth_height: int | None = None,
         wait_timeout_ms: int = 5000,
         read_retries: int = 3,
     ) -> None:
@@ -68,12 +71,66 @@ class RealSenseD435iSource:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
+        if (depth_width is None) != (depth_height is None):
+            raise ValueError("Specify both depth_width and depth_height")
+        self.depth_size = None if depth_width is None else (int(depth_width), int(depth_height))
+        if min(self.width, self.height, self.fps, *(self.depth_size or (1, 1))) <= 0:
+            raise ValueError("RealSense resolutions and fps must be positive")
+        if len({c.name for c in self.cameras}) != len(self.cameras):
+            raise ValueError("RealSense camera names must be unique")
         self.wait_timeout_ms = int(wait_timeout_ms)
         self.read_retries = max(int(read_retries), 1)
         self._rs = None
         self._pipelines = []
         self._aligns = []
         self._color_calibrations: dict[str, dict[str, object]] = {}
+        self._stream_info: dict[str, dict[str, object]] = {}
+
+    def _stream_requests(self, rs):
+        devices = {d.get_info(rs.camera_info.serial_number): d for d in rs.context().query_devices()}
+        requests, used = [], set()
+        for camera in self.cameras:
+            serial = str(camera.serial) if camera.serial else next((s for s in devices if s not in used), None)
+            if serial not in devices:
+                raise RuntimeError(f"RealSense camera {camera.name!r}, serial={serial}, is not connected; "
+                                   f"available serials: {sorted(devices)}")
+            if serial in used:
+                raise ValueError(f"RealSense serial {serial} assigned to multiple views")
+            used.add(serial)
+            device = devices[serial]
+            usb = device.get_info(rs.camera_info.usb_type_descriptor) if device.supports(rs.camera_info.usb_type_descriptor) else "unknown"
+            profiles = {rs.stream.color: set(), rs.stream.depth: set()}
+            for sensor in device.query_sensors():
+                for profile in sensor.get_stream_profiles():
+                    stream = profile.stream_type()
+                    if stream not in profiles:
+                        continue
+                    wanted_format = rs.format.rgb8 if stream == rs.stream.color else rs.format.z16
+                    if profile.format() == wanted_format:
+                        video = profile.as_video_stream_profile()
+                        profiles[stream].add((video.width(), video.height(), profile.fps()))
+            requested = (self.width, self.height, self.fps)
+            if requested not in profiles[rs.stream.color]:
+                raise RuntimeError(f"RealSense {camera.name!r} serial={serial} USB={usb}: "
+                                   f"unsupported RGB {requested}; supported: {sorted(profiles[rs.stream.color])}")
+            if self.depth_size is not None:
+                depth = (*self.depth_size, self.fps)
+                if depth not in profiles[rs.stream.depth]:
+                    raise RuntimeError(f"RealSense {camera.name!r} serial={serial} USB={usb}: "
+                                       f"unsupported depth {depth}; supported: {sorted(profiles[rs.stream.depth])}")
+            elif requested in profiles[rs.stream.depth]:
+                depth = requested
+            else:
+                candidates = [p for p in profiles[rs.stream.depth] if p[2] == self.fps]
+                if not candidates:
+                    raise RuntimeError(f"RealSense {camera.name!r} serial={serial} USB={usb}: "
+                                       f"no Z16 depth profile at {self.fps} fps; supported: {sorted(profiles[rs.stream.depth])}")
+                depth = min(candidates, key=lambda p: (abs(p[0]*p[1]-self.width*self.height), p))
+                warnings.warn(f"RealSense {camera.name!r} serial={serial} USB={usb}: depth {requested} "
+                              f"unsupported; using {depth}, aligned to RGB {requested}", RuntimeWarning, stacklevel=2)
+            info = {"serial": serial, "usb": usb, "color": list(requested), "depth": list(depth)}
+            requests.append((camera.name, serial, depth, info))
+        return requests
 
     def start(self) -> None:
         try:
@@ -82,37 +139,63 @@ class RealSenseD435iSource:
             raise ImportError("Missing dependency 'pyrealsense2' for Intel RealSense D435i cameras.") from exc
 
         self._rs = rs
-        self._pipelines = []
-        self._aligns = []
+        if self._pipelines:
+            raise RuntimeError("RealSense source is already started")
         self._color_calibrations = {}
-        for camera in self.cameras:
-            pipeline = rs.pipeline()
-            config = rs.config()
-            if camera.serial:
-                config.enable_device(str(camera.serial))
-            config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
-            config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-            profile = pipeline.start(config)
-            color_intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-            self._color_calibrations[camera.name] = {
-                "intrinsics": [
-                    [float(color_intrinsics.fx), 0.0, float(color_intrinsics.ppx)],
-                    [0.0, float(color_intrinsics.fy), float(color_intrinsics.ppy)],
-                    [0.0, 0.0, 1.0],
-                ],
-                "distortion": [float(value) for value in color_intrinsics.coeffs],
-                "width": int(color_intrinsics.width),
-                "height": int(color_intrinsics.height),
-            }
-            self._pipelines.append((camera.name, pipeline))
-            self._aligns.append(rs.align(rs.stream.color))
+        self._stream_info = {}
+        requests = self._stream_requests(rs)
+        try:
+            for name, serial, depth, info in requests:
+                pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_device(serial)
+                config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+                config.enable_stream(rs.stream.depth, *depth[:2], rs.format.z16, depth[2])
+                try:
+                    profile = pipeline.start(config)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"Failed to start RealSense {name!r} serial={serial} USB={info['usb']} "
+                                       f"RGB={info['color']} depth={info['depth']}: {exc}. "
+                                       "Check camera ownership and USB connection/bandwidth.") from exc
+                self._pipelines.append((name, pipeline))
+                color_intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+                self._color_calibrations[name] = {
+                    "intrinsics": [
+                        [float(color_intrinsics.fx), 0.0, float(color_intrinsics.ppx)],
+                        [0.0, float(color_intrinsics.fy), float(color_intrinsics.ppy)],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "distortion": [float(value) for value in color_intrinsics.coeffs],
+                    "distortion_model": str(color_intrinsics.model).rsplit(".", 1)[-1],
+                    "width": int(color_intrinsics.width),
+                    "height": int(color_intrinsics.height),
+                }
+                self._stream_info[name] = info
+                self._aligns.append(rs.align(rs.stream.color))
+        except BaseException:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            raise
 
     def stop(self) -> None:
-        for _, pipeline in self._pipelines:
-            pipeline.stop()
+        pipelines = self._pipelines
         self._pipelines = []
         self._aligns = []
         self._color_calibrations = {}
+        self._stream_info = {}
+        errors = []
+        for name, pipeline in pipelines:
+            try:
+                pipeline.stop()
+            except Exception as exc:
+                errors.append((name, exc))
+        if errors:
+            raise RuntimeError(f"Failed to stop RealSense cameras: {[name for name, _ in errors]}") from errors[0][1]
+
+    def get_stream_info(self) -> dict[str, dict[str, object]]:
+        return {name: dict(info) for name, info in self._stream_info.items()}
 
     def get_color_calibrations(self) -> dict[str, dict[str, object]]:
         """Return SDK-reported colour intrinsics for the RGB-aligned depth stream."""

@@ -5,7 +5,9 @@ import numpy as np
 import pytest
 import torch
 
-from real_scripts.real_cbf_qp import OrientedBox, PointFlowConstraint, select_point_flow_constraints, project_joint_delta_qp
+from real_scripts.real_cbf_qp import (OrientedBox, PointFlowConstraint,
+                                      project_joint_delta_qp, select_inter_arm_constraints,
+                                      select_point_flow_constraints)
 from safety_module.checkpoint_loading import restore_nonpersistent_buffers
 from safety_module.runtime_contract import validate_prediction, validate_snapshot
 from safety_module.measured_surface import MeasuredSurfaceSampler
@@ -102,6 +104,70 @@ def test_deepest_future_barrier_and_nan_rejection():
     assert constraints[0].predicted_h == pytest.approx(-.05)
     with pytest.raises(ValueError):
         select_point_flow_constraints(current, future * np.nan, [box])
+
+
+def test_rounded_box_margin_matches_euclidean_corner_clearance():
+    box = OrientedBox(np.zeros(3), np.eye(3), np.asarray([.01, .01, .1]))
+    current = np.asarray([[-.05, -.05, 0.]])
+    legacy = select_point_flow_constraints(current, current[None], [box],
+                                           collision_margin_m=.05, trigger_margin_m=.01)
+    rounded = select_point_flow_constraints(current, current[None], [box],
+                                            collision_margin_m=.05, trigger_margin_m=.01,
+                                            rounded_margin=True)
+    assert legacy[0].current_h < 0
+    assert rounded[0].current_h == pytest.approx(np.hypot(.04, .04)-.05)
+
+
+def test_current_cbf_barrier_does_not_make_safe_braking_infeasible():
+    item = PointFlowConstraint(np.array([-1., 0., 0.]), .06, -.04, 0, 0, 0)
+    jacobian = np.zeros((1, 3, 12)); jacobian[0, 0, 0] = 1.
+    nominal = np.zeros(12); nominal[0] = .03
+    lower, upper = np.full(12, -.05), np.full(12, .05)
+    lower[0], upper[0] = .02, .03
+    _, legacy = project_joint_delta_qp(nominal, jacobian, [item], lower_delta=lower,
+                                       upper_delta=upper, iterations=64)
+    safe, corrected = project_joint_delta_qp(nominal, jacobian, [item], lower_delta=lower,
+                                             upper_delta=upper, iterations=64,
+                                             use_current_barrier=True)
+    assert not legacy['success']
+    assert corrected['success']
+    assert .02 <= safe[0] <= .03
+
+
+def test_future_surface_intrusion_is_removed_by_action_projection():
+    item = PointFlowConstraint(np.array([-1., 0., 0.]), .06, -.04, 0, 0, 0)
+    jacobian = np.zeros((1, 3, 12)); jacobian[0, 0, 0] = 1.
+    nominal = np.zeros(12); nominal[0] = .1
+    safe, info = project_joint_delta_qp(
+        nominal, jacobian, [item], lower_delta=np.full(12, -.1),
+        upper_delta=np.full(12, .1), iterations=64,
+        use_predicted_linearization=True)
+    assert info['success']
+    assert safe[0] == pytest.approx(.06, abs=1e-6)
+    # At the nominal endpoint h=-.04; changing the action by -.04
+    # raises that same future point to the clearance boundary.
+    assert item.predicted_h + float(item.normal[0]) * (safe[0]-nominal[0]) >= -1e-6
+
+
+def test_future_point_normal_uses_predicted_side_of_box():
+    box = OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))
+    current = np.array([[.35, 0., 0.]])
+    future = np.array([[[.55, 0., 0.]]])
+    old = select_point_flow_constraints(current, future, [box], normal_at_prediction=False)
+    projected = select_point_flow_constraints(current, future, [box], normal_at_prediction=True)
+    assert old[0].normal[0] == pytest.approx(-1.)
+    assert projected[0].normal[0] == pytest.approx(1.)
+
+
+def test_future_inter_arm_normal_uses_predicted_point_order():
+    current = np.array([[-.1, 0., 0.], [.1, 0., 0.]])
+    future = np.array([[[.01, 0., 0.], [-.01, 0., 0.]]])
+    mask = np.array([True, False])
+    old = select_inter_arm_constraints(current, future, mask, normal_at_prediction=False)
+    projected = select_inter_arm_constraints(current, future, mask,
+                                              normal_at_prediction=True)
+    assert old[0].normal[0] == pytest.approx(-1.)
+    assert projected[0].normal[0] == pytest.approx(1.)
 
 
 def test_uncontrollable_violation_cannot_be_hidden_by_feasible_constraint():
@@ -280,9 +346,14 @@ def test_two_view_perception_without_hardware(monkeypatch):
     monkeypatch.setattr(live, "load_arms", lambda args: (*arms, cal, {"camera_serial": "front", "right_base_to_left_base": np.eye(4).tolist()}))
     monkeypatch.setattr(live, "load_calibration", lambda path: (np.eye(4), K, "side", {"parent_frame": "left_base"}))
     class Receiver:
-        def __init__(self, ip): pass
+        def __init__(self, ip): self.arm = "left_arm" if ip == "fake-left" else "right_arm"
         def getActualQ(self): return np.zeros(6)
-        def getActualTCPPose(self): return np.zeros(6)
+        def getActualTCPPose(self):
+            from scipy.spatial.transform import Rotation
+            from safety_module.project_config import load_project_config
+            flange_to_tcp = np.asarray(load_project_config()[0]["robot"]["flange_to_active_tcp"][self.arm]["matrix"])
+            transform = live.flange_transform(np.zeros(6)) @ flange_to_tcp
+            return np.r_[transform[:3, 3], Rotation.from_matrix(transform[:3, :3]).as_rotvec()]
         def disconnect(self): pass
     monkeypatch.setitem(sys.modules, "rtde_receive", SimpleNamespace(RTDEReceiveInterface=Receiver))
     class Gripper:
@@ -296,6 +367,7 @@ def test_two_view_perception_without_hardware(monkeypatch):
         def start(self): pass
         def stop(self): pass
         def get_color_calibrations(self): return {n: {"intrinsics": K.tolist()} for n in ("front", "side")}
+        def get_stream_info(self): return {}
         def read(self):
             stamp = time.monotonic_ns()
             depth = np.full((60, 80), .6, np.float32); depth[20:40, 30:50] = .55
@@ -311,3 +383,411 @@ def test_two_view_perception_without_hardware(monkeypatch):
     assert snapshot["gripper_position"] == pytest.approx({"left": .3, "right": .7})
     assert len(snapshot["current_surface"]) > 0
     assert snapshot["diagnostics"]["environment_points"] > 0
+    assert len(snapshot["_viewer_environment"]["points"]) >= len(snapshot["environment"]["points"])
+    assert snapshot["diagnostics"]["viewer_outside_workspace_points"] >= 0
+    assert snapshot["published_timestamp_ns"] >= snapshot["host_timestamp_ns"]
+    assert snapshot["diagnostics"]["capture_to_publish_seconds"] >= 0
+
+
+def test_compact_scene_preserves_capture_state_geometry_and_calibration():
+    import json
+    from real_scripts.live_dual_ur7e_obstacle_model import snapshot_payload
+    snapshot = {"schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
+                "host_timestamp_ns": 100, "published_timestamp_ns": 200, "status": "ok",
+                "qpos": {"left": [0.]*6, "right": [0.]*6},
+                "gripper_position": {"left": .3, "right": .7},
+                "obbs": [{"center": [1., 2., 3.], "axes": np.eye(3).tolist(), "half_sizes": [.1]*3}],
+                "calibration": {"sha256": "calibration-id"}, "diagnostics": {"processing_seconds": .2},
+                "environment": {"points": [[0.]*3]*1000},
+                "_viewer_environment": {"points": [[1.]*3]*1000},
+                "robot": {"points": [[0.]*3]*1000},
+                "current_surface": [[0.]*3]*1000, "rgb_front_jpeg_base64": "jpeg"}
+    full = snapshot_payload(snapshot)
+    viewer = snapshot_payload(snapshot, viewer=True)
+    compact = snapshot_payload(snapshot, compact=True)
+    decoded = json.loads(compact)
+    assert decoded == {k: v for k, v in snapshot.items()
+                       if k not in ("environment", "_viewer_environment", "robot", "current_surface", "rgb_front_jpeg_base64")}
+    assert json.loads(full) == {k: v for k, v in snapshot.items() if k != "_viewer_environment"}
+    assert json.loads(viewer)["environment"] == snapshot["_viewer_environment"]
+    assert len(compact) < len(full)/10
+
+
+def test_live_snapshot_defers_display_work_until_requested(monkeypatch):
+    import json
+    from real_scripts import live_dual_ur7e_obstacle_model as live
+
+    points = np.asarray([[0., 0., .1], [1., 0., .1]], dtype=np.float32)
+    colors = np.asarray([[10, 20, 30], [40, 50, 60]], dtype=np.uint8)
+    display = live.SnapshotDisplay(
+        points[:1], colors[:1], points, colors, np.asarray([True, True]),
+        points[:1], colors[:1], points[:1], np.zeros((4, 4, 3), np.uint8), 10,
+    )
+    snapshot = {"frame": 7, "obbs": [], "_display_data": display}
+    with monkeypatch.context() as patch:
+        patch.setattr(live.cv2, "imencode", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("JPEG should not be encoded for compact or viewer requests")))
+        assert json.loads(live.snapshot_payload(snapshot, compact=True)) == {"frame": 7, "obbs": []}
+        viewer = json.loads(live.snapshot_payload(snapshot, viewer=True))
+    assert len(viewer["environment"]["points"]) == 2
+    assert "current_surface" not in viewer and "rgb_front_jpeg_base64" not in viewer
+    full = json.loads(live.snapshot_payload(snapshot))
+    assert len(full["environment"]["points"]) == 1
+    assert len(full["current_surface"]) == 1
+    assert full["rgb_front_jpeg_base64"]
+
+
+def test_viewer_adds_tabletop_outside_detection_workspace_only():
+    from real_scripts.live_dual_ur7e_obstacle_model import viewer_environment_points
+
+    points = np.asarray([[0., 0., 0.], [0., 1., 0.], [0., 1., -.2],
+                         [0., 1., .5], [0., 1., .1]], dtype=np.float32)
+    colors = np.arange(15, dtype=np.uint8).reshape(5, 3)
+    workspace = np.asarray([True, False, False, False, False])
+    shown, shown_colors, extra_count = viewer_environment_points(
+        points, colors, workspace, np.asarray([0., 0., 1.]), 0.,
+        plane_threshold_m=.012, max_height_m=.35, box_margin_m=.01,
+    )
+
+    np.testing.assert_array_equal(shown, points[[0, 1, 4]])
+    np.testing.assert_array_equal(shown_colors, colors[[0, 1, 4]])
+    assert extra_count == 2
+    np.testing.assert_array_equal(workspace, [True, False, False, False, False])
+
+
+def test_dual_arm_workspace_uses_each_calibrated_base_frame():
+    from real_scripts.live_dual_ur7e_obstacle_model import dual_arm_workspace_masks
+
+    right_to_left = np.asarray([[0., -1., 0., 2.], [1., 0., 0., 0.],
+                                [0., 0., 1., 0.], [0., 0., 0., 1.]])
+    points = np.asarray([[0., 0., 0.], [2., 0., 0.], [2., .4, 0.],
+                         [2.4, 0., 0.], [1., 0., 0.]], dtype=np.float32)
+    bounds = (-.5, .5, -.5, .5, -.1, .5)
+
+    left, right, union = dual_arm_workspace_masks(points, bounds, bounds, right_to_left)
+
+    np.testing.assert_array_equal(left, [True, False, False, False, False])
+    np.testing.assert_array_equal(right, [False, True, True, True, False])
+    np.testing.assert_array_equal(union, [True, True, True, True, False])
+
+
+def test_overlapping_obstacle_boxes_merge_without_losing_covered_volume():
+    from real_scripts.live_dual_ur7e_obstacle_model import (
+        expanded_obb, merge_overlapping_obbs, tabletop_obb,
+        upright_obb_overlap_ratio, upright_obbs_overlap,
+    )
+
+    normal = np.asarray([0., 0., 1.])
+
+    def box(xmin, xmax, ymin=-.08, ymax=.08):
+        corners = np.asarray([[x, y, z] for z in (0., .2)
+                              for x in (xmin, xmax) for y in (ymin, ymax)])
+        return tabletop_obb(corners, normal, 0.)
+
+    first, second, separate = box(-.2, .1), box(0., .3), box(.55, .75)
+    merged = merge_overlapping_obbs([first, second, separate], normal, 0.)
+
+    assert len(merged) == 2
+    assert merged[0].point_count == first.point_count + second.point_count
+    assert not upright_obbs_overlap(*merged)
+    for original in (first, second):
+        local = (original.corners - merged[0].center) @ merged[0].rotation
+        assert np.all(np.abs(local) <= merged[0].extents / 2 + 1e-5)
+    assert len(merge_overlapping_obbs([box(-.2, 0.), box(-.05, .15), box(.1, .3)], normal, 0.)) == 1
+
+    # Margins can make two otherwise separate boxes overlap in the published scene.
+    near_a, near_b = box(0., .1), box(.115, .215)
+    assert len(merge_overlapping_obbs([near_a, near_b], normal, 0.)) == 2
+    inflated = [expanded_obb(item, .01) for item in (near_a, near_b)]
+    assert upright_obbs_overlap(*inflated)
+    assert 0 < upright_obb_overlap_ratio(*inflated) < .10
+    assert len(merge_overlapping_obbs(inflated, normal, 0.)) == 2
+    assert len(merge_overlapping_obbs(inflated, normal, 0., min_overlap_ratio=0.)) == 1
+
+    # A meaningful shared volume merges; the threshold uses the smaller volume.
+    deep_a, deep_b = box(0., .1), box(.075, .175)
+    ratio = upright_obb_overlap_ratio(deep_a, deep_b)
+    assert ratio == pytest.approx(.25, abs=1e-5)
+    assert len(merge_overlapping_obbs([deep_a, deep_b], normal, 0.)) == 1
+    assert len(merge_overlapping_obbs([deep_a, deep_b], normal, 0., min_overlap_ratio=ratio)) == 2
+    assert upright_obb_overlap_ratio(box(-.1, .1), box(-.03, .03, -.03, .03)) == pytest.approx(1.)
+    with pytest.raises(ValueError, match="overlap ratio"):
+        merge_overlapping_obbs([deep_a, deep_b], normal, 0., min_overlap_ratio=1.)
+
+    tilted_normal = np.asarray([0., 1., 1.]) / np.sqrt(2.)
+    tangent = np.cross(tilted_normal, [1., 0., 0.])
+    tilted_boxes = []
+    for center_x, angle in ((0., 0.), (.12, np.pi / 5)):
+        along = np.cos(angle) * np.asarray([1., 0., 0.]) + np.sin(angle) * tangent
+        across = np.cross(tilted_normal, along)
+        corners = np.asarray([center_x * np.asarray([1., 0., 0.]) + x * along + y * across + z * tilted_normal
+                              for z in (0., .2) for x in (-.15, .15) for y in (-.06, .06)])
+        tilted_boxes.append(tabletop_obb(corners, tilted_normal, 0.))
+    tilted_merged = merge_overlapping_obbs(tilted_boxes, tilted_normal, 0.)
+    assert len(tilted_merged) == 1
+    for original in tilted_boxes:
+        local = (original.corners - tilted_merged[0].center) @ tilted_merged[0].rotation
+        assert np.all(np.abs(local) <= tilted_merged[0].extents / 2 + 1e-5)
+
+
+def test_stale_track_does_not_merge_with_new_candidate():
+    from real_scripts.live_dual_ur7e_obstacle_model import (
+        TemporalOBBGate, tabletop_obb,
+    )
+
+    normal = np.asarray([0., 0., 1.])
+    def box(xmin, xmax):
+        corners = np.asarray([[x, y, z] for z in (0., .2)
+                              for x in (xmin, xmax) for y in (-.08, .08)])
+        return tabletop_obb(corners, normal, 0.)
+
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.01)
+    gate.update([box(-.2, .1)])
+    published = gate.update([box(0., .3)])
+    assert len(gate._tracks) == 2
+    assert len(published) == 2
+    assert "missing_cluster" in gate.unstable_reasons
+
+
+def test_large_overlap_merges_published_boxes_before_stability_gate():
+    from real_scripts.live_dual_ur7e_obstacle_model import (
+        TemporalOBBGate, merge_overlapping_obbs, safety_obbs_with_candidates,
+        tabletop_obb, upright_obb_overlap_ratio,
+    )
+
+    normal = np.array([0., 0., 1.])
+    def cloud(xmin, xmax):
+        return np.array([[x, y, z] for x in np.linspace(xmin, xmax, 8)
+                         for y in np.linspace(-.04, .04, 8) for z in (.04, .08)])
+
+    first_points, second_points = cloud(0., .1), cloud(.04, .14)
+    first, second = (tabletop_obb(points, normal, 0.)
+                     for points in (first_points, second_points))
+    assert upright_obb_overlap_ratio(first, second) == pytest.approx(.6, abs=1e-5)
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.01)
+    tracked = gate.update([first, second], [first_points, second_points])
+    assert len(tracked) == 2
+    published, _ = safety_obbs_with_candidates(tracked, [first, second],
+                                                [first_points, second_points])
+    merged = merge_overlapping_obbs(published, normal, 0., min_overlap_ratio=.5)
+    assert len(merged) == 1
+    for original in (first, second):
+        local = (original.corners-merged[0].center) @ merged[0].rotation
+        assert np.all(np.abs(local) <= merged[0].extents/2 + 1e-5)
+
+    half_overlap = tabletop_obb(cloud(.05, .15), normal, 0.)
+    ratio = upright_obb_overlap_ratio(first, half_overlap)
+    assert ratio == pytest.approx(.5, abs=1e-5)
+    assert len(merge_overlapping_obbs([first, half_overlap], normal, 0.,
+                                      min_overlap_ratio=ratio)) == 2
+
+
+def test_obb_geometry_follows_cluster_evidence_and_holds_through_dropout():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    normal = np.array([0., 0., 1.])
+    grid = np.array([[x, y, z] for x in np.linspace(-.04, .04, 8)
+                     for y in np.linspace(-.03, .03, 8) for z in (.04, .08)])
+    new_points = np.vstack((grid, grid + [.10, 0., 0.]))
+    original = tabletop_obb(grid, normal, 0.)
+    enlarged = tabletop_obb(new_points, normal, 0.)
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035,
+                           point_change_distance_m=.015, point_change_fraction=.25,
+                           change_confirm_frames=2)
+
+    assert gate.update([original], [grid])[0] is original
+    # A changed box with the same observed cluster has no point-cloud support.
+    assert gate.update([enlarged], [grid])[0] is original
+    assert not gate.unstable_reasons
+    # A genuine new region must persist across frames before changing geometry.
+    assert gate.update([enlarged], [new_points])[0] is original
+    assert gate.unstable_reasons == ["changed_cluster"]
+    assert gate.update([enlarged], [new_points])[0] is enlarged
+    assert not gate.unstable_reasons
+    assert gate.update([], []) == [enlarged]
+    assert gate.unstable_reasons == ["missing_cluster"]
+
+
+def test_obb_change_uses_current_and_previous_two_clusters():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    normal = np.array([0., 0., 1.])
+    original_points = np.array([[x, y, z] for x in np.linspace(-.04, .04, 8)
+                                for y in np.linspace(-.03, .03, 8) for z in (.04, .08)])
+    changed_points = np.vstack((original_points, original_points + [.10, 0., 0.]))
+    original = tabletop_obb(original_points, normal, 0.)
+    changed = tabletop_obb(changed_points, normal, 0.)
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035,
+                           history_frames=10)
+
+    assert gate.update([original], [original_points]) == [original]
+    assert gate.update([changed], [changed_points]) == [original]
+    assert gate.update([changed], [changed_points]) == [original]
+    assert gate.update([changed], [changed_points]) == [changed]
+    assert gate.unstable_reasons == []
+    assert [frame for frame, _ in gate._tracks[0].recent_observations] == [1, 2, 3, 4]
+
+
+def test_obb_history_is_bounded_and_missing_track_expires_at_window():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    points = np.array([[x, y, z] for x in np.linspace(-.03, .03, 8)
+                       for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    box = tabletop_obb(points, np.array([0., 0., 1.]), 0.)
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035,
+                           history_frames=10)
+    for _ in range(12):
+        assert gate.update([box], [points]) == [box]
+    assert [frame for frame, _ in gate._tracks[0].recent_observations] == list(range(3, 13))
+    assert gate._tracks[0].reference_frame == 3
+
+    for _ in range(9):
+        assert gate.update([], []) == [box]
+        assert gate.expired_tracks == 0
+    assert gate.update([], []) == []
+    assert gate.expired_tracks == 1
+    assert gate._tracks == []
+
+
+def test_obbs_hidden_by_persistent_merged_cluster_expire_after_window():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    normal = np.array([0., 0., 1.])
+    left = np.array([[x, y, z] for x in np.linspace(-.12, -.08, 8)
+                     for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    right = left + [.20, 0., 0.]
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035,
+                           history_frames=10)
+    original_boxes = [tabletop_obb(points, normal, 0.) for points in (left, right)]
+    assert gate.update(original_boxes, [left, right]) == original_boxes
+    merged_points = np.vstack((left, right))
+    merged_box = tabletop_obb(merged_points, normal, 0.)
+    for _ in range(9):
+        assert gate.update([merged_box], [merged_points]) == original_boxes
+    assert gate.update([merged_box], [merged_points]) == [merged_box]
+    assert gate.expired_tracks == 2
+    assert len(gate._tracks) == 1
+    assert gate.update([merged_box], [merged_points]) == [merged_box]
+
+
+def test_missing_obb_retires_only_after_measured_free_space_persists():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+    from real_scripts.real_robot_adapter import CameraCalibration
+
+    points = np.array([[x, y, z] for x in np.linspace(-.06, .06, 8)
+                       for y in np.linspace(-.04, .04, 8) for z in (1., 1.04)])
+    box = tabletop_obb(points, np.array([0., 0., 1.]), -1.)
+    calibration = CameraCalibration("test", np.array([[100., 0., 50.], [0., 100., 50.], [0., 0., 1.]]),
+                                    np.eye(4))
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035,
+                           removal_confirm_frames=3)
+    gate.update([box], [points])
+    foreground = [(calibration, np.full((100, 100), .8))]
+    invalid = [(calibration, np.zeros((100, 100)))]
+    clear = [(calibration, np.full((100, 100), 1.5))]
+    assert gate.update([], [], free_space_views=foreground) == [box]
+    assert gate.update([], [], free_space_views=invalid) == [box]
+    assert gate.unstable_reasons == ["missing_cluster"]
+    assert gate.update([], [], free_space_views=clear) == [box]
+    assert gate.update([], [], free_space_views=clear) == [box]
+    assert gate.update([], [], free_space_views=clear) == []
+    assert not gate.unstable_reasons
+
+
+def test_duplicate_confirmed_obbs_coalesce_without_merged_cluster_error():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    points = np.array([[x, y, z] for x in np.linspace(-.04, .04, 8)
+                       for y in np.linspace(-.03, .03, 8) for z in (.04, .08)])
+    box = tabletop_obb(points, np.array([0., 0., 1.]), 0.)
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035)
+    assert len(gate.update([box, box], [points, points])) == 2
+    assert len(gate.update([box], [points])) == 1
+    assert not gate.unstable_reasons
+
+
+def test_new_obb_requires_persistent_cluster_before_safety_publication():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    points = np.array([[x, y, z] for x in np.linspace(-.03, .03, 8)
+                       for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    box = tabletop_obb(points, np.array([0., 0., 1.]), 0.)
+    gate = TemporalOBBGate(required_hits=3, match_distance_m=.035)
+    assert gate.update([box], [points]) == []
+    assert gate.unstable_reasons == ["new_cluster"]
+    assert gate.update([box], [points]) == []
+    assert gate.update([box], [points]) == [box]
+    assert not gate.unstable_reasons
+
+
+def test_one_frame_false_cluster_clears_on_next_observation():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    points = np.array([[x, y, z] for x in np.linspace(-.03, .03, 8)
+                       for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    box = tabletop_obb(points, np.array([0., 0., 1.]), 0.)
+    gate = TemporalOBBGate(required_hits=3, match_distance_m=.035)
+    assert gate.update([box], [points]) == []
+    assert gate.unstable_reasons == ["new_cluster"]
+    assert gate.update([], []) == []
+    assert not gate.unstable_reasons
+
+
+def test_transient_cluster_merge_keeps_two_observed_boxes():
+    from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
+
+    normal = np.array([0., 0., 1.])
+    left = np.array([[x, y, z] for x in np.linspace(-.12, -.08, 8)
+                     for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    right = left + [.20, 0., 0.]
+    boxes = [tabletop_obb(points, normal, 0.) for points in (left, right)]
+    gate = TemporalOBBGate(required_hits=1, match_distance_m=.035)
+    assert gate.update(boxes, [left, right]) == boxes
+
+    merged_points = np.vstack((left, right))
+    merged_box = tabletop_obb(merged_points, normal, 0.)
+    assert gate.update([merged_box], [merged_points]) == boxes
+    assert gate.unstable_reasons == ["merged_clusters"]
+    assert gate.update(boxes, [left, right]) == boxes
+    assert not gate.unstable_reasons
+
+
+def test_safety_scene_keeps_old_boxes_and_adds_uncovered_candidate_points():
+    from real_scripts.live_dual_ur7e_obstacle_model import (
+        safety_obbs_with_candidates, tabletop_obb,
+    )
+
+    normal = np.array([0., 0., 1.])
+    left = np.array([[x, y, z] for x in np.linspace(-.12, -.08, 8)
+                     for y in np.linspace(-.02, .02, 8) for z in (.04, .08)])
+    right = left + [.20, 0., 0.]
+    old = [tabletop_obb(points, normal, 0.) for points in (left, right)]
+    merged = np.vstack((left, right))
+    merged_box = tabletop_obb(merged, normal, 0.)
+    boxes, supplemental = safety_obbs_with_candidates(old, [merged_box], [merged])
+    assert boxes == old
+    assert supplemental == 0
+
+    new_points = left + [.40, 0., 0.]
+    new_box = tabletop_obb(new_points, normal, 0.)
+    boxes, supplemental = safety_obbs_with_candidates(old, [new_box], [new_points])
+    assert boxes == [*old, new_box]
+    assert supplemental == 1
+
+
+def test_rotated_obb_overlap_uses_footprint_area_not_axis_projection():
+    from real_scripts.live_dual_ur7e_obstacle_model import UprightOBB, upright_obb_overlap_ratio
+
+    signs = np.asarray(((-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),
+                        (-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)), dtype=np.float32)
+
+    def square(angle):
+        c, s = np.cos(angle), np.sin(angle)
+        rotation = np.asarray([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]], dtype=np.float32)
+        center = np.asarray([0., 0., .1], dtype=np.float32)
+        extents = np.asarray([.2, .2, .2], dtype=np.float32)
+        corners = center + (signs * extents / 2) @ rotation.T
+        return UprightOBB(center, rotation, extents, corners, 8)
+
+    expected = 1. - .5 * (2. - np.sqrt(2.)) ** 2
+    assert upright_obb_overlap_ratio(square(0.), square(np.pi / 4)) == pytest.approx(expected, abs=1e-5)

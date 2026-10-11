@@ -19,7 +19,7 @@ front/side D455 → LingBot 修复 → 双臂剔除 → 聚类 OBB
 
 左右工具均为 Robotiq 2F-85。只读枚举确认：
 
-双臂目前已断开；下列相机枚举来自此前检查，不表示整套硬件当前可运行。
+下列序列号来自硬件配置；本轮标定接入仅验证文件和几何计算，未验证设备在线状态。
 
 | 角色 | 型号 | 序列号 |
 | --- | --- | --- |
@@ -28,10 +28,11 @@ front/side D455 → LingBot 修复 → 双臂剔除 → 聚类 OBB
 | left_wrist | D435i | 420222071502 |
 | right_wrist | D435i | 405622072940 |
 
-**front 旧外参已失效，side 尚未标定。** 当前
-`safety.camera_calibration_valid=false`，在线感知/控制入口拒绝启动。
-不能只修改标志跳过标定。流程见 [CALIBRATION.md](docs/CALIBRATION.md)。
-保留的历史外参仅适用于匹配旧采集时相机位置的数据。
+已接入 **2026-10-08 双臂双视角标定**：
+`../quest3_collect/config/calibration/dual_arm_camera_transforms.yaml`。
+障碍物检测与固定表面点 FK 共用汇总文件中的基座/相机变换，并验证四份
+源文件的 SHA256、质量与坐标闭环。快照标定哈希不一致时拒绝执行。
+流程见 [CALIBRATION.md](docs/CALIBRATION.md)。历史外参仅适用于对应旧采集数据。
 
 ## 环境
 
@@ -135,6 +136,56 @@ python real_scripts/run_ur7e_vla_safety_executor.py --prompt "manipulate the tab
 默认 dry-run。快照为 `http://127.0.0.1:8766/snapshot.json`，包含双视角 OBB、
 双臂 qpos、双夹爪实测状态与 current_surface。使用实际流内参；LingBot 修复
 后重新剔除双臂，并保留原始深度支持域限制。
+可视化页的“隐藏机械臂（R）”按钮可切换红橙色机械臂点的显示；障碍物检测和快照数据仍照常更新。
+
+LeRobot 动作避障回放建议使用
+`python real_scripts/live_obstacle_detection.py --no-browser --no-lingbot-depth`，
+避免深度修复延迟导致超过当前配置的 `stale_timeout_s: 2.0`。
+验证程序自动请求 `snapshot.json?compact=1`，省去展示点云、表面点和 JPEG；
+检测线程先发布安全数据，展示点列表仅在页面或完整快照请求时生成；JPEG 仅在
+完整快照请求时生成。页面请求 `viewer=1` 不生成 JPEG 或表面点。默认每帧最多展示 12000 个
+环境点，可用 `--display-max-points` 调整；该参数不改变检测使用的点云。
+启动及执行时均直接读取当前快照；过期快照立即拒绝。
+检测器只保留最新帧；每个 OBB 的点簇观察采用最近 10 帧的滚动窗口。
+当前帧与前两帧的点簇变化连续成立时才更新已确认 OBB。短暂漏检保留原框；
+若相机深度连续 3 帧明确测到旧簇表面后方的空间，则提前移除；连续漏检
+10 帧时无论深度是否可用均删除旧框，可用 `--obb-history-frames` 调整窗口。
+安全快照同时发布旧框与旧框覆盖不到的当前
+候选框；两个 OBB 的交集体积超过较小框体积的 50% 时，优先合并并包住原框。
+低于阈值的点簇合并仍保留旧框。点簇合并、
+漏检或新簇出现时，实机回放直接用该帧 OBB 继续进行 CBF 和扫掠检查。
+过期快照、相机或校准故障仍会报错退出。
+快照诊断包含 `processing_seconds` 和 `capture_to_publish_seconds`，有效期始终从采集时刻计算。
+排查检测帧率时，读取 `snapshot.json?compact=1` 的 `diagnostics`：
+`capture_seconds`、`robot_geometry_seconds`、`depth_stage_seconds`、
+`point_cloud_seconds`、`scene_analysis_seconds`、`box_tracking_seconds` 和
+`snapshot_build_seconds` 分别对应采集、机器人表面计算、深度修复、点云生成、
+桌面/聚类分析、OBB 跟踪和安全快照构建。`frame_interval_seconds` 表示实际
+采集帧间隔；页面直接显示这些耗时。HTTP 响应的 `Server-Timing` 头另列
+展示数据生成及 JSON 编码耗时。先比较这些耗时，再调整参数。
+`--no-lingbot-depth` 可省去模型推理；若 `point_cloud_seconds` 或
+`scene_analysis_seconds` 较大，可尝试 `--point-stride 4`，但稀疏采样可能漏掉
+较细障碍物。若全图处理仍占主要时间，可在确认相机支持后尝试
+`--width 640 --height 480`；降低分辨率后须重新验证小障碍物检测和标定效果。
+提高 `--fps` 只改变相机采集上限，处理耗时不下降时不会提高实际发布帧率。
+LeRobot 实机回放直接读取 RTDE/GET POS 反馈，在快照有效期内允许同一帧 OBB
+用于多个控制周期的逐步复核；控制频率不再跟随检测帧率。
+报告中的 `actions_executed`、`path_control_ticks` 和 `max_tracking_error_rad`
+分别记录已完成数据集动作、路径控制周期和最大追踪误差；`phase=restore` 尚未进入数据集回放。
+LeRobot 回放默认以 20 Hz 提供数据集动作，关节速度默认 0.5 rad/s、
+加速度默认 1.2 rad/s²；碰撞复核、过期停止与 UR 自身保护继续生效。
+
+相机启动时检查实际 SDK 流配置：默认保持 `1280×720@15` 彩色流；若某相机
+不支持同分辨率的深度流，自动选用同帧率的深度配置，再由 SDK 对齐到彩色图。
+实际序列号、USB 连接与 RGB/原始深度配置会打印，并写入快照 `camera_streams`。
+当前 side D455（`260922303231`）在本次检查中为 USB 2.1，只提供
+`1280×720@5` 的深度流，因此会选择 `640×480@15` 深度并对齐到 720p RGB。
+如需原始 720p 深度 15 fps，需要恢复该相机的 USB 3 连接。
+可显式指定 `--depth-width 640 --depth-height 480`，两项必须一起提供。
+启动失败会显示具体相机和流配置，释放已启动的其他相机，并发布 error 状态。
+若之后出现 `left_arm/right_arm: Active TCP differs from fixed-surface FK`，
+则是控制器 active TCP 与 `robot.flange_to_active_tcp` 的一致性校验失败；
+需要核对对应机械臂的实际工具/TCP 配置，不能据相机已启动判断空间对齐已通过。
 
 QP 修改首动作的12个关节；修正后复核 FK 点轨迹及帧间线段，执行前复查新快照。
 NaN、过期、不可控危险约束、复核碰撞拒绝执行；推理有超时，servo 有独立停止
@@ -142,9 +193,17 @@ NaN、过期、不可控危险约束、复核碰撞拒绝执行；推理有超�
 
 物理执行需 `--execute` 和精确确认串；`--execute-grippers` 可显式开启双
 2F-85 输出（有约束时保持夹爪，发送前包含夹爪 FK 轨迹检查）。
-新标定与受控实机验收尚未完成，本轮没有发送运动或夹爪命令。
+新标定文件接入与离线几何校验已完成；受控实机验收尚未进行，本轮没有发送运动或夹爪命令。
 
 ## 验证与历史代码
+
+无需训练动作/点流模型的 LeRobot 双臂动作回放验证见
+[MODEL_FREE_OBSTACLE_VALIDATION.md](docs/MODEL_FREE_OBSTACLE_VALIDATION.md)。
+入口 `python -m obstacle_validation.lerobot_replay` 将 Quest3 HDF5 转成 LeRobot
+数据集，并按绝对关节目标和双夹爪目标逐条回放；`avoid` 使用固定表面点 CBF
+修正动作，复位阶段局部 CBF 无法前进时尝试经碰撞检查的 RRT 绕行。默认虚拟执行。
+实机 `baseline` 可不启动障碍物服务，仅用双臂实时反馈回放数据集动作；
+实机 `avoid` 需要 `--live` 的双视角检测服务。两者均需专用 `--execute-ack`。
 
 ```bash
 conda run -n safety python -m pytest -q

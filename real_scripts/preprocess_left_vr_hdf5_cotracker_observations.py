@@ -147,7 +147,9 @@ def _lift_measured_tracks(depth_m: np.ndarray, rendered_depth: np.ndarray, track
     points = np.zeros((len(tracks_xy), 3), dtype=np.float32)
     if np.any(visible):
         z = measured[visible].astype(np.float64); K = calibration.intrinsics
-        camera = np.c_[((u[visible] - K[0, 2]) * z / K[0, 0]), ((v[visible] - K[1, 2]) * z / K[1, 1]), z, np.ones(len(z))]
+        from real_scripts.camera_geometry import pixel_rays
+        xyz = pixel_rays(np.c_[u[visible], v[visible]], K, calibration.distortion, calibration.distortion_model)*z[:, None]
+        camera = np.c_[xyz, np.ones(len(z))]
         points[visible] = (calibration.camera_to_world @ camera.T).T[:, :3].astype(np.float32)
     return points, visible
 

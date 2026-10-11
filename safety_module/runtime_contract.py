@@ -5,14 +5,20 @@ import time
 import numpy as np
 
 
+class SnapshotExpired(RuntimeError):
+    """A valid scene whose capture timestamp is too old for execution."""
+
+
 def validate_snapshot(snapshot, max_age_s):
     if snapshot.get("schema") not in ("dual_ur7e_obstacle_snapshot_v2", "surface_action_obstacles_v3") or snapshot.get("coordinate_frame") != "left_base":
         raise ValueError("Unsupported obstacle snapshot schema/frame")
     if str(snapshot.get("status", "")).startswith(("error", "initializing")):
         raise RuntimeError(f"Obstacle service unavailable: {snapshot['status']}")
     age = (time.monotonic_ns() - int(snapshot["host_timestamp_ns"])) / 1e9
-    if not np.isfinite(age) or age < 0 or age > max_age_s:
+    if not np.isfinite(age) or age < 0:
         raise RuntimeError(f"Obstacle snapshot expired or clock domain differs: {age:.3f}s")
+    if age > max_age_s:
+        raise SnapshotExpired(f"Obstacle snapshot expired: {age:.3f}s (limit {max_age_s:.3f}s)")
     return age
 
 

@@ -37,6 +37,7 @@ from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_co
 from safety_module.runtime_contract import validate_prediction, validate_snapshot
 from safety_module.measured_surface import MeasuredSurfaceSampler, associate_surface
 from safety_module.command_watchdog import CommandWatchdog
+from safety_module.dual_camera_calibration import validate_calibration_identity
 
 
 EXECUTE_ACK = "I_UNDERSTAND_DUAL_UR7E_WILL_MOVE"
@@ -400,6 +401,7 @@ def run(args: argparse.Namespace) -> None:
         for step in range(args.max_steps):
             began = time.monotonic()
             snap = _snapshot(obstacle_url, timeout_s=snapshot_age_limit_s)
+            validate_calibration_identity(snap, sampler.calibration_digest)
             age_s = (time.monotonic_ns() - int(snap["host_timestamp_ns"])) / 1e9
             if age_s < -0.1 or age_s > snapshot_age_limit_s:
                 raise RuntimeError(f"Obstacle snapshot is stale or from another clock domain: age={age_s:.3f}s")
@@ -524,6 +526,7 @@ def run(args: argparse.Namespace) -> None:
                 # Include network inference, geometry and QP time in the deadline.
                 validate_snapshot(snap, snapshot_age_limit_s)
                 fresh = _snapshot(obstacle_url, timeout_s=snapshot_age_limit_s)
+                validate_calibration_identity(fresh, sampler.calibration_digest)
                 if np.max(np.abs(_qpos(fresh) - qpos)) > float(safety.get("max_state_drift_rad", 0.01)):
                     raise RuntimeError("Robot state changed during policy inference; discarding action")
                 if not np.allclose(_gripper(fresh), grip, atol=.02):

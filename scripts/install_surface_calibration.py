@@ -58,6 +58,9 @@ def main():
     hardware["arms"]["right_arm"]["front_calibration"] = str(prepared[2][0].relative_to(hardware_path.parent))
     hardware_path.write_text(yaml.safe_dump(hardware, sort_keys=False))
     config["safety"]["camera_calibration_valid"] = True
+    # This legacy three-file installer cannot retain a previous aggregate
+    # whose source hashes describe a different calibration session.
+    config["safety"].pop("dual_arm_camera_calibration", None)
     config["safety"].pop("calibration_invalid_reason", None)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     print("Installed new calibration. Rebuild geometry identities and validate checkpoint compatibility before deployment.")

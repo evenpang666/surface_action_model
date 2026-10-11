@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler  # noqa: E402
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config  # noqa: E402
 from safety_module.shards import open_shard
+from safety_module.dual_camera_calibration import calibration_from_project, validate_calibration_identity
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +43,9 @@ def main() -> None:
         "tcp_transform_verified": sampler.tcp_transform_verified,
         "right_base_to_left_base_finite": bool(np.isfinite(sampler.right_base_to_left_base).all()),
     }
+    calibration = calibration_from_project(config)
+    if calibration is not None:
+        checks["calibration"] = calibration.report()
     errors: list[str] = []
     if not sampler.tcp_transform_verified["right_arm"] and not args.allow_unverified_right_tcp:
         errors.append("right flange_to_active_tcp is not verified")
@@ -100,6 +104,7 @@ def main() -> None:
         from safety_module.runtime_contract import validate_snapshot
         try:
             validate_snapshot(snapshot, float(config["safety"]["stale_timeout_s"]))
+            validate_calibration_identity(snapshot, sampler.calibration_digest)
         except (ValueError, RuntimeError, KeyError) as exc:
             errors.append(str(exc))
         if snapshot.get("schema") != "dual_ur7e_obstacle_snapshot_v2" or snapshot.get("coordinate_frame") != "left_base":

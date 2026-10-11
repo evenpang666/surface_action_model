@@ -25,7 +25,7 @@ robot:
   tools:
     left_arm: robotiq_2f85
     right_arm: robotiq_2f85
-  # ^flange T_active_tcp, measured receive-only from both controllers on 2026-09-10.
+  # ^flange T_active_tcp, receive-only measurements: left 2026-09-10, right 2026-10-08.
   flange_to_active_tcp:
     left_arm:
       source: measured_receive_only_rtde_2026-09-10
@@ -36,12 +36,17 @@ robot:
         - [-0.0017834044239512998, 0.0009599976848928029, 0.9999979489344493, 0.18298864323189268]
         - [0.0, 0.0, 0.0, 1.0]
     right_arm:
-      source: measured_receive_only_rtde_2026-09-10
+      source: measured_receive_only_rtde_2026-10-08
+      measured_at_utc: '2026-10-08T13:33:38.900603+00:00'
+      measurement_file: outputs/calibration/dual_flange_to_active_tcp_20261008.json
+      sample_count: 30
+      translation_max_spread_mm: 2.8310626692637043e-05
+      rotation_max_spread_deg: 3.943111961351375e-06
       verified: true
       matrix:
-        - [0.999999568471559, 0.000655015429167971, -0.0006587954794618209, -0.000296112627913403]
-        - [-0.0006562993377756256, 0.999997882313685, -0.0019505484677651856, 0.0006828212434020209]
-        - [0.0006575164449979234, 0.0019509799930849463, 0.9999978806723501, 0.16185311527147203]
+        - [0.9999992884322433, 0.0011457863036181753, -0.00033212761599977635, -0.0006546365299157156]
+        - [-0.0011463193722683147, 0.9999980480678009, -0.0016092894347427308, -0.0005553481426067153]
+        - [0.0003302830659163028, 0.001609669013944544, 0.9999986499384695, 0.1801257229032101]
         - [0.0, 0.0, 0.0, 1.0]
 
 preprocess:
@@ -57,16 +62,18 @@ model:
   source_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi05_base
 
 safety:
-  camera_calibration_valid: false
-  calibration_invalid_reason: "2026-09-22: user confirmed front calibration invalid and side uncalibrated"
-  front_calibration: configs/hardware/calibration/front_current.yaml
-  right_front_calibration: configs/hardware/calibration/right_front_current.yaml
-  side_calibration: configs/hardware/calibration/side_current.yaml
+  # Validated aggregate and four source hashes from the 2026-10-08 sessions.
+  camera_calibration_valid: true
+  dual_arm_camera_calibration: ../quest3_collect/config/calibration/dual_arm_camera_transforms.yaml
+  front_calibration: ../quest3_collect/config/calibration/left_base_to_front_camera.yaml
+  right_front_calibration: ../quest3_collect/config/calibration/right_base_to_front_camera.yaml
+  side_calibration: ../quest3_collect/config/calibration/left_base_to_side_camera.yaml
+  right_side_calibration: ../quest3_collect/config/calibration/right_base_to_side_camera.yaml
   max_camera_skew_s: 0.10
   policy_host: 192.168.124.64
   max_state_drift_rad: 0.01
   obstacle_url: http://127.0.0.1:8766/snapshot.json
-  stale_timeout_s: 1.5
+  stale_timeout_s: 2.0
   collision_margin_m: 0.010
   trigger_margin_m: 0.025
   max_joint_step_rad: 0.015
