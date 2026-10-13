@@ -11,7 +11,7 @@ from typing import Protocol, Sequence
 
 import numpy as np
 
-from real_scripts.real_robot_adapter import DEFAULT_RGBD_CAMERA_NAMES, RGBDFrame
+from real_scripts.real_robot_adapter import DEFAULT_RGBD_CAMERA_NAMES, NativeDepthFrame, RGBDFrame
 from real_scripts.ur7e_controller import ROBOT_IP, UR7eVectorController
 
 
@@ -64,6 +64,7 @@ class RealSenseD435iSource:
         depth_height: int | None = None,
         wait_timeout_ms: int = 5000,
         read_retries: int = 3,
+        retain_native_depth: bool = False,
     ) -> None:
         self.cameras = tuple(cameras)
         if not self.cameras:
@@ -80,6 +81,7 @@ class RealSenseD435iSource:
             raise ValueError("RealSense camera names must be unique")
         self.wait_timeout_ms = int(wait_timeout_ms)
         self.read_retries = max(int(read_retries), 1)
+        self.retain_native_depth = bool(retain_native_depth)
         self._rs = None
         self._pipelines = []
         self._aligns = []
@@ -209,10 +211,28 @@ class RealSenseD435iSource:
         frames: dict[str, RGBDFrame] = {}
         for (name, pipeline), align in zip(self._pipelines, self._aligns):
             aligned = None
+            native_depth = None
             last_error: Exception | None = None
             for attempt in range(1, self.read_retries + 1):
                 try:
-                    aligned = align.process(pipeline.wait_for_frames(self.wait_timeout_ms))
+                    sdk_frames = pipeline.wait_for_frames(self.wait_timeout_ms)
+                    if self.retain_native_depth:
+                        native = sdk_frames.get_depth_frame()
+                        color = sdk_frames.get_color_frame()
+                        if not native or not color:
+                            raise RuntimeError(f"Missing native RGB-D frames for {name!r}")
+                        depth_profile = native.get_profile().as_video_stream_profile()
+                        intr = depth_profile.get_intrinsics()
+                        extr = depth_profile.get_extrinsics_to(color.get_profile())
+                        transform = np.eye(4)
+                        # rs2_extrinsics.rotation is column-major, in metres.
+                        transform[:3, :3] = np.asarray(extr.rotation).reshape(3, 3, order="F")
+                        transform[:3, 3] = extr.translation
+                        native_depth = NativeDepthFrame(
+                            np.asarray(native.get_data(), dtype=np.uint16), float(native.get_units()),
+                            np.array([[intr.fx, 0., intr.ppx], [0., intr.fy, intr.ppy], [0., 0., 1.]]),
+                            transform, np.asarray(intr.coeffs), str(intr.model).rsplit(".", 1)[-1])
+                    aligned = align.process(sdk_frames)
                     break
                 except RuntimeError as exc:
                     last_error = exc
@@ -228,7 +248,7 @@ class RealSenseD435iSource:
             depth_frame = aligned.get_depth_frame()
             if not color_frame or not depth_frame:
                 raise RuntimeError(f"Failed to read synchronized RGB-D frame from camera {name!r}")
-            rgb = np.ascontiguousarray(np.asarray(color_frame.get_data(), dtype=np.uint8))
+            rgb = np.asarray(color_frame.get_data(), dtype=np.uint8).copy()
             depth_scale = float(depth_frame.get_units())
             depth_m = np.asarray(depth_frame.get_data(), dtype=np.float32) * depth_scale
             # The camera timestamp is retained even though two independent
@@ -243,6 +263,7 @@ class RealSenseD435iSource:
                 device_timestamp_ms=float(depth_frame.get_timestamp()),
                 frame_number=int(depth_frame.get_frame_number()),
                 timestamp_domain=timestamp_domain,
+                native_depth=native_depth,
             )
         return frames
 

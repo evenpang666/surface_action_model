@@ -9,9 +9,24 @@ class SnapshotExpired(RuntimeError):
     """A valid scene whose capture timestamp is too old for execution."""
 
 
+class SnapshotUnknown(RuntimeError):
+    """Previously observed obstacles have neither occupied nor free evidence."""
+
+
 def validate_snapshot(snapshot, max_age_s):
     if snapshot.get("schema") not in ("dual_ur7e_obstacle_snapshot_v2", "surface_action_obstacles_v3") or snapshot.get("coordinate_frame") != "left_base":
         raise ValueError("Unsupported obstacle snapshot schema/frame")
+    if snapshot.get("obstacle_backend") == "probabilistic_voxels":
+        from safety_module.occupancy import MAP_SCHEMA
+        payload = snapshot.get("occupancy_map")
+        if (not isinstance(payload, dict) or payload.get("schema") != MAP_SCHEMA
+                or payload.get("capture_timestamp_ns") != snapshot.get("host_timestamp_ns")):
+            raise ValueError("Probabilistic obstacle snapshot requires its capture-aligned occupancy map")
+        if payload.get("historical_unknown_voxels", 0):
+            raise SnapshotUnknown("Occupancy map contains previously occupied unknown voxels")
+    if (snapshot.get("scene_observation_state") == "unknown"
+            or snapshot.get("unknown_obstacles")):
+        raise SnapshotUnknown("Obstacle scene contains unknown space; fresh measured evidence is required")
     if str(snapshot.get("status", "")).startswith(("error", "initializing")):
         raise RuntimeError(f"Obstacle service unavailable: {snapshot['status']}")
     age = (time.monotonic_ns() - int(snapshot["host_timestamp_ns"])) / 1e9

@@ -69,6 +69,35 @@ class CameraCalibrationSession:
 
 
 @dataclass(frozen=True)
+class NativeDepthFrame:
+    """Unaligned SDK Z16 buffer and its native optical calibration."""
+
+    depth_units: np.ndarray
+    depth_scale_m: float
+    intrinsics: np.ndarray
+    depth_to_color: np.ndarray
+    distortion: np.ndarray | None = None
+    distortion_model: str = "brown_conrady"
+
+    def __post_init__(self):
+        units = np.asarray(self.depth_units)
+        if units.ndim != 2 or units.dtype != np.uint16:
+            raise ValueError("Native depth requires an HxW uint16 SDK buffer")
+        if not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
+            raise ValueError("Native depth scale must be finite and positive")
+        calibration = CameraCalibration("native_depth", self.intrinsics, self.depth_to_color,
+                                        self.distortion, self.distortion_model)
+        transform = calibration.camera_to_world
+        if (not np.isfinite(transform).all() or not np.allclose(transform[3], [0, 0, 0, 1])
+                or not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-5)
+                or not np.isclose(np.linalg.det(transform[:3, :3]), 1., atol=1e-5)):
+            raise ValueError("Native depth-to-color calibration must be a rigid transform")
+        object.__setattr__(self, "depth_units", units.copy())
+        object.__setattr__(self, "intrinsics", calibration.intrinsics.copy())
+        object.__setattr__(self, "depth_to_color", transform.copy())
+
+
+@dataclass(frozen=True)
 class RGBDFrame:
     camera_name: str
     rgb: np.ndarray
@@ -80,6 +109,7 @@ class RGBDFrame:
     device_timestamp_ms: float | None = None
     frame_number: int | None = None
     timestamp_domain: str | None = None
+    native_depth: NativeDepthFrame | None = None
 
     def __post_init__(self) -> None:
         rgb = np.asarray(self.rgb, dtype=np.uint8)

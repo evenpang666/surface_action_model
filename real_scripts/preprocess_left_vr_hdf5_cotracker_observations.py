@@ -28,6 +28,8 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.real_robot_adapter import CameraCalibration, robot_depth_keep_mask  # noqa: E402
 from real_scripts.ur7e_collision_mesh import render_surface_points_depth  # noqa: E402
 from safety_module.shards import open_shard
+from real_scripts.quest3_depth import Quest3DepthReader, recorded_intrinsics
+from safety_module.dual_camera_calibration import rigid_matrix
 
 
 DEFAULT_COTRACKER_REPO = Path.home() / ".cache/torch/hub/facebookresearch_co-tracker_main"
@@ -38,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episode", type=Path, required=True)
     parser.add_argument("--geometry-shard", "--mesh-surface-npz", dest="mesh_surface_npz", type=Path, required=True, help="FK gate shard; mesh points are not emitted as measured observations.")
-    parser.add_argument("--calibration", type=Path, required=True, help="Calibration valid at the recording time; never infer from the current camera pose")
+    parser.add_argument("--calibration", type=Path, required=True, help="Recorded fixed front color-camera calibration in left_base or right_base; right_base is composed with the geometry shard's base transform. Wrist cameras require per-frame FK and are not supported by this front-only extractor.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--visualization", type=Path, required=True)
     parser.add_argument("--preview", type=Path, required=True, help="Front RGB overview with measured CoTracker points only.")
@@ -52,33 +54,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--absolute-depth-tolerance-m", type=float, default=.015)
     parser.add_argument("--relative-depth-tolerance", type=float, default=.015)
     parser.add_argument("--depth-dilation-pixels", type=int, default=3)
-    parser.add_argument("--depth-unit-m", type=float, default=.001)
+    parser.add_argument("--depth-unit-m", type=float, default=None, help="Explicit metres per Z16 unit; otherwise use recorded scale (historical aligned-depth fallback: .001).")
     parser.add_argument("--render-splat-pixels", type=int, default=3)
     parser.add_argument("--visualization-max-frames", type=int, default=0, help="Number of animation frames; 0 means every recorded frame (default).")
     return parser.parse_args()
 
 
-def _recorded_intrinsics(calibration_path: Path, *, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
-    """Apply the recorder's centre-crop+resize transform to calibrated K."""
+def _recorded_intrinsics(calibration_path: Path, *, width: int, height: int,
+                         right_base_to_left_base: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Return recorded RGB K and left_base_T_front, checking declared frames."""
     payload = yaml.safe_load(Path(calibration_path).read_text(encoding="utf-8"))
-    source = payload.get("intrinsics", {})
-    source_w, source_h = int(source["width"]), int(source["height"])
-    K = np.asarray(((source["fx"], 0., source["ppx"]), (0., source["fy"], source["ppy"]), (0., 0., 1.)), dtype=np.float64)
-    source_ratio, target_ratio = source_w / source_h, width / height
-    if source_ratio > target_ratio:
-        crop_w = round(source_h * target_ratio)
-        left = (source_w - crop_w) // 2
-        K[0, 2] -= left
-        scale_x, scale_y = width / crop_w, height / source_h
-    elif source_ratio < target_ratio:
-        crop_h = round(source_w / target_ratio)
-        top = (source_h - crop_h) // 2
-        K[1, 2] -= top
-        scale_x, scale_y = width / source_w, height / crop_h
-    else:
-        scale_x, scale_y = width / source_w, height / source_h
-    K[0] *= scale_x; K[1] *= scale_y
-    camera_to_world = np.asarray(payload["matrix"], dtype=np.float64)
+    child = payload.get("child_frame", "front_camera_color_optical_frame")
+    if child != "front_camera_color_optical_frame":
+        raise ValueError(f"This extractor requires a fixed front camera, got {child}; "
+                         "wrist camera poses require per-frame arm FK and flange-to-camera calibration")
+    parent = payload.get("parent_frame", "left_base")
+    camera_to_world = rigid_matrix(payload["matrix"], str(calibration_path))
+    if parent == "right_base":
+        if right_base_to_left_base is None:
+            raise ValueError("right_base camera calibration requires right_base_to_left_base in the geometry shard")
+        camera_to_world = rigid_matrix(right_base_to_left_base, "right_base_to_left_base") @ camera_to_world
+    elif parent != "left_base":
+        raise ValueError(f"Unsupported fixed camera parent_frame: {parent}")
+    K = recorded_intrinsics(payload["intrinsics"], width=width, height=height)
     return K, camera_to_world
 
 
@@ -86,6 +84,7 @@ def _rendered_depth(points: np.ndarray, calibration: CameraCalibration, *, heigh
     return render_surface_points_depth(
         np.asarray(points, dtype=np.float32).reshape(-1, 3), calibration.camera_to_world, calibration.intrinsics,
         width=width, height=height, splat_radius_pixels=splat_pixels,
+        distortion=calibration.distortion, distortion_model=calibration.distortion_model,
     )
 
 
@@ -285,23 +284,41 @@ scheduleHistory(0, true);
 
 def main() -> None:
     args = parse_args()
-    if args.max_seeds < 1 or args.seed_stride < 1 or args.chunk_size < 2 or not 0.0 < args.tracking_scale <= 1.0 or args.depth_unit_m <= 0.0:
+    if args.max_seeds < 1 or args.seed_stride < 1 or args.chunk_size < 2 or not 0.0 < args.tracking_scale <= 1.0 or (args.depth_unit_m is not None and (not np.isfinite(args.depth_unit_m) or args.depth_unit_m <= 0.0)):
         raise ValueError("invalid seed/tracker/depth arguments")
     with open_shard(args.mesh_surface_npz) as mesh:
         mesh_points = np.asarray(mesh["fixed_link_points"], dtype=np.float32)
         mesh_qpos = np.asarray(mesh["qpos"], dtype=np.float32)
         link_names = np.asarray(mesh["link_names"])
         surface_arm_count = int(mesh["surface_arm_count"]) if "surface_arm_count" in mesh else int(mesh["arm_count"])
+        if "coordinate_frame" in mesh and str(np.asarray(mesh["coordinate_frame"]).item()) != "left_base":
+            raise ValueError("The geometry shard must express both arms in left_base")
+        right_base_to_left_base = np.asarray(mesh["right_base_to_left_base"]) if "right_base_to_left_base" in mesh else None
     with h5py.File(args.episode, "r") as source:
         from scripts.preprocess_quest3_hdf5 import _decode_rgb
         rgb = _decode_rgb(source["observations/images/front/rgb"])
         timestamps_ns = np.asarray(source["timestamps_ns"], dtype=np.int64)
-        depth0 = np.asarray(source["observations/images/front/depth"][0], dtype=np.float32) * args.depth_unit_m
-    if len(rgb) != len(mesh_points) or len(mesh_qpos) != len(rgb):
+        height, width = rgb.shape[1:3]
+        K, camera_to_world = _recorded_intrinsics(args.calibration, width=width, height=height,
+                                                right_base_to_left_base=right_base_to_left_base)
+        world_spec = yaml.safe_load(args.calibration.read_text(encoding="utf-8"))
+        color_spec = world_spec["intrinsics"]
+        calibration = CameraCalibration("front", K, camera_to_world,
+                                        color_spec.get("distortion", color_spec.get("coeffs")),
+                                        color_spec.get("distortion_model", "brown_conrady"))
+        depth_reader = Quest3DepthReader(source, view="front", rgb_shape=(height, width),
+                                        calibration=calibration, depth_unit_m=args.depth_unit_m)
+        if len(depth_reader.dataset) != len(rgb):
+            raise ValueError("HDF5 depth and RGB frame counts disagree")
+        depth0 = depth_reader.read(0)
+        calibration = depth_reader.calibration
+        depth_metadata = depth_reader.metadata
+        depth_metadata["world_calibration_source"] = str(args.calibration.resolve())
+        depth_metadata["world_coordinate_frame"] = "left_base"
+        depth_unit_m = depth_reader.depth_unit_m
+        K = calibration.intrinsics
+    if len(rgb) == 0 or len(rgb) != len(mesh_points) or len(mesh_qpos) != len(rgb) or timestamps_ns.shape != (len(rgb),):
         raise ValueError("HDF5 and mesh-surface frame counts disagree")
-    height, width = rgb.shape[1:3]
-    K, camera_to_world = _recorded_intrinsics(args.calibration, width=width, height=height)
-    calibration = CameraCalibration("front", K, camera_to_world)
     initial_rendered = _rendered_depth(mesh_points[0], calibration, height=height, width=width, splat_pixels=args.render_splat_pixels)
     seeds = _seed_pixels(depth0, initial_rendered, max_seeds=args.max_seeds, stride=args.seed_stride, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance, dilation_pixels=args.depth_dilation_pixels)
     seed_points, seed_valid = _lift_measured_tracks(depth0, initial_rendered, seeds, np.ones(len(seeds), bool), calibration, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance)
@@ -316,9 +333,10 @@ def main() -> None:
     tracks /= args.tracking_scale
     observed = np.zeros((len(rgb), len(seeds), 3), dtype=np.float32); visible = np.zeros((len(rgb), len(seeds)), dtype=bool)
     with h5py.File(args.episode, "r") as source:
-        depth_dataset = source["observations/images/front/depth"]
+        depth_reader = Quest3DepthReader(source, view="front", rgb_shape=(height, width),
+                                        calibration=calibration, depth_unit_m=args.depth_unit_m)
         for index in range(len(rgb)):
-            depth_m = np.asarray(depth_dataset[index], dtype=np.float32) * args.depth_unit_m
+            depth_m = depth_reader.read(index)
             rendered = _rendered_depth(mesh_points[index], calibration, height=height, width=width, splat_pixels=args.render_splat_pixels)
             observed[index], visible[index] = _lift_measured_tracks(depth_m, rendered, tracks[index], tracker_visible[index], calibration, absolute_tolerance_m=args.absolute_depth_tolerance_m, relative_tolerance=args.relative_depth_tolerance)
             for link in np.unique(track_link_ids):
@@ -327,7 +345,7 @@ def main() -> None:
                     distance, _ = cKDTree(mesh_points[index, link]).query(observed[index, ids])
                     visible[index, ids] &= distance <= .04
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.output, source_episode=np.asarray(str(Path(args.episode).resolve())), coordinate_frame=np.asarray("left_base"), point_source=np.asarray("measured_d455_depth_lifted_cotracker_fk_gated"), mesh_points_emitted=np.asarray(False), tracks_xy=tracks.astype(np.float32), tracker_visible=tracker_visible.astype(bool), observed_points=observed, observed_visible=visible, seed_xy=seeds, timestamps_ns=timestamps_ns, intrinsics=K, camera_to_world=camera_to_world, depth_unit_m=np.asarray(args.depth_unit_m, dtype=np.float32), rendered_depth_tolerance_m=np.asarray(args.absolute_depth_tolerance_m, dtype=np.float32), rendered_depth_relative_tolerance=np.asarray(args.relative_depth_tolerance, dtype=np.float32), tracker=np.asarray("CoTracker3 offline scaled_offline"))
+    np.savez_compressed(args.output, source_episode=np.asarray(str(Path(args.episode).resolve())), coordinate_frame=np.asarray("left_base"), point_source=np.asarray("measured_d455_depth_lifted_cotracker_fk_gated"), mesh_points_emitted=np.asarray(False), tracks_xy=tracks.astype(np.float32), tracker_visible=tracker_visible.astype(bool), observed_points=observed, observed_visible=visible, seed_xy=seeds, timestamps_ns=timestamps_ns, intrinsics=K, camera_to_world=camera_to_world, distortion=np.asarray(calibration.distortion if calibration.distortion is not None else np.zeros(5)), distortion_model=np.asarray(calibration.distortion_model), depth_unit_m=np.asarray(depth_unit_m, dtype=np.float32), depth_alignment_metadata=np.asarray(json.dumps(depth_metadata)), rendered_depth_tolerance_m=np.asarray(args.absolute_depth_tolerance_m, dtype=np.float32), rendered_depth_relative_tolerance=np.asarray(args.relative_depth_tolerance, dtype=np.float32), tracker=np.asarray("CoTracker3 offline scaled_offline"))
     _write_preview(args.preview, rgb, tracks, visible)
     _write_html(args.visualization, observed, visible, timestamps_ns, max_frames=args.visualization_max_frames)
     print({"frames": len(rgb), "stable_seed_ids": len(seeds), "cotracker_visible": int(tracker_visible.sum()), "depth_and_fk_valid": int(visible.sum()), "mean_valid_per_frame": float(visible.sum() / len(rgb)), "output": str(args.output), "preview": str(args.preview), "visualization": str(args.visualization)})

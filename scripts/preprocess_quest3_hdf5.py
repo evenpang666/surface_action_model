@@ -143,6 +143,11 @@ def _merge_visual(path: Path, *, episode_path: Path, sample_indices: np.ndarray,
         observed = np.asarray(data["observed_points"], dtype=np.float32)
         visible = np.asarray(data["observed_visible"], dtype=bool)
         source = str(np.asarray(data["source_episode"]).item())
+        depth_provenance = {
+            f"visual_{key}": np.asarray(data[key]).copy()
+            for key in ("depth_alignment_metadata", "depth_unit_m", "intrinsics", "camera_to_world", "distortion", "distortion_model")
+            if key in data
+        }
     if observed.shape[:2] != visible.shape or observed.shape[0] != frame_count or observed.shape[-1] != 3:
         raise ValueError(f"Measured point flow {path} does not align with the HDF5 episode")
     if Path(source).resolve() != episode_path.resolve():
@@ -171,6 +176,7 @@ def _merge_visual(path: Path, *, episode_path: Path, sample_indices: np.ndarray,
         offsets[row] = np.where(valid[..., None], future - current[row][None, ...], 0.0)
         mask[row] = valid
     return {
+        **depth_provenance,
         "current_surface": current,
         "surface_chunk": current[:, None] + offsets,
         "current_surface_mask": current_visible,

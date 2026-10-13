@@ -25,8 +25,12 @@ def fake_sdk(monkeypatch, *, fail_serial=None, fail_intrinsics=None, fail_stop=N
         def get_intrinsics(self):
             if fail_intrinsics:
                 raise RuntimeError('intrinsics unavailable')
-            return NS(fx=700., fy=701., ppx=640., ppy=360., coeffs=[.1, -.2, 0., 0., 0.],
+            return NS(fx=700. if self.stream == 'color' else 400.,
+                      fy=701. if self.stream == 'color' else 401.,
+                      ppx=self.w/2, ppy=self.h/2, coeffs=[.1, -.2, 0., 0., 0.],
                       model='distortion.brown_conrady', width=self.w, height=self.h)
+        def get_extrinsics_to(self, other):
+            return NS(rotation=[0., 1., 0., -1., 0., 0., 0., 0., 1.], translation=[.01, -.02, .03])
 
     class Device:
         def __init__(self, serial, usb): self.serial, self.usb = serial, usb
@@ -45,8 +49,9 @@ def fake_sdk(monkeypatch, *, fail_serial=None, fail_intrinsics=None, fail_stop=N
             self.streams[stream] = (width, height, fps)
 
     class Frame:
-        def __init__(self, data): self.data = data
+        def __init__(self, data, profile): self.data, self.profile = data, profile
         def get_data(self): return self.data
+        def get_profile(self): return self.profile
         def get_units(self): return .001
         def get_frame_timestamp_domain(self): return 'hardware_clock'
         def get_timestamp(self): return 1000.
@@ -59,23 +64,27 @@ def fake_sdk(monkeypatch, *, fail_serial=None, fail_intrinsics=None, fail_stop=N
         def start(self, config):
             self.config = config
             if config.serial == fail_serial: raise RuntimeError("Couldn't resolve requests")
-            w, h, fps = config.streams['color']
-            return NS(get_stream=lambda stream: Profile(stream, w, h, fps))
+            return NS(get_stream=lambda stream: Profile(stream, *config.streams[stream]))
         def stop(self):
             self.stopped = True
             if self.config.serial == fail_stop: raise RuntimeError('USB disconnected during stop')
         def wait_for_frames(self, timeout):
             w, h, _ = self.config.streams['color']
-            # SDK alignment yields depth in the requested color pixel grid,
-            # although the configured raw depth stream has another resolution.
-            return NS(get_color_frame=lambda: Frame(np.zeros((h, w, 3), np.uint8)),
-                      get_depth_frame=lambda: Frame(np.full((h, w), 1000, np.uint16)))
+            dw, dh, rate = self.config.streams['depth']
+            return NS(get_color_frame=lambda: Frame(np.zeros((h, w, 3), np.uint8), Profile('color', w, h, 15)),
+                      get_depth_frame=lambda: Frame(np.full((dh, dw), 1100, np.uint16), Profile('depth', dw, dh, rate)))
+
+    def align(frames):
+        color = frames.get_color_frame()
+        h, w = color.data.shape[:2]
+        return NS(get_color_frame=lambda: color,
+                  get_depth_frame=lambda: Frame(np.full((h, w), 1000, np.uint16), Profile('depth', w, h, 15)))
 
     devices = [Device('front-id', '3.2'), Device('side-id', '2.1')]
     sdk = NS(camera_info=NS(serial_number='serial', usb_type_descriptor='usb'),
              stream=NS(color='color', depth='depth'), format=NS(rgb8='rgb8', z16='z16'),
              context=lambda: NS(query_devices=lambda: devices), pipeline=Pipeline, config=Config,
-             align=lambda stream: NS(process=lambda frames: frames))
+             align=lambda stream: NS(process=align))
     monkeypatch.setitem(sys.modules, 'pyrealsense2', sdk)
     return pipelines
 
@@ -100,6 +109,26 @@ def test_usb2_depth_fallback_preserves_rgb_calibration_and_aligned_depth(monkeyp
     assert camera.get_color_calibrations()['side']['intrinsics'][0][0] == 700.
     camera.stop()
     assert all(p.stopped for p in pipelines)
+
+
+def test_native_depth_is_copied_before_sdk_alignment(monkeypatch):
+    fake_sdk(monkeypatch)
+    camera = source(retain_native_depth=True)
+    with pytest.warns(RuntimeWarning):
+        camera.start()
+    try:
+        frames = camera.read()
+        native = frames['side'].native_depth
+        assert native.depth_units.shape == (480, 640)
+        assert frames['side'].depth_m.shape == (720, 1280)
+        assert native.depth_units.dtype == np.uint16
+        np.testing.assert_array_equal(native.depth_units, np.full((480, 640), 1100, np.uint16))
+        np.testing.assert_allclose(frames['side'].depth_m, 1.)
+        assert native.depth_scale_m == .001 and native.intrinsics[0, 0] == 400.
+        np.testing.assert_array_equal(native.depth_to_color[:3, :3], [[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+        np.testing.assert_allclose(native.depth_to_color[:3, 3], [.01, -.02, .03])
+    finally:
+        camera.stop()
 
 
 def test_explicit_depth_profile_is_checked_before_any_camera_starts(monkeypatch):

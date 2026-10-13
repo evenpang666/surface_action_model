@@ -54,3 +54,24 @@ def test_robot_mask_matches_previous_dilation(radius: int) -> None:
     expected = ~(visible & valid & (np.abs(measured - expanded) <= 0.008 + 0.01 * expanded))
     actual = robot_depth_keep_mask(measured, rendered, dilation_pixels=radius)
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_offscreen_distorted_robot_rays_cannot_fold_back_into_image():
+    K = np.array([[100., 0., 50.], [0., 100., 40.], [0., 0., 1.]])
+    # k1=-1 folds the offscreen normalized ray x=1 onto the principal point.
+    # It must not mask the real one-metre surface there with a fake .5 m robot.
+    points = np.array([[.5, 0., .5], [0., 0., 1.], [.1, 0., 1.]])
+    depth = render_surface_points_depth(points, np.eye(4), K, width=100, height=80,
+                                         distortion=[-1., 0., 0., 0., 0.], splat_radius_pixels=0)
+    assert depth[40, 50] == 1.
+    assert depth[40, 60] == 1.
+    assert np.count_nonzero(depth) == 2
+
+
+def test_nonfinite_projection_never_reaches_integer_pixel_conversion():
+    K = np.array([[100., 0., 50.], [0., 100., 40.], [0., 0., 1.]])
+    points = np.array([[1e100, 0., .0001], [np.nan, 0., 1.], [0., 0., -1.]])
+    with np.errstate(all="raise"):
+        depth = render_surface_points_depth(points, np.eye(4), K, width=100, height=80,
+                                             distortion=[-.06, .06, 0., 0., -.02])
+    assert not depth.any()

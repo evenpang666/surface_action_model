@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -43,7 +43,11 @@ if str(REPO_ROOT) not in sys.path:
 from real_scripts.lingbot_depth import add_lingbot_depth_cli_args, create_lingbot_depth_refiner_from_args
 from real_scripts.camera_geometry import project_pixels
 from real_scripts.real_robot_adapter import CameraCalibration, RGBDFrame, depth_to_world_points, robot_depth_keep_mask
-from real_scripts.reconstruct_realsense_pointcloud import estimate_dominant_plane
+from real_scripts.obstacle_observation import TablePlanePrior, verified_completion_depth, measured_view_support
+from real_scripts.raw_depth_evidence import RawDepthEvidenceFilter, confirm_raw_depth_views
+from real_scripts.probabilistic_obstacle_map import workspace_occupancy_grid, integrate_depth_views
+from real_scripts.manual_obstacle_selection import ManualSelectionStore, rgb_manual_frame
+from safety_module.occupancy import LocalOccupancyGrid
 from real_scripts.ur7e_collision_mesh import (
     collision_surface_samples,
     link_and_collision_transforms,
@@ -60,11 +64,12 @@ from real_scripts.preprocess_left_vr_hdf5_cotracker_observations import _lift_me
 
 VIEWER_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Dual UR7e obstacle model</title>
 <script src="/plotly.min.js"></script><style>html,body,#scene{margin:0;width:100%;height:100%;overflow:hidden;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000c;padding:10px 13px;border-radius:7px;line-height:1.6;pointer-events:none}#pause,#focus,#robot-toggle{pointer-events:auto;margin-top:6px;padding:4px 9px;border:1px solid #6c7784;border-radius:4px;background:#17212b;color:#e6edf3;cursor:pointer}.robot{color:#ff6b55}.obstacle{color:#45ff9b}.warning{color:#ffd166}</style></head>
-<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（桌面坐标）</b><br><span id="s">等待首帧…</span><br><span id="timing"></span><br><span class="robot">红/橙：双 Robotiq 2F-85 与双臂</span> · <span class="obstacle">绿：双臂工作区内的桌面连接障碍物 OBB</span><br><span class="warning">双臂工作区外桌面点仅供显示；仅 RTDE 读取，不会发送运动或夹爪命令。</span><br><button id="focus" type="button" aria-pressed="true">当前：桌面聚焦（F）</button> <button id="robot-toggle" type="button" aria-pressed="true">隐藏机械臂（R）</button> <button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button></div><div id="scene"></div>
+<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（桌面坐标）</b><br><span id="s">等待首帧…</span><br><span id="timing"></span><br><span class="robot">红/橙：双 Robotiq 2F-85 与双臂</span> · <span class="obstacle">绿：双臂工作区障碍物 OBB（含悬空）</span><br><span class="warning">双臂工作区外桌面点仅供显示；仅 RTDE 读取，不会发送运动或夹爪命令。</span><br><button id="focus" type="button" aria-pressed="true">当前：桌面聚焦（F）</button> <button id="robot-toggle" type="button" aria-pressed="true">隐藏机械臂（R）</button> <button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button> <a href="/manual-obstacles" target="_blank" style="pointer-events:auto;color:#69dec3">人工 OBB / 体素验证</a><br><span id="manual-status" class="warning"></span></div><div id="scene"></div>
 <script>
 const G=document.getElementById('scene'),S=document.getElementById('s'),T=document.getElementById('timing'),P=document.getElementById('pause'),F=document.getElementById('focus'),R=document.getElementById('robot-toggle');
 const E=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
 let paused=false,focusTable=true,showRobot=true,tableReference=null,lastSnapshot=null;
+const manualMode=new URLSearchParams(location.search).get('manual')==='1';
 function setPaused(value){paused=value;P.textContent=paused?'继续显示（空格）':'暂停显示（空格）';P.setAttribute('aria-pressed',String(paused))}
 function setFocus(value){focusTable=value;F.textContent=value?'当前：桌面聚焦（F）':'当前：全景（F）';F.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot)}
 function setShowRobot(value){showRobot=value;R.textContent=value?'隐藏机械臂（R）':'显示机械臂（R）';R.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot)}
@@ -107,6 +112,19 @@ function boxes(items,frame){
   }
   return result;
 }
+function manualVoxels(selection,frame){
+  // Display full voxel cells, not point markers. Keep the exported selection complete.
+  const centers=selection.centers, limit=5000,step=Math.max(1,Math.ceil(centers.length/limit));
+  const signs=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
+  const triangles=[[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]];
+  const x=[],y=[],z=[],i=[],j=[],k=[],a=selection.axes,h=selection.resolution_m/2;
+  for(let index=0;index<centers.length;index+=step){const c=centers[index],base=x.length;
+    for(const sign of signs){const p=tablePoint(c.map((v,r)=>v+h*(a[r][0]*sign[0]+a[r][1]*sign[1]+a[r][2]*sign[2])),frame);x.push(p[0]);y.push(p[1]);z.push(p[2])}
+    for(const t of triangles){i.push(base+t[0]);j.push(base+t[1]);k.push(base+t[2])}
+  }
+  document.getElementById('manual-status').textContent=`人工冻结帧 ${selection.frame} · 黄色 ${centers.length} 个选中体素${step>1?'（显示抽样 '+Math.ceil(centers.length/step)+' 个）':''} · 蓝色为 3D 包围框 · 非实时`;
+  return {type:'mesh3d',name:'人工筛选体素',x,y,z,i,j,k,color:'#ffd84d',opacity:.85,flatshading:true,hoverinfo:'skip'};
+}
 function quantile(sorted,fraction){const index=(sorted.length-1)*fraction,low=Math.floor(index),high=Math.ceil(index);return sorted[low]+(sorted[high]-sorted[low])*(index-low)}
 function tableBounds(environment,frame){
   if(!frame)return null;
@@ -145,8 +163,9 @@ function draw(d){
   const outsideText=Number.isFinite(outside)?` · 双臂工作区外桌面/物体点 ${outside}`:'';
   const left=d.diagnostics?.left_workspace_points,right=d.diagnostics?.right_workspace_points;
   const workspaces=Number.isFinite(left)&&Number.isFinite(right)?` · 左/右工作区 ${left}/${right} 点`:'';
-  S.textContent=`帧 ${d.frame} · ${d.status} · 环境 ${d.environment.points.length} 点 · 双臂 ${d.robot.points.length} 点${showRobot?'':'（已隐藏）'} · ${d.obbs.length} 个障碍物${workspaces}${coverage}${outsideText}`;
-  const timing=d.diagnostics||{},stages=[['采集','capture_seconds'],['深度','depth_stage_seconds'],['点云','point_cloud_seconds'],['场景','scene_analysis_seconds'],['跟踪','box_tracking_seconds']];
+  const unknown=d.unknown_obstacles?.length||0;
+  S.textContent=`帧 ${d.frame} · ${d.status} · 环境 ${d.environment.points.length} 点 · 双臂 ${d.robot.points.length} 点${showRobot?'':'（已隐藏）'} · ${d.obbs.length} 个障碍物 · ${unknown} 个 unknown（无历史框）${workspaces}${coverage}${outsideText}`;
+  const timing=d.diagnostics||{},stages=[['采集','capture_seconds'],['深度','depth_stage_seconds'],['点云','point_cloud_seconds'],['桌面','scene_analysis_seconds'],['地图','box_tracking_seconds']];
   const elapsed=Number.isFinite(timing.processing_seconds)?`检测 ${Math.round(timing.processing_seconds*1000)} ms`:'';
   const interval=Number.isFinite(timing.frame_interval_seconds)?` · 帧间隔 ${Math.round(timing.frame_interval_seconds*1000)} ms`:'';
   T.textContent=elapsed+interval+stages.filter(([,key])=>Number.isFinite(timing[key])).map(([label,key])=>` · ${label} ${Math.round(timing[key]*1000)} ms`).join('');
@@ -159,11 +178,16 @@ function draw(d){
   const traces=[pts(d.environment,'environment',.7,frame)];
   if(showRobot)traces.push(pts(d.robot,'dual robots',1.1,frame));
   traces.push(...boxes(d.obbs,frame));
+  if(d.manual_selection){
+    traces.push(manualVoxels(d.manual_selection,frame));
+    const selectedBoxes=d.manual_selection.objects.filter(o=>o.obb).map(o=>o.obb);
+    traces.push(...boxes(selectedBoxes,frame).map(b=>({...b,line:{color:'#63b8ff',width:4}})));
+  }
   return Plotly.react(G,traces,{
     uirevision:focusTable?'table-focus-v3':'table-overview-v3',showlegend:false,paper_bgcolor:'#080a0d',margin:{l:0,r:0,t:0,b:0},scene
   },{displaylogo:false,responsive:true,scrollZoom:true});
 }
-async function poll(){if(!paused)try{let r=await fetch('/snapshot.json?viewer=1&'+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(!paused)await draw(d)}catch(e){if(!paused)S.textContent='读取快照失败，正在重试：'+e}setTimeout(poll,900)}
+async function poll(){if(!paused)try{let r=await fetch((manualMode?'/manual-obstacles/scene.json?':'/snapshot.json?viewer=1&')+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(!paused)await draw(d)}catch(e){if(!paused)S.textContent='读取快照失败，正在重试：'+e}setTimeout(poll,900)}
 poll();
 </script></body></html>"""
 
@@ -320,12 +344,38 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(lingbot_camera_names=("front", "side"), lingbot_depth=True)
     parser.add_argument("--workspace-bounds", nargs=6, type=float, default=(-0.85, 0.85, -0.85, 1.20, -0.12, 0.70), metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="Local workspace bounds for each arm; both are included in tabletop detection.")
     parser.add_argument("--right-workspace-bounds", nargs=6, type=float, default=None, metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="Optional right_base bounds; defaults to --workspace-bounds.")
-    parser.add_argument("--plane-threshold-m", type=float, default=.012); parser.add_argument("--min-height-m", type=float, default=.020); parser.add_argument("--max-height-m", type=float, default=.35); parser.add_argument("--outlier-neighbour-m", type=float, default=.020)
+    parser.add_argument("--plane-threshold-m", type=float, default=.012); parser.add_argument("--min-height-m", type=float, default=.020)
+    parser.add_argument("--max-height-m", type=float, default=None, help="Optional explicit obstacle height cap; default uses the full configured workspace.")
+    parser.add_argument("--outlier-neighbour-m", type=float, default=.020, help="Maximum 3D distance to a supporting raw-depth neighbour (also used by the legacy cluster helper).")
+    parser.add_argument("--raw-depth-neighbor-pixels", type=int, default=1)
+    parser.add_argument("--raw-depth-min-neighbors", type=int, default=2)
+    parser.add_argument("--raw-depth-absolute-tolerance-m", type=float, default=.008)
+    parser.add_argument("--raw-depth-relative-tolerance", type=float, default=.005)
+    parser.add_argument("--raw-depth-confirm-frames", type=int, default=3)
+    parser.add_argument("--raw-depth-max-gap-s", type=float, default=2.)
+    parser.add_argument("--table-plane", nargs=4, type=float, default=None, metavar=("NX", "NY", "NZ", "OFFSET"), help="Optional measured table prior in left_base: n.x + offset = 0. Otherwise initialize with an exposed tabletop.")
+    parser.add_argument("--table-prior-min-inlier-fraction", type=float, default=.35)
+    parser.add_argument("--table-prior-max-angle-deg", type=float, default=3.)
+    parser.add_argument("--table-prior-max-offset-m", type=float, default=.01)
     parser.add_argument("--cluster-eps-m", type=float, default=.010, help="Exact point-to-point DBSCAN radius; unlike voxel adjacency, this is a physical distance.")
     parser.add_argument("--cluster-min-samples", type=int, default=6, help="DBSCAN core-neighbour count, including the point itself.")
     parser.add_argument("--min-cluster-points", type=int, default=80); parser.add_argument("--attachment-distance-m", type=float, default=.050); parser.add_argument("--box-margin-m", type=float, default=.010)
     parser.add_argument("--raw-depth-support-pixels", type=int, default=2, help="LingBot pixels must be within this many pixels of raw, non-robot D455 depth; 0 permits raw pixels only.")
-    parser.add_argument("--temporal-persistence-frames", type=int, default=3, help="Consecutive observations required before an obstacle OBB is shown; use 1 to disable.")
+    parser.add_argument("--completion-absolute-tolerance-m", type=float, default=.015)
+    parser.add_argument("--completion-relative-tolerance", type=float, default=.015)
+    parser.add_argument("--occupancy-map", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the local probabilistic voxel map (default on); --no-occupancy-map uses filtered DBSCAN/temporal OBBs without a map.")
+    parser.add_argument("--manual-output-dir", type=Path, default=REPO_ROOT / "outputs/manual_obstacles",
+                        help="Save frozen dual-view RGB-D captures and manual voxel selections here.")
+    parser.add_argument("--occupancy-resolution-m", type=float, default=.02)
+    parser.add_argument("--occupancy-ray-stride", type=int, default=6)
+    parser.add_argument("--occupancy-free-margin-m", type=float, default=.015)
+    parser.add_argument("--occupancy-free-ttl-s", type=float, default=2.)
+    parser.add_argument("--occupancy-hit-probability", type=float, default=.7)
+    parser.add_argument("--occupancy-miss-probability", type=float, default=.4)
+    parser.add_argument("--occupancy-free-probability", type=float, default=.35)
+    parser.add_argument("--occupancy-box-tile-voxels", type=int, default=4)
+    parser.add_argument("--temporal-persistence-frames", type=int, default=3, help="Consecutive observations required to confirm a track; uncovered candidate OBBs are published immediately.")
     parser.add_argument("--temporal-track-distance-m", type=float, default=.035, help="Maximum centre displacement when associating an OBB across frames.")
     parser.add_argument("--obb-point-change-distance-m", type=float, default=.015,
                         help="Nearest-neighbour point displacement counted as cluster change (m).")
@@ -338,7 +388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obb-merge-overlap-ratio", type=float, default=.50,
                         help="Merge published OBBs when intersection exceeds this fraction of the smaller OBB volume.")
     parser.add_argument("--obb-removal-confirm-frames", type=int, default=3,
-                        help="Consecutive frames with measured free space behind a missing cluster before removing its OBB.")
+                        help="Consecutive measured-free frames needed to resolve a missing obstacle's unknown state.")
     parser.add_argument("--left-tool-from-tcp", type=Path, default=None, help="Optional JSON/YAML ^active_tcpT_left_tool_urdf_root; identity for the bundled URDF.")
     parser.add_argument("--right-tool-from-tcp", type=Path, default=None, help="Optional JSON/YAML ^active_tcpT_right_tool_urdf_root; identity for the bundled URDF.")
     parser.add_argument("--left-robotiq-read-port", type=int, default=63352, help="Left 2F-85 URCap port used only for GET POS.")
@@ -350,8 +400,50 @@ def parse_args() -> argparse.Namespace:
             or not 1 <= args.obb_change_confirm_frames <= args.obb_history_frames
             or args.obb_removal_confirm_frames < 1
             or not np.isfinite(args.obb_merge_overlap_ratio)
-            or not 0 <= args.obb_merge_overlap_ratio < 1):
+            or not 0 <= args.obb_merge_overlap_ratio < 1
+            or args.raw_depth_support_pixels < 0
+            or not np.isfinite([args.completion_absolute_tolerance_m, args.completion_relative_tolerance]).all()
+            or args.completion_absolute_tolerance_m < 0 or args.completion_relative_tolerance < 0
+            or (args.occupancy_map and (
+                args.occupancy_ray_stride < 1 or not 1 <= args.occupancy_box_tile_voxels <= 32
+                or not np.isfinite(args.occupancy_free_margin_m) or args.occupancy_free_margin_m < 0))
+            or not np.isfinite(args.min_height_m) or args.min_height_m < 0
+            or (args.max_height_m is not None and (not np.isfinite(args.max_height_m)
+                                                  or args.max_height_m <= args.min_height_m))):
         parser.error("Invalid OBB tracking thresholds or merge overlap ratio")
+    try:
+        RawDepthEvidenceFilter(radius_pixels=args.raw_depth_neighbor_pixels,
+                               min_neighbors=args.raw_depth_min_neighbors,
+                               absolute_tolerance_m=args.raw_depth_absolute_tolerance_m,
+                               relative_tolerance=args.raw_depth_relative_tolerance,
+                               neighbor_distance_m=args.outlier_neighbour_m,
+                               confirm_frames=args.raw_depth_confirm_frames,
+                               max_gap_s=args.raw_depth_max_gap_s)
+        TablePlanePrior(threshold_m=args.plane_threshold_m, plane=args.table_plane,
+                        min_fraction=args.table_prior_min_inlier_fraction,
+                        max_angle_deg=args.table_prior_max_angle_deg,
+                        max_offset_m=args.table_prior_max_offset_m)
+        if args.occupancy_map:
+            LocalOccupancyGrid([0., 0., 0.], np.eye(3), [1, 1, 1], args.occupancy_resolution_m,
+                               hit_probability=args.occupancy_hit_probability,
+                               miss_probability=args.occupancy_miss_probability,
+                               free_probability=args.occupancy_free_probability,
+                               clear_frames=args.obb_removal_confirm_frames,
+                               free_ttl_s=args.occupancy_free_ttl_s)
+        else:
+            if (not np.isfinite([args.cluster_eps_m, args.attachment_distance_m]).all()
+                    or args.cluster_eps_m <= 0 or args.cluster_min_samples < 1
+                    or args.min_cluster_points < 3 or args.attachment_distance_m < 0):
+                raise ValueError("Invalid DBSCAN obstacle thresholds")
+            TemporalOBBGate(required_hits=args.temporal_persistence_frames,
+                            match_distance_m=args.temporal_track_distance_m,
+                            point_change_distance_m=args.obb_point_change_distance_m,
+                            point_change_fraction=args.obb_point_change_fraction,
+                            change_confirm_frames=args.obb_change_confirm_frames,
+                            removal_confirm_frames=args.obb_removal_confirm_frames,
+                            history_frames=args.obb_history_frames)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -500,7 +592,8 @@ def viewer_environment_points(
     return points[visible], colors[visible], int(outside.sum())
 
 
-def tabletop_obb(points: np.ndarray, normal: np.ndarray, offset: float) -> UprightOBB | None:
+def tabletop_obb(points: np.ndarray, normal: np.ndarray, offset: float,
+                 *, extend_to_table: bool = True) -> UprightOBB | None:
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     if len(points) < 3: return None
     normal = np.asarray(normal, dtype=np.float64); normal /= max(np.linalg.norm(normal), 1e-12)
@@ -508,7 +601,10 @@ def tabletop_obb(points: np.ndarray, normal: np.ndarray, offset: float) -> Uprig
     basis = np.column_stack((first, second)); planar = points @ basis; centered = planar - planar.mean(0)
     _, vectors = np.linalg.eigh(centered.T @ centered / max(len(points) - 1, 1)); rotation = np.column_stack((basis @ vectors[:, ::-1], normal))
     if np.linalg.det(rotation) < 0: rotation[:, 1] *= -1
-    local = points @ rotation; low, high = local.min(0), local.max(0); low[2] = min(low[2], -float(offset)); extents = np.maximum(high - low, 1e-4); center = rotation @ ((low + high) * .5)
+    local = points @ rotation; low, high = local.min(0), local.max(0)
+    if extend_to_table:
+        low[2] = min(low[2], -float(offset))
+    extents = np.maximum(high - low, 1e-4); center = rotation @ ((low + high) * .5)
     signs = np.asarray(((-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)), dtype=np.float64)
     corners = center + (0.5 * signs * extents) @ rotation.T
     return UprightOBB(center.astype(np.float32), rotation.astype(np.float32), extents.astype(np.float32), corners.astype(np.float32), int(len(points)))
@@ -588,7 +684,8 @@ def merge_overlapping_obbs(
         ratio, i, j = max(pairs)
         if ratio <= min_overlap_ratio:
             return merged
-        covering = tabletop_obb(np.concatenate((merged[i].corners, merged[j].corners)), normal, offset)
+        covering = tabletop_obb(np.concatenate((merged[i].corners, merged[j].corners)), normal, offset,
+                                extend_to_table=False)
         if covering is None:
             raise RuntimeError("Overlapping obstacle boxes could not be enclosed")
         covering = UprightOBB(covering.center, covering.rotation, covering.extents, covering.corners,
@@ -640,6 +737,38 @@ def dbscan_clusters(
     return [indices for label in range(cluster_id) if len(indices := np.flatnonzero(labels == label)) >= int(min_cluster_points)]
 
 
+def obstacle_cluster_boxes(points: np.ndarray, normal: np.ndarray, offset: float,
+                           *, min_height_m: float, max_height_m: float | None,
+                           outlier_neighbour_m: float, eps_m: float, min_samples: int,
+                           min_cluster_points: int, attachment_distance_m: float
+                           ) -> tuple[list[UprightOBB], list[np.ndarray], dict]:
+    """Detect every above-table cluster in the workspace, including floating ones."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    height = points @ normal + offset
+    keep = height >= min_height_m
+    if max_height_m is not None:
+        keep &= height <= max_height_m
+    points, height = points[keep], height[keep]
+    if len(points) > 1 and outlier_neighbour_m > 0:
+        distances, _ = cKDTree(points).query(points, k=2, workers=-1)
+        keep = distances[:, 1] <= outlier_neighbour_m
+        points, height = points[keep], height[keep]
+    boxes, clusters = [], []
+    connected = floating = 0
+    for indices in dbscan_clusters(points, eps_m=eps_m, min_samples=min_samples,
+                                   min_cluster_points=min_cluster_points):
+        attached = height[indices].min() <= attachment_distance_m
+        box = tabletop_obb(points[indices], normal, offset, extend_to_table=bool(attached))
+        if box is not None:
+            boxes.append(box)
+            clusters.append(points[indices])
+            connected += int(attached)
+            floating += int(not attached)
+    return boxes, clusters, {"object_candidate_points": len(points),
+                              "table_connected_components": connected,
+                              "floating_components": floating}
+
+
 def raw_depth_support_mask(depth_m: np.ndarray, robot_keep_mask: np.ndarray, radius_pixels: int) -> np.ndarray:
     """Permit completed depth only near a measured, non-robot D455 sample."""
     raw_depth = np.asarray(depth_m, dtype=np.float32)
@@ -661,7 +790,7 @@ def raw_depth_support_mask(depth_m: np.ndarray, robot_keep_mask: np.ndarray, rad
 @dataclass
 class _ObstacleTrack:
     center: np.ndarray
-    box: UprightOBB
+    box: UprightOBB | None
     points: np.ndarray
     consecutive_hits: int = 1
     missed_frames: int = 0
@@ -672,6 +801,7 @@ class _ObstacleTrack:
     change_hits: int = 0
     free_space_hits: int = 0
     last_free_space_fraction: float = 0.0
+    track_id: int = 0
 
 
 def _enclose_duplicate_boxes(first: UprightOBB, second: UprightOBB) -> UprightOBB:
@@ -688,7 +818,8 @@ def _enclose_duplicate_boxes(first: UprightOBB, second: UprightOBB) -> UprightOB
 
 def observed_free_space_fraction(points: np.ndarray,
                                  views: list[tuple[CameraCalibration, np.ndarray]],
-                                 *, depth_margin_m: float = .03) -> float:
+                                 *, depth_margin_m: float = .03,
+                                 uncertain_views: list[tuple[CameraCalibration, np.ndarray]] | None = None) -> float:
     """Fraction of former cluster points with measured depth behind them.
 
     A missing or foreground depth sample does not establish free space. A 3x3
@@ -698,6 +829,7 @@ def observed_free_space_fraction(points: np.ndarray,
     if not len(points):
         return 0.0
     free = np.zeros(len(points), dtype=bool)
+    occupied = np.zeros(len(points), dtype=bool)
     for camera, depth in views:
         depth = np.asarray(depth, dtype=float)
         world_to_camera = np.linalg.inv(camera.camera_to_world)
@@ -720,15 +852,21 @@ def observed_free_space_fraction(points: np.ndarray,
         nearest = np.min(np.where(valid, neighborhood, np.inf), axis=0)
         free[indices] |= ((valid.sum(axis=0) >= 5)
                           & (nearest > camera_points[indices, 2] + depth_margin_m))
-    return float(np.mean(free))
+        occupied[indices] |= (valid.sum(axis=0) >= 5) & (
+            np.abs(nearest - camera_points[indices, 2]) <= depth_margin_m)
+    if uncertain_views:
+        pending, _ = measured_view_support(points, uncertain_views,
+                                          absolute_tolerance_m=depth_margin_m, relative_tolerance=0.)
+        occupied |= pending
+    return float(np.mean(free & ~occupied))
 
 
 class TemporalOBBGate:
     """Keep OBB geometry fixed until its observed point cluster changes persistently.
 
-    Only a bounded window of sampled cluster observations is retained. Missing
-    confirmed boxes expire after that many frames, with measured free space
-    allowed to remove them sooner.
+    Missing tracks discard their OBB immediately and become unknown. A bounded
+    point sample remains only as a witness for measured clearing/reobservation;
+    neither missing frames nor history expiry establish free space.
     """
 
     def __init__(self, *, required_hits: int, match_distance_m: float,
@@ -754,6 +892,18 @@ class TemporalOBBGate:
         self._tracks: list[_ObstacleTrack] = []
         self.unstable_reasons: list[str] = []
         self.expired_tracks = 0
+        self._next_track_id = 1
+
+    @property
+    def unknown_obstacles(self) -> list[dict]:
+        # No historical box, centre, axes or extents are published as geometry.
+        return [{"track_id": track.track_id, "state": "unknown",
+                 "reason": "missing_depth_observation",
+                 "last_observed_frame": track.last_observed_frame,
+                 "missed_frames": track.missed_frames,
+                 "free_space_fraction": track.last_free_space_fraction,
+                 "free_space_hits": track.free_space_hits}
+                for track in self._tracks if track.box is None]
 
     @staticmethod
     def _sample_points(points: np.ndarray) -> np.ndarray:
@@ -773,6 +923,7 @@ class TemporalOBBGate:
         for track in self._tracks:
             duplicate = next((other for other in unique
                               if track.confirmed and other.confirmed
+                              and track.box is not None and other.box is not None
                               and np.linalg.norm(track.center - other.center) <= self.match_distance_m
                               and np.allclose(track.box.extents, other.box.extents, rtol=.15, atol=.02)
                               and self._change_fraction(track.points, other.points) < .1), None)
@@ -795,7 +946,8 @@ class TemporalOBBGate:
         self._tracks = unique
 
     def update(self, boxes: list[UprightOBB], point_clusters: list[np.ndarray] | None = None,
-               *, free_space_views: list[tuple[CameraCalibration, np.ndarray]] | None = None) -> list[UprightOBB]:
+               *, free_space_views: list[tuple[CameraCalibration, np.ndarray]] | None = None,
+               uncertain_space_views: list[tuple[CameraCalibration, np.ndarray]] | None = None) -> list[UprightOBB]:
         if point_clusters is None:
             point_clusters = [box.corners for box in boxes]
         if len(boxes) != len(point_clusters):
@@ -810,10 +962,6 @@ class TemporalOBBGate:
             while (track.recent_observations
                    and self._frame_number - track.recent_observations[0][0] >= self.history_frames):
                 track.recent_observations.popleft()
-            if (track.confirmed
-                    and self._frame_number - track.last_observed_frame >= self.history_frames):
-                self.expired_tracks += 1
-                continue
             if (track.reference_frame
                     and self._frame_number - track.reference_frame >= self.history_frames
                     and track.recent_observations):
@@ -829,9 +977,13 @@ class TemporalOBBGate:
             for track_index, track in enumerate(self._tracks):
                 support = float(np.mean(tree.query(track.points)[0] <= self.point_change_distance_m))
                 distance = float(np.linalg.norm(track.center - box.center))
-                if support >= .5 and track.confirmed:
+                if support >= .5 and track.confirmed and track.box is not None:
                     supporting_tracks.append(track_index)
-                if distance <= self.match_distance_m or support >= .5:
+                # Unknown witnesses need almost complete reobservation; a nearby
+                # but different object must not silently resolve unknown space.
+                matches = (support >= .95 if track.box is None else
+                           distance <= self.match_distance_m or support >= .5)
+                if matches:
                     candidates.append((-support, distance, track_index, box_index))
             if len(supporting_tracks) >= 2:
                 merged_candidates[box_index] = supporting_tracks
@@ -851,8 +1003,8 @@ class TemporalOBBGate:
             track.last_free_space_fraction = 0.0
             observed_points = samples[box_index]
             newly_confirmed = not track.confirmed and track.consecutive_hits >= self.required_hits
-            if newly_confirmed:
-                track.confirmed = True
+            if newly_confirmed or track.box is None:
+                track.confirmed = track.confirmed or newly_confirmed
                 track.box = boxes[box_index]
                 track.center = np.asarray(track.box.center, dtype=np.float64)
                 track.points = observed_points
@@ -891,6 +1043,7 @@ class TemporalOBBGate:
             for track_index in track_indices:
                 if track_index not in used_tracks:
                     self._tracks[track_index].missed_frames = 0
+                    self._tracks[track_index].last_observed_frame = self._frame_number
                     self._tracks[track_index].free_space_hits = 0
                     self._tracks[track_index].last_free_space_fraction = 0.0
                     used_tracks.add(track_index)
@@ -903,27 +1056,32 @@ class TemporalOBBGate:
                     recent_observations=deque([(self._frame_number, points)],
                                               maxlen=self.history_frames),
                     last_observed_frame=self._frame_number,
-                    reference_frame=self._frame_number))
-        # A missing confirmed cluster remains in the safety scene during the
-        # recent-frame window. An unconfirmed one-frame candidate disappears
-        # on its first miss.
-        self._tracks = [track for track in self._tracks if track.confirmed or not track.missed_frames]
+                    reference_frame=self._frame_number, track_id=self._next_track_id))
+                self._next_track_id += 1
         retained = []
         for track in self._tracks:
-            if track.confirmed and track.missed_frames:
-                free_fraction = (observed_free_space_fraction(track.points, free_space_views)
+            if track.missed_frames:
+                # Every candidate is published for safety, including tracks not
+                # yet confirmed. Its disappearance must therefore become unknown.
+                track.box = None
+                # A merged observed cluster may fully cover multiple old witnesses.
+                if any(np.mean(cKDTree(sample).query(track.points)[0]
+                               <= self.point_change_distance_m) >= .95 for sample in samples):
+                    continue
+                free_fraction = (observed_free_space_fraction(track.points, free_space_views,
+                                                            uncertain_views=uncertain_space_views)
                                  if free_space_views is not None else 0.0)
                 track.last_free_space_fraction = free_fraction
-                track.free_space_hits = (track.free_space_hits + 1 if free_fraction >= .6 else 0)
+                track.free_space_hits = (track.free_space_hits + 1 if free_fraction >= .95 else 0)
                 if track.free_space_hits >= self.removal_confirm_frames:
                     continue
             retained.append(track)
         self._tracks = retained
-        if any(not track.confirmed for track in self._tracks):
+        if any(not track.confirmed and track.box is not None for track in self._tracks):
             self.unstable_reasons.append("new_cluster")
-        if any(track.confirmed and track.missed_frames for track in self._tracks):
+        if self.unknown_obstacles:
             self.unstable_reasons.append("missing_cluster")
-        return [track.box for track in self._tracks if track.confirmed]
+        return [track.box for track in self._tracks if track.confirmed and track.box is not None]
 
 
 def combine_depth(depths: list[np.ndarray]) -> np.ndarray:
@@ -938,8 +1096,8 @@ def materialize_snapshot(snapshot: dict, *, viewer: bool = False,
     """Convert display arrays only when a client asks for them."""
     display: SnapshotDisplay | None = snapshot.get("_display_data")
     if display is None:
-        return dict(snapshot)
-    result = {key: value for key, value in snapshot.items() if key != "_display_data"}
+        return {key: value for key, value in snapshot.items() if key != "_manual_frames"}
+    result = {key: value for key, value in snapshot.items() if key not in ("_display_data", "_manual_frames")}
     if viewer:
         visible = display.table_band
         environment = cap(display.all_points[visible], display.all_colors[visible], display.max_points)
@@ -965,7 +1123,7 @@ def snapshot_payload(snapshot: dict, *, compact: bool = False, viewer: bool = Fa
     """Keep safety requests small and build display JSON outside the detector."""
     if compact:
         excluded = {"environment", "_viewer_environment", "robot", "current_surface",
-                    "rgb_front_jpeg_base64", "_display_data"}
+                    "rgb_front_jpeg_base64", "_display_data", "_manual_frames"}
         snapshot = {key: value for key, value in snapshot.items() if key not in excluded}
     else:
         snapshot = materialize_snapshot(snapshot, viewer=viewer)
@@ -1003,9 +1161,8 @@ def main() -> None:
         raise RuntimeError("Calibration changed while constructing perception geometry")
     print(json.dumps({"mode": "read-only", "calibration": report, "left_ip": left.ip, "right_ip": right.ip}, indent=2))
     from rtde_receive import RTDEReceiveInterface
-    # Model construction/download is intentionally opt-in: on a CPU-only host
-    # it is not a real-time operation.  With --lingbot-depth it refines the
-    # front D455 map before the environment cloud is created.
+    # --no-lingbot-depth bypasses model loading/inference. Verified completion
+    # from both views supplements raw measurements but never replaces them.
     refiner = create_lingbot_depth_refiner_from_args(args)
     if refiner is not None:
         print(json.dumps({"depth_refinement": "LingBot-Depth", "model": refiner.model_id, "device": str(refiner.device), "fp16": refiner.use_fp16, "views": refiner.camera_names}, indent=2))
@@ -1015,11 +1172,13 @@ def main() -> None:
     latest: dict = {"schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
                     "frame": 0, "status": "initializing", "environment": {"points": [], "colors": []},
                     "robot": {"points": [], "colors": []}, "obbs": []}; lock = threading.Lock(); stop = threading.Event()
+    manual_store = ManualSelectionStore(args.manual_output_dir)
 
     def process() -> None:
         nonlocal latest
         source = RealSenseD435iSource(cameras=(D435iCameraConfig("front", args.front_serial or report["camera_serial"]), D435iCameraConfig("side", args.side_serial or side_serial)), width=args.width, height=args.height, fps=args.fps,
-                                    depth_width=args.depth_width, depth_height=args.depth_height)
+                                    depth_width=args.depth_width, depth_height=args.depth_height,
+                                    retain_native_depth=True)
         receivers = {}
         try:
             for arm in (left, right):
@@ -1030,14 +1189,24 @@ def main() -> None:
         left_gripper: ReadOnlyRobotiq2FPosition | None = None; right_gripper: ReadOnlyRobotiq2FPosition | None = None
         finger_angle = float(np.clip(args.left_finger_angle_rad, 0., .8)); right_finger_angle = finger_angle
         gripper_status = f"2F-85 fixed angle {finger_angle:.3f} rad"
-        obstacle_gate = TemporalOBBGate(
-            required_hits=args.temporal_persistence_frames,
-            match_distance_m=args.temporal_track_distance_m,
+        occupancy_grid = None
+        obstacle_gate = (None if args.occupancy_map else TemporalOBBGate(
+            required_hits=args.temporal_persistence_frames, match_distance_m=args.temporal_track_distance_m,
             point_change_distance_m=args.obb_point_change_distance_m,
             point_change_fraction=args.obb_point_change_fraction,
             change_confirm_frames=args.obb_change_confirm_frames,
-            removal_confirm_frames=args.obb_removal_confirm_frames,
-            history_frames=args.obb_history_frames,
+            removal_confirm_frames=args.obb_removal_confirm_frames, history_frames=args.obb_history_frames))
+        raw_filters = {name: RawDepthEvidenceFilter(
+            radius_pixels=args.raw_depth_neighbor_pixels, min_neighbors=args.raw_depth_min_neighbors,
+            absolute_tolerance_m=args.raw_depth_absolute_tolerance_m,
+            relative_tolerance=args.raw_depth_relative_tolerance,
+            neighbor_distance_m=args.outlier_neighbour_m, confirm_frames=args.raw_depth_confirm_frames,
+            max_gap_s=args.raw_depth_max_gap_s) for name in calibrations}
+        table_prior = TablePlanePrior(
+            threshold_m=args.plane_threshold_m, plane=args.table_plane,
+            min_fraction=args.table_prior_min_inlier_fraction,
+            max_angle_deg=args.table_prior_max_angle_deg,
+            max_offset_m=args.table_prior_max_offset_m,
         )
         try:
             left_gripper = ReadOnlyRobotiq2FPosition(left.ip, port=args.left_robotiq_read_port)
@@ -1084,7 +1253,6 @@ def main() -> None:
                     # A partial frame cannot be used for robot masking or
                     # collision checks. Keep polling so a restored read-only
                     # connection can publish a completely new scene.
-                    obstacle_gate._tracks.clear()
                     with lock:
                         latest = {"schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
                                   "frame": frame_no, "status": message,
@@ -1115,24 +1283,68 @@ def main() -> None:
                 geometry_done = time.perf_counter()
                 refined_frames = frames if refiner is None else {f.camera_name: f for f in refiner.refine(tuple(frames.values()), calibrations)}
                 refinement_done = time.perf_counter()
-                clouds, colors, measured_surface = [], [], []
+                clouds, colors, measured_clouds, completion_clouds, measured_surface, uncertain_clouds = [], [], [], [], [], []
+                mapped_raw_clouds = []
                 support_pixels = 0
+                raw_keeps, rendered_views = {}, {}
+                raw_evidence = {}
+                raw_filter_seconds = 0.
                 for name, raw in frames.items():
                     view = calibrations[name]
-                    refined = refined_frames[name]
                     rendered = render_surface_points_depth(robot, view.camera_to_world, view.intrinsics,
                                                            width=raw.rgb.shape[1], height=raw.rgb.shape[0], splat_radius_pixels=3,
                                                            distortion=view.distortion, distortion_model=view.distortion_model)
                     raw_keep = robot_depth_keep_mask(raw.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
-                    refined_keep = (raw_keep if refiner is None else
-                                    robot_depth_keep_mask(refined.depth_m, rendered,
-                                                          absolute_tolerance_m=args.absolute_tolerance_m,
-                                                          relative_tolerance=args.relative_tolerance,
-                                                          dilation_pixels=args.dilation_pixels))
-                    raw_support = raw_depth_support_mask(raw.depth_m, raw_keep, args.raw_depth_support_pixels)
-                    keep = refined_keep & raw_support
-                    cloud, color = depth_to_world_points(refined, view, stride=args.point_stride, max_depth=2.5, keep_mask=keep)
+                    raw_keeps[name], rendered_views[name] = raw_keep, rendered
+                    filter_began = time.perf_counter()
+                    raw_evidence[name] = raw_filters[name].update(
+                        raw.depth_m, raw_keep, rendered, view, timestamp_ns=capture_timestamp_ns,
+                        robot_absolute_tolerance_m=args.absolute_tolerance_m,
+                        robot_relative_tolerance=args.relative_tolerance)
+                    raw_filter_seconds += time.perf_counter() - filter_began
+                filter_began = time.perf_counter()
+                confirm_raw_depth_views(
+                    {name: (calibrations[name], raw.depth_m, raw_evidence[name]) for name, raw in frames.items()},
+                    absolute_tolerance_m=args.raw_depth_absolute_tolerance_m,
+                    relative_tolerance=args.raw_depth_relative_tolerance)
+                raw_filter_seconds += time.perf_counter() - filter_began
+                # Rejected returns cannot confirm completion or establish free
+                # rays. Keep their endpoints unknown, even after a free history.
+                measured_views = {name: np.where(raw_evidence[name].accepted, frame.depth_m, 0.)
+                                  for name, frame in frames.items()}
+                depth_evidence = {}
+                for name, raw in frames.items():
+                    view, raw_keep, rendered = calibrations[name], raw_keeps[name], rendered_views[name]
+                    evidence = raw_evidence[name]
+                    completion_keep = raw_keep & ~evidence.uncertain
+                    raw_support = raw_depth_support_mask(raw.depth_m, completion_keep, args.raw_depth_support_pixels)
+                    # Preserve accepted raw values when the model disagrees;
+                    # completion must never restore a rejected measured return.
+                    cloud, color = depth_to_world_points(raw, view, stride=args.point_stride, max_depth=2.5, keep_mask=evidence.accepted)
+                    if args.occupancy_map:
+                        uncertain = raw_filters[name].world_points(raw.depth_m, evidence.uncertain, view)
+                        uncertain_clouds.append(uncertain)
+                        mapped_raw_clouds.append(raw_filters[name].world_points(raw.depth_m, evidence.accepted, view))
+                    measured_clouds.append(cloud)
                     clouds.append(cloud); colors.append(color); support_pixels += int(raw_support.sum())
+                    depth_evidence[name] = {**evidence.diagnostics, "measured_points": len(cloud), "accepted_completion_pixels": 0}
+                    if refiner is not None:
+                        refined = refined_frames[name]
+                        refined_keep = robot_depth_keep_mask(
+                            refined.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m,
+                            relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                        completion, completion_evidence = verified_completion_depth(
+                            raw.depth_m, refined.depth_m, completion_keep, refined_keep, view,
+                            [(calibrations[other], depth) for other, depth in measured_views.items() if other != name],
+                            support_pixels=args.raw_depth_support_pixels,
+                            absolute_tolerance_m=args.completion_absolute_tolerance_m,
+                            relative_tolerance=args.completion_relative_tolerance)
+                        extra, extra_color = depth_to_world_points(
+                            replace(raw, depth_m=completion), view, stride=args.point_stride,
+                            max_depth=2.5, keep_mask=completion > 0)
+                        clouds.append(extra); colors.append(extra_color)
+                        completion_clouds.append(extra)
+                        depth_evidence[name].update(completion_evidence, completion_points=len(extra))
                     v, u = np.nonzero(~raw_keep & (raw.depth_m > 0))
                     pixels = np.c_[u, v][::max(1, args.point_stride)]
                     observed, visible = _lift_measured_tracks(raw.depth_m, rendered, pixels, np.ones(len(pixels), bool), view, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance)
@@ -1143,67 +1355,100 @@ def main() -> None:
                 left_mask, right_mask, arm_workspace_mask = dual_arm_workspace_masks(
                     full_env, args.workspace_bounds, right_workspace_bounds, right.base_to_left,
                 )
-                local = full_env[left_mask]
-                if len(local) < 80: raise RuntimeError("not enough robot-filtered points to fit the tabletop")
-                normal, offset, _ = estimate_dominant_plane(local, threshold=args.plane_threshold_m, ransac_iterations=300)
-                # ``left_base`` need not have its +Z along the physical table
-                # normal (this dual setup is not a world frame).  The only
-                # stable sign convention is: positive height faces the fixed
-                # overhead camera, so tabletop objects rise toward it.
-                camera_side = float(calibration.camera_to_world[:3, 3] @ normal + offset)
-                if camera_side < 0:
-                    normal, offset = -normal, -offset
+                raw_env = np.concatenate(measured_clouds)
+                local = raw_env[points_in_bounds(raw_env, args.workspace_bounds)]
+                normal, offset = table_prior.update(local, calibration.camera_to_world[:3, 3])
                 full_height = full_env.astype(np.float64) @ normal + offset
-                table_band = (full_height >= -max(.03, 2 * args.plane_threshold_m)) & (full_height <= args.max_height_m + args.box_margin_m)
+                table_band = full_height >= -max(.03, 2 * args.plane_threshold_m)
+                if args.max_height_m is not None:
+                    table_band &= full_height <= args.max_height_m + args.box_margin_m
                 mask = arm_workspace_mask & table_band
                 env, ecol = full_env[mask], full_ecol[mask]
                 # The viewer's tabletop band includes the detection workspace
                 # plus points outside it; the band has already been calculated.
                 viewer_extra_count = int((~arm_workspace_mask & table_band).sum())
-                height = env.astype(np.float64) @ normal + offset; candidates = (height >= args.min_height_m)&(height <= args.max_height_m); op, oh = env[candidates], height[candidates]
-                if len(op) > 1 and args.outlier_neighbour_m > 0:
-                    distances, _ = cKDTree(op).query(op, k=2, workers=-1); valid = distances[:,1] <= args.outlier_neighbour_m; op,oh = op[valid],oh[valid]
-                raw_boxes = []; raw_clusters = []; floating_components = 0; connected_components = 0
-                for indices in dbscan_clusters(op, eps_m=args.cluster_eps_m, min_samples=args.cluster_min_samples, min_cluster_points=args.min_cluster_points):
-                    if oh[indices].min() <= args.attachment_distance_m:
-                        connected_components += 1
-                        box = tabletop_obb(op[indices], normal, offset)
-                        if box is not None:
-                            raw_boxes.append(box)
-                            raw_clusters.append(op[indices])
-                    else:
-                        floating_components += 1
                 scene_analysis_done = time.perf_counter()
-                # Track raw clusters separately: merging boxes before or after
-                # temporal matching can create a large unsupported safety OBB.
-                candidate_boxes = [expanded_obb(box, args.box_margin_m) for box in raw_boxes]
-                tracked_boxes = obstacle_gate.update(
-                    candidate_boxes, raw_clusters,
-                    free_space_views=[(calibrations[name], frame.depth_m) for name, frame in frames.items()],
-                )
-                boxes, supplemental_boxes = safety_obbs_with_candidates(
-                    tracked_boxes, candidate_boxes, raw_clusters)
-                before_overlap_merge = len(boxes)
-                # A deep geometric overlap takes precedence over temporal
-                # stability of the individual tracks. Enclose both old and
-                # current candidate OBBs in the published safety scene.
-                boxes = merge_overlapping_obbs(
-                    boxes, normal, offset,
-                    min_overlap_ratio=args.obb_merge_overlap_ratio,
-                )
+                map_snapshot = None
+                backend_diagnostics = {}
+                if args.occupancy_map:
+                    backend = "probabilistic_voxels"
+                    if occupancy_grid is None:
+                        occupancy_grid = workspace_occupancy_grid(
+                            normal, offset, [(args.workspace_bounds, np.eye(4)),
+                                             (right_workspace_bounds, right.base_to_left)],
+                            resolution_m=args.occupancy_resolution_m,
+                            min_height_m=args.min_height_m, max_height_m=args.max_height_m,
+                            hit_probability=args.occupancy_hit_probability,
+                            miss_probability=args.occupancy_miss_probability,
+                            free_probability=args.occupancy_free_probability,
+                            clear_frames=args.obb_removal_confirm_frames,
+                            free_ttl_s=args.occupancy_free_ttl_s)
+                    integrate_depth_views(
+                        occupancy_grid,
+                        [(calibrations[name], raw.depth_m, raw_evidence[name].accepted, rendered_views[name])
+                         for name, raw in frames.items()], np.concatenate(mapped_raw_clouds),
+                        np.concatenate(completion_clouds) if completion_clouds else np.empty((0, 3)),
+                        timestamp_ns=capture_timestamp_ns, ray_stride=args.occupancy_ray_stride,
+                        free_margin_m=args.occupancy_free_margin_m,
+                        uncertain_hits=np.concatenate(uncertain_clouds))
+                    map_update_done = time.perf_counter()
+                    # Do not remerge inflated tiles across empty gaps.
+                    map_boxes = occupancy_grid.boxes(tile_voxels=args.occupancy_box_tile_voxels)
+                    boxes = [expanded_obb(box, args.box_margin_m) for box in map_boxes]
+                    map_boxes_done = time.perf_counter()
+                    map_snapshot = occupancy_grid.snapshot()
+                    unknown_obstacles = occupancy_grid.unknown_obstacles
+                    unstable_reasons = []
+                    backend_diagnostics = {
+                        "mapped_occupied_voxels": len(occupancy_grid.current_hits),
+                        "occupancy": {**occupancy_grid.diagnostics, **{key: map_snapshot[key] for key in
+                                      ("unknown_voxels", "free_voxels", "occupied_voxels", "historical_unknown_voxels")}},
+                        "occupancy_update_seconds": map_update_done - scene_analysis_done,
+                        "occupancy_boxes_seconds": map_boxes_done - map_update_done,
+                        "occupancy_encode_seconds": time.perf_counter() - map_boxes_done,
+                        "expired_obbs": 0, "large_overlap_merges": 0,
+                    }
+                else:
+                    backend = "clustered_obbs"
+                    raw_boxes, clusters, cluster_diagnostics = obstacle_cluster_boxes(
+                        env, normal, offset, min_height_m=args.min_height_m, max_height_m=args.max_height_m,
+                        outlier_neighbour_m=args.outlier_neighbour_m, eps_m=args.cluster_eps_m,
+                        min_samples=args.cluster_min_samples, min_cluster_points=args.min_cluster_points,
+                        attachment_distance_m=args.attachment_distance_m)
+                    candidates = [expanded_obb(box, args.box_margin_m) for box in raw_boxes]
+                    tracked = obstacle_gate.update(
+                        candidates, clusters,
+                        free_space_views=[(calibrations[name], depth) for name, depth in measured_views.items()],
+                        uncertain_space_views=[(calibrations[name], np.where(raw_evidence[name].uncertain, raw.depth_m, 0.))
+                                               for name, raw in frames.items()])
+                    boxes, supplemental = safety_obbs_with_candidates(tracked, candidates, clusters)
+                    before_merge = len(boxes)
+                    boxes = merge_overlapping_obbs(boxes, normal, offset,
+                                                   min_overlap_ratio=args.obb_merge_overlap_ratio)
+                    unknown_obstacles = obstacle_gate.unknown_obstacles
+                    unstable_reasons = sorted(set(obstacle_gate.unstable_reasons))
+                    backend_diagnostics = {**cluster_diagnostics, "raw_candidate_obbs": len(raw_boxes),
+                                           "candidate_obbs": len(candidates), "confirmed_obbs": len(tracked),
+                                           "supplemental_obbs": supplemental, "expired_obbs": obstacle_gate.expired_tracks,
+                                           "large_overlap_merges": before_merge-len(boxes)}
                 box_tracking_done = time.perf_counter()
-                display_boxes = boxes
+                _, _, measured_workspace = dual_arm_workspace_masks(
+                    raw_env, args.workspace_bounds, right_workspace_bounds, right.base_to_left)
+                if int(measured_workspace.sum()) < 80:
+                    unknown_obstacles.append({"state": "unknown", "reason": "insufficient_measured_workspace_depth"})
                 frame_no += 1
                 qdelta = max(float(np.max(np.abs(q1[a.name]-q0[a.name]))) for a in (left,right))
-                diagnostics = {"environment_points": int(len(env)), "left_workspace_points": int((left_mask & table_band).sum()), "right_workspace_points": int((right_mask & table_band).sum()), "viewer_outside_workspace_points": viewer_extra_count, "object_candidate_points": int(len(op)), "table_connected_components": connected_components, "floating_components": floating_components, "raw_candidate_obbs": len(raw_boxes), "candidate_obbs": len(candidate_boxes), "confirmed_obbs": len(tracked_boxes), "supplemental_obbs": supplemental_boxes, "published_obbs": len(boxes), "safety_obbs_cover_candidates": True, "obb_unstable_reasons": sorted(set(obstacle_gate.unstable_reasons)), "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": support_pixels, "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
+                diagnostics = {**backend_diagnostics, "occupancy_map_enabled": args.occupancy_map, "environment_points": int(len(env)), "left_workspace_points": int((left_mask & table_band).sum()), "right_workspace_points": int((right_mask & table_band).sum()), "viewer_outside_workspace_points": viewer_extra_count, "published_obbs": len(boxes), "safety_obbs_cover_candidates": True, "obb_unstable_reasons": unstable_reasons, "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": support_pixels, "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
                 diagnostics["obb_point_change_distance_m"] = args.obb_point_change_distance_m
+                diagnostics["table_prior"] = table_prior.diagnostics
+                diagnostics["depth_evidence"] = depth_evidence
+                diagnostics["raw_depth_filter_seconds"] = raw_filter_seconds
+                diagnostics["unknown_obstacles"] = len(unknown_obstacles)
                 diagnostics["obb_point_change_fraction"] = args.obb_point_change_fraction
                 diagnostics["obb_change_confirm_frames"] = args.obb_change_confirm_frames
                 diagnostics["obb_history_frames"] = args.obb_history_frames
-                diagnostics["expired_obbs"] = obstacle_gate.expired_tracks
                 diagnostics["obb_removal_confirm_frames"] = args.obb_removal_confirm_frames
                 diagnostics["obb_merge_overlap_ratio"] = args.obb_merge_overlap_ratio
-                diagnostics["large_overlap_merges"] = before_overlap_merge - len(boxes)
                 diagnostics["capture_seconds"] = capture_done - began
                 diagnostics["frame_interval_seconds"] = frame_interval_seconds
                 diagnostics["robot_geometry_seconds"] = geometry_done - capture_done
@@ -1211,24 +1456,18 @@ def main() -> None:
                 diagnostics["point_cloud_seconds"] = point_cloud_done - refinement_done
                 diagnostics["scene_analysis_seconds"] = scene_analysis_done - point_cloud_done
                 diagnostics["box_tracking_seconds"] = box_tracking_done - scene_analysis_done
-                diagnostics["obb_tracks"] = [
-                    {"center": track.center.astype(float).tolist(),
-                     "missed_frames": track.missed_frames,
-                     "last_observed_frame": track.last_observed_frame,
-                     "reference_frame": track.reference_frame,
-                     "cached_cluster_frames": len(track.recent_observations),
-                     "free_space_fraction": round(track.last_free_space_fraction, 3),
-                     "free_space_hits": track.free_space_hits}
-                    for track in obstacle_gate._tracks if track.confirmed
-                ]
                 refinement = f" · LingBot {refiner.last_inference_seconds:.2f}s" if refiner is not None else ""
                 snapshot_build_began = time.perf_counter()
                 snapshot = {
                     "schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
                     "frame": frame_no, "host_timestamp_ns": int(min(stamps)),
-                    "status": (f"error: unstable obstacle point clusters ({', '.join(sorted(set(obstacle_gate.unstable_reasons)))})"
-                               if obstacle_gate.unstable_reasons else
-                               f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个桌面连接障碍物"),
+                    "scene_observation_state": "unknown" if unknown_obstacles else "observed",
+                    "unknown_obstacles": unknown_obstacles,
+                    "obstacle_evidence": "raw_depth_with_verified_completion" if refiner is not None else "raw_depth",
+                    "obstacle_backend": backend,
+                    "status": ("error: unknown obstacle space" if unknown_obstacles else
+                               f"error: unstable obstacle point clusters ({', '.join(unstable_reasons)})" if unstable_reasons else
+                               f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个障碍框"),
                     "qpos": {a.name: ((q0[a.name] + q1[a.name]) * .5).astype(float).tolist() for a in (left, right)},
                     "gripper_position": {"left": float(finger_angle / .8), "right": float(right_finger_angle / .8)},
                     "surface_source": "measured_depth_fk_gated",
@@ -1239,10 +1478,15 @@ def main() -> None:
                     "obbs":[{
                         "center": b.center.astype(float).tolist(), "axes": b.rotation.astype(float).tolist(),
                         "half_sizes": (b.extents * .5).astype(float).tolist(), "corners":b.corners.astype(float).tolist(),
-                        "point_count": int(b.point_count),
+                        ("voxel_count" if args.occupancy_map else "point_count"): int(b.point_count), "geometry_source": backend,
                     } for b in boxes],
                     "calibration": report, "camera_streams": stream_info, "diagnostics": diagnostics,
                 }
+                if map_snapshot is not None:
+                    snapshot["occupancy_map"] = map_snapshot
+                    snapshot["_manual_frames"] = {
+                        name: rgb_manual_frame(raw, calibrations[name], raw_evidence[name].accepted)
+                        for name, raw in frames.items()}
                 # Capture age is the safety boundary; publication must never
                 # replace it with a new timestamp for already processed data.
                 snapshot["published_timestamp_ns"] = time.monotonic_ns()
@@ -1250,11 +1494,11 @@ def main() -> None:
                 diagnostics["processing_seconds"] = time.perf_counter() - began
                 diagnostics["capture_to_publish_seconds"] = (snapshot["published_timestamp_ns"] - min(stamps)) / 1e9
                 with lock: latest = snapshot
-                # A one-shot diagnostic must still observe enough frames to
-                # exercise the configured temporal persistence gate.  The old
-                # one-frame behavior could never emit an OBB with the default
-                # required_hits=3 and therefore produced a misleading zero.
-                if args.once and frame_no >= args.temporal_persistence_frames:
+                # One-shot mapping must exercise the raw-free confirmation
+                # window. Current occupied endpoints are published immediately.
+                if args.once and frame_no >= max(args.temporal_persistence_frames,
+                                                 args.raw_depth_confirm_frames,
+                                                 args.obb_removal_confirm_frames):
                     break
         finally:
             cleanup = [source.stop, *(receiver.disconnect for receiver in receivers.values())]
@@ -1290,10 +1534,66 @@ def main() -> None:
         if str(latest["status"]).startswith("error") or "schema" not in latest:
             raise RuntimeError(f"Obstacle acquisition failed: {latest['status']}")
         latest = materialize_snapshot(latest, include_viewer_environment=True)
-        print(json.dumps({"schema": latest.get("schema"), "coordinate_frame": latest.get("coordinate_frame"), "frame": latest["frame"], "host_timestamp_ns": latest.get("host_timestamp_ns"), "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": latest["obbs"], "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {}), "camera_streams": latest.get("camera_streams", {})}, ensure_ascii=False, indent=2)); return latest
+        print(json.dumps({**{key: latest[key] for key in ("obstacle_backend", "scene_observation_state", "unknown_obstacles", "occupancy_map") if key in latest}, "schema": latest.get("schema"), "coordinate_frame": latest.get("coordinate_frame"), "frame": latest["frame"], "host_timestamp_ns": latest.get("host_timestamp_ns"), "status": latest["status"], "environment_points": len(latest["environment"]["points"]), "robot_points": len(latest["robot"]["points"]), "obbs": latest["obbs"], "diagnostics": latest.get("diagnostics", {}), "calibration": latest.get("calibration", {}), "camera_streams": latest.get("camera_streams", {})}, ensure_ascii=False, indent=2)); return latest
 
     class Handler(BaseHTTPRequestHandler):
+        def send_json(self, value, status=200):
+            payload = json.dumps(value, allow_nan=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            path = urlsplit(self.path).path
+            if path not in ("/manual-obstacles/capture", "/manual-obstacles/select"):
+                self.send_json({"error": "Unknown endpoint"}, 404)
+                return
+            # Reject cross-origin browser writes to a local annotation service.
+            origin = self.headers.get("Origin")
+            if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+                self.send_json({"error": "Cross-origin annotation request rejected"}, 403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 65536:
+                    raise ValueError("Expected a JSON body no larger than 64 KiB")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("Expected a JSON object")
+                if path.endswith("/capture"):
+                    with lock:
+                        snapshot = latest
+                    result = manual_store.capture(snapshot, materialize_snapshot(snapshot, viewer=True))
+                else:
+                    result = manual_store.select(body.get("capture_id"), body.get("annotations"), body.get("mode", "depth"))
+                self.send_json(result)
+            except (ValueError, TypeError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                self.send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+
         def do_GET(self):
+            path = urlsplit(self.path).path
+            if path in ("/manual-obstacles", "/manual-obstacles/"):
+                payload = (REPO_ROOT / "real_scripts/manual_obstacle_annotation.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if path == "/manual-obstacles/scene.json":
+                try:
+                    self.send_json(manual_store.scene_payload())
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 400)
+                return
+            if path == "/manual-obstacles/capture.json":
+                self.send_json(manual_store.capture_payload())
+                return
             if self.path.startswith("/snapshot.json"):
                 # Snapshots are replaced atomically, never modified in place.
                 # JSON encoding must not hold up publication of the next frame.

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>双视角人工 OBB 验证</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0d141d;color:#e6edf3;font:15px system-ui,sans-serif}
+main{max-width:1500px;margin:auto;padding:24px}h1{font-size:24px;margin:0 0 12px}p{color:#afbed0;line-height:1.7}
+button,select,input,a.action{background:#1d2b3d;color:#e6edf3;border:1px solid #52647a;border-radius:6px;padding:9px;cursor:pointer}
+button.primary{background:#287b69}button:disabled{opacity:.45;cursor:default}.toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:16px 0}
+.views{display:grid;grid-template-columns:1fr 1fr;gap:18px}.view{padding:16px;background:#15202d;border-radius:10px;min-width:0}
+canvas{width:100%;height:auto;display:block;background:#070b10;cursor:crosshair;touch-action:none;margin:12px 0}
+canvas.reference{cursor:default;touch-action:auto}.depth-legend{display:flex;align-items:center;gap:12px;color:#afbed0;font-size:13px;margin:12px 0}.depth-gradient{width:160px;height:12px;border-radius:3px;background:linear-gradient(to right,#b42109,#f9b938,#8efd56,#22a7d3,#30123b)}
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px}input[type=range]{width:160px;padding:0}input[type=text]{width:80px}
+#status{white-space:pre-wrap;padding:14px;border:1px solid #34475d;border-radius:8px;line-height:1.7;overflow-wrap:anywhere}
+a{color:#69dec3}iframe{width:100%;height:620px;border:1px solid #34475d;margin-top:20px;border-radius:8px}
+@media(max-width:850px){.views{grid-template-columns:1fr}}
+</style></head><body><main>
+<h1>双视角人工 OBB → 障碍物体素</h1>
+<p>在 front / side 两张 RGB 图上画框并旋转；对齐深度只用于三维映射。每个障碍物都需要在两路使用相同编号标注。最终体素的位置必须同时落在两个视角的对应框内。</p>
+<div class="toolbar">
+<button id="capture" class="primary">捕获当前双视角帧</button>
+<label>当前障碍物编号 <input id="object" type="text" value="1" maxlength="64"></label>
+<label>筛选方式 <select id="mode"><option value="depth">双视角共同约束 → 深度体素（推荐）</option><option value="obb">双视角共同约束 + 3D OBB</option></select></label>
+<button id="apply" class="primary" disabled>筛选并显示体素</button>
+<a href="/" target="_blank">实时 3D 页面</a>
+</div>
+<div class="depth-legend"><span id="depth-near">近</span><span class="depth-gradient" aria-hidden="true"></span><span id="depth-far">远</span><span>对齐深度预览仅供核查，不用于画框</span></div>
+<div class="views">
+<section class="view"><b>front_cam · RGB（在此标注）</b><canvas id="front" aria-label="front RGB 标注画布" width="640" height="360"></canvas>
+<div class="controls"><label>旋转 <input id="front-angle" type="range" min="-180" max="180" value="0"></label><span id="front-angle-label">0°</span><button id="front-delete">删除选中框</button><button id="front-clear">清空此视角</button></div>
+<p>front_cam · RGB 对齐深度预览</p><canvas class="reference" id="front-rgb" aria-label="front 对齐深度预览" width="640" height="360"></canvas></section>
+<section class="view"><b>side_cam · RGB（在此标注）</b><canvas id="side" aria-label="side RGB 标注画布" width="640" height="360"></canvas>
+<div class="controls"><label>旋转 <input id="side-angle" type="range" min="-180" max="180" value="0"></label><span id="side-angle-label">0°</span><button id="side-delete">删除选中框</button><button id="side-clear">清空此视角</button></div>
+<p>side_cam · RGB 对齐深度预览</p><canvas class="reference" id="side-rgb" aria-label="side 对齐深度预览" width="640" height="360"></canvas></section>
+</div>
+<p>黄色：筛选出的真实体素单元；蓝色：每个障碍物的 3D 包围框。2D 框包含的背景深度也可能被选中，可通过缩小、旋转或重画框比较结果。图像与 3D 结果固定在捕获帧，不随当前物体移动。</p>
+<div id="status" role="status">等待捕获。此验证仅增加可视化结果，不改变检测器的安全地图。</div>
+<iframe id="preview" title="冻结帧体素筛选预览" hidden></iframe>
+</main><script>
+const status=document.getElementById('status'),captureButton=document.getElementById('capture'),applyButton=document.getElementById('apply');
+let capture=null,busy=false;
+const views=Object.fromEntries(['front','side'].map(name=>[name,{canvas:document.getElementById(name),referenceCanvas:document.getElementById(name+'-rgb'),image:null,rgbImage:null,boxes:[],selected:-1,start:null}]));
+function setBusy(value){busy=value;captureButton.disabled=value;applyButton.disabled=value||!capture}
+async function request(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(data.error||response.status);return data}
+function point(view,event){const rect=view.canvas.getBoundingClientRect();return {x:Math.max(0,Math.min(view.canvas.width-1,(event.clientX-rect.left)*view.canvas.width/rect.width)),y:Math.max(0,Math.min(view.canvas.height-1,(event.clientY-rect.top)*view.canvas.height/rect.height))}}
+function contains(box,p){const a=box.angle_deg*Math.PI/180,c=Math.cos(a),s=Math.sin(a),x=p.x-box.cx,y=p.y-box.cy;return Math.abs(c*x+s*y)<=box.width/2&&Math.abs(-s*x+c*y)<=box.height/2}
+function redraw(name){const v=views[name];for(const [canvas,image] of [[v.canvas,v.image],[v.referenceCanvas,v.rgbImage]]){const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);if(image)ctx.drawImage(image,0,0);if(canvas===v.referenceCanvas)continue;
+ for(const [index,b] of v.boxes.entries()){ctx.save();ctx.translate(b.cx,b.cy);ctx.rotate(b.angle_deg*Math.PI/180);ctx.strokeStyle='#ff0000';ctx.lineWidth=Math.max(index===v.selected?4:3,v.canvas.width/(index===v.selected?220:320));ctx.shadowColor='#000';ctx.shadowBlur=3;ctx.strokeRect(-b.width/2,-b.height/2,b.width,b.height);ctx.fillStyle=ctx.strokeStyle;ctx.font=`bold ${Math.max(16,v.canvas.width/50)}px sans-serif`;ctx.fillText(b.object_id,-b.width/2+3,-b.height/2+20);ctx.restore()}}
+}
+function updateAngle(name){const box=views[name].boxes[views[name].selected],angle=box?.angle_deg||0;document.getElementById(name+'-angle').value=angle;document.getElementById(name+'-angle-label').textContent=angle+'°';redraw(name)}
+for(const [name,v] of Object.entries(views)){
+ v.canvas.addEventListener('pointerdown',e=>{if(!capture||busy)return;v.start=point(v,e);v.canvas.setPointerCapture(e.pointerId)});
+ v.canvas.addEventListener('pointerup',e=>{if(!v.start)return;const p=point(v,e),start=v.start;v.start=null;
+  if(Math.hypot(p.x-start.x,p.y-start.y)<5){v.selected=v.boxes.findLastIndex(b=>contains(b,p));updateAngle(name);return}
+  const id=document.getElementById('object').value.trim();if(!id){status.textContent='请填写障碍物编号。';return}
+  const width=Math.abs(p.x-start.x),height=Math.abs(p.y-start.y);if(width<2||height<2)return;
+  v.boxes.push({object_id:id,cx:(p.x+start.x)/2,cy:(p.y+start.y)/2,width,height,angle_deg:0});v.selected=v.boxes.length-1;updateAngle(name);
+ });
+ v.canvas.addEventListener('pointermove',e=>{if(!v.start)return;redraw(name);const p=point(v,e),ctx=v.canvas.getContext('2d');ctx.strokeStyle='#ff0000';ctx.lineWidth=4;ctx.shadowColor='#000';ctx.shadowBlur=3;ctx.strokeRect(v.start.x,v.start.y,p.x-v.start.x,p.y-v.start.y);ctx.shadowBlur=0});
+ v.canvas.addEventListener('pointercancel',()=>{v.start=null;redraw(name)});
+ document.getElementById(name+'-angle').addEventListener('input',e=>{if(busy)return;const box=v.boxes[v.selected];if(box)box.angle_deg=Number(e.target.value);updateAngle(name)});
+ document.getElementById(name+'-delete').onclick=()=>{if(busy)return;if(v.selected>=0)v.boxes.splice(v.selected,1);v.selected=v.boxes.length-1;updateAngle(name)};
+ document.getElementById(name+'-clear').onclick=()=>{if(busy)return;v.boxes=[];v.selected=-1;updateAngle(name)};
+}
+async function showCapture(data){
+ if(!data.depth_images||data.annotation_image!=='recorded_rgb')throw Error('此捕获没有 RGB 坐标的对齐深度，请重启新版服务并重新捕获。');
+ const images=await Promise.all(Object.entries(views).map(async([name,v])=>{const image=new Image(),rgbImage=new Image();image.src=data.images[name];rgbImage.src=data.depth_images[name];await Promise.all([image.decode(),rgbImage.decode()]);return {name,v,image,rgbImage}}));
+ capture=data;for(const {name,v,image,rgbImage} of images){v.image=image;v.rgbImage=rgbImage;v.canvas.width=image.naturalWidth;v.canvas.height=image.naturalHeight;v.referenceCanvas.width=rgbImage.naturalWidth;v.referenceCanvas.height=rgbImage.naturalHeight;v.boxes=[];v.selected=-1;updateAngle(name)}
+ document.getElementById('depth-near').textContent=`近 ≤ ${data.depth_display.min_m.toFixed(2)} m`;
+ document.getElementById('depth-far').textContent=`远 ≥ ${data.depth_display.max_m.toFixed(2)} m`;
+ document.getElementById('preview').hidden=true;
+ status.textContent=`已捕获检测帧 ${data.frame}。请在两张 RGB 图上标注相同编号的障碍物。\n保存目录：${data.output_dir}`;
+}
+captureButton.onclick=async()=>{setBusy(true);status.textContent='正在保存当前双视角帧…';try{
+ await showCapture(await request('/manual-obstacles/capture',{}));
+}catch(e){status.textContent='捕获失败：'+e.message}finally{setBusy(false)}};
+applyButton.onclick=async()=>{setBusy(true);status.textContent='正在映射深度并筛选体素…';try{
+ const frontIds=new Set(views.front.boxes.map(b=>b.object_id)),sideIds=new Set(views.side.boxes.map(b=>b.object_id));
+ if(!frontIds.size||frontIds.size!==sideIds.size||[...frontIds].some(id=>!sideIds.has(id)))throw Error('每个障碍物都需要在 front 和 side RGB 图上使用相同编号标注。');
+ const data=await request('/manual-obstacles/select',{capture_id:capture.capture_id,annotations:Object.fromEntries(Object.entries(views).map(([n,v])=>[n,v.boxes])),mode:document.getElementById('mode').value});
+ status.textContent=`冻结帧 ${data.frame}：筛选出 ${data.voxel_count} 个占据体素，边长 ${(data.resolution_m*1000).toFixed(1)} mm。\n`+data.objects.map(o=>`障碍物 ${o.object_id}：${o.voxel_count} 个体素`).join('；')+`\n结果已保存：${data.output_dir}`;
+ if(!data.voxel_count)status.textContent+='\n没有占据体素同时满足两路标注，请检查两个框的对应位置、对齐深度有效性和工作区。';
+ const preview=document.getElementById('preview');preview.hidden=false;preview.src='/?manual=1&'+Date.now();
+}catch(e){status.textContent='筛选失败：'+e.message}finally{setBusy(false)}};
+async function restoreCapture(){setBusy(true);try{const response=await fetch('/manual-obstacles/capture.json',{cache:'no-store'});if(!response.ok)throw Error(response.status);const data=await response.json();if(data)await showCapture(data)}catch(e){status.textContent='读取已捕获帧失败：'+e.message}finally{setBusy(false)}}
+restoreCapture();
+</script></body></html>

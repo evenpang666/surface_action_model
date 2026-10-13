@@ -335,7 +335,11 @@ def test_installer_checks_sessions_before_activating(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError): main()
 
 
-def test_two_view_perception_without_hardware(monkeypatch):
+@pytest.mark.parametrize("refinement", [False, True])
+@pytest.mark.parametrize("noise", [False, True])
+@pytest.mark.parametrize("map_mode", ["default", "on", "off"])
+def test_two_view_perception_without_hardware(monkeypatch, refinement, noise, map_mode):
+    import json
     import sys
     from real_scripts import live_dual_ur7e_obstacle_model as live
     from real_scripts.real_robot_adapter import RGBDFrame, CameraCalibration
@@ -371,13 +375,43 @@ def test_two_view_perception_without_hardware(monkeypatch):
         def read(self):
             stamp = time.monotonic_ns()
             depth = np.full((60, 80), .6, np.float32); depth[20:40, 30:50] = .55
+            # A three-pixel surface entirely between the stride=3 sample sites.
+            depth[46, 70:72] = .48
+            depth[47, 70] = .48
+            if noise:
+                # Neither pixel is on the point_stride=3 lattice. Both cameras
+                # see these unsupported returns: they must not confirm each other.
+                depth[13, 17] = .4
+                depth[43, 62] = .4
             return {n: RGBDFrame(n, np.zeros((60, 80, 3), np.uint8), depth.copy(), host_timestamp_ns=stamp) for n in ("front", "side")}
     monkeypatch.setattr(live, "RealSenseD435iSource", Source)
     def render(*args, **kwargs):
         depth = np.zeros((60, 80), np.float32); depth[:6] = .6
         return depth
     monkeypatch.setattr(live, "render_surface_points_depth", render)
-    monkeypatch.setattr("sys.argv", ["perception", "--once", "--no-browser", "--no-lingbot-depth", "--warmup-frames", "1", "--temporal-persistence-frames", "1"])
+    if refinement:
+        class Refiner:
+            model_id, device, use_fp16 = "fake", "cpu", False
+            camera_names, last_inference_seconds = ("front", "side"), 0.
+            def refine(self, frames, _calibrations):
+                return [RGBDFrame(f.camera_name, f.rgb, np.zeros_like(f.depth_m),
+                                  host_timestamp_ns=f.host_timestamp_ns) for f in frames]
+        monkeypatch.setattr(live, "create_lingbot_depth_refiner_from_args", lambda _args: Refiner())
+    flags = ["perception", "--once", "--no-browser",
+             "--lingbot-depth" if refinement else "--no-lingbot-depth",
+             "--warmup-frames", "1", "--temporal-persistence-frames", "1"]
+    if map_mode == "off":
+        flags += ["--no-occupancy-map", "--point-stride", "1"]
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("Disabled map must not allocate, integrate or lift dense endpoints")
+        for name in ("LocalOccupancyGrid", "workspace_occupancy_grid", "integrate_depth_views"):
+            monkeypatch.setattr(live, name, forbidden)
+        monkeypatch.setattr(live.RawDepthEvidenceFilter, "world_points", forbidden)
+    else:
+        flags += ["--min-cluster-points", "1000000"]
+        if map_mode == "on":
+            flags += ["--occupancy-map"]
+    monkeypatch.setattr("sys.argv", flags)
     snapshot = live.main()
     assert snapshot["camera_names"] == ["front", "side"]
     assert snapshot["gripper_position"] == pytest.approx({"left": .3, "right": .7})
@@ -387,6 +421,45 @@ def test_two_view_perception_without_hardware(monkeypatch):
     assert snapshot["diagnostics"]["viewer_outside_workspace_points"] >= 0
     assert snapshot["published_timestamp_ns"] >= snapshot["host_timestamp_ns"]
     assert snapshot["diagnostics"]["capture_to_publish_seconds"] >= 0
+    assert snapshot["scene_observation_state"] == "observed"
+    assert not snapshot["unknown_obstacles"]
+    assert snapshot["diagnostics"]["table_prior"]["state"] in ("initialized", "updated")
+    assert all(e["measured_points"] > 0 for e in snapshot["diagnostics"]["depth_evidence"].values())
+    from real_scripts.real_cbf_qp import boxes_from_snapshot
+    if map_mode == "off":
+        assert snapshot["obstacle_backend"] == "clustered_obbs"
+        assert snapshot["diagnostics"]["occupancy_map_enabled"] is False
+        assert "occupancy_map" not in snapshot and "occupancy" not in snapshot["diagnostics"]
+        assert snapshot["obbs"] and boxes_from_snapshot(snapshot).observation is None
+        validate_snapshot(snapshot, 2.)
+        for options in ({}, {"compact": True}, {"viewer": True}):
+            payload = json.loads(live.snapshot_payload(snapshot, **options))
+            assert "occupancy_map" not in payload
+            assert all(box["geometry_source"] == "clustered_obbs" and "point_count" in box
+                       and "voxel_count" not in box for box in payload["obbs"])
+        if noise:
+            assert all(e["isolated_pixels"] == 2 and e["uncertain_raw_pixels"] == 2
+                       for e in snapshot["diagnostics"]["depth_evidence"].values())
+        return
+    assert snapshot["diagnostics"]["occupancy_map_enabled"] is True
+    assert snapshot["obstacle_backend"] == "probabilistic_voxels"
+    assert snapshot["occupancy_map"]["occupied_voxels"] > 0
+    assert boxes_from_snapshot(snapshot).observation is not None
+    from safety_module.occupancy import ObservationGrid, OCCUPIED
+    observation = ObservationGrid(snapshot["occupancy_map"])
+    tiny = np.array([[(70-40)/100*.48, (46-30)/100*.48, .48]])
+    tiny_ids, inside = observation.indices(tiny)
+    assert inside.all() and observation.state[tiny_ids[0]] == OCCUPIED
+    if noise:
+        from safety_module.occupancy import ObservationGrid, UNKNOWN
+        view = ObservationGrid(snapshot["occupancy_map"])
+        points = np.array([[(17-40)/100*.4, (13-30)/100*.4, .4],
+                           [(62-40)/100*.4, (43-30)/100*.4, .4]])
+        ids, inside = view.indices(points)
+        assert inside.all() and np.all(view.state[ids] == UNKNOWN)
+        assert snapshot["diagnostics"]["occupancy"]["uncertain_raw_voxels"] > 0
+        assert all(e["isolated_pixels"] == 2 for e in snapshot["diagnostics"]["depth_evidence"].values())
+        assert all(e["uncertain_raw_pixels"] == 2 for e in snapshot["diagnostics"]["depth_evidence"].values())
 
 
 def test_compact_scene_preserves_capture_state_geometry_and_calibration():
@@ -545,7 +618,9 @@ def test_stale_track_does_not_merge_with_new_candidate():
     gate.update([box(-.2, .1)])
     published = gate.update([box(0., .3)])
     assert len(gate._tracks) == 2
-    assert len(published) == 2
+    assert len(published) == 1
+    assert len(gate.unknown_obstacles) == 1
+    assert gate._tracks[0].box is None
     assert "missing_cluster" in gate.unstable_reasons
 
 
@@ -582,7 +657,7 @@ def test_large_overlap_merges_published_boxes_before_stability_gate():
                                       min_overlap_ratio=ratio)) == 2
 
 
-def test_obb_geometry_follows_cluster_evidence_and_holds_through_dropout():
+def test_obb_geometry_follows_cluster_evidence_and_becomes_unknown_on_dropout():
     from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
 
     normal = np.array([0., 0., 1.])
@@ -604,7 +679,9 @@ def test_obb_geometry_follows_cluster_evidence_and_holds_through_dropout():
     assert gate.unstable_reasons == ["changed_cluster"]
     assert gate.update([enlarged], [new_points])[0] is enlarged
     assert not gate.unstable_reasons
-    assert gate.update([], []) == [enlarged]
+    assert gate.update([], []) == []
+    assert gate._tracks[0].box is None
+    assert len(gate.unknown_obstacles) == 1
     assert gate.unstable_reasons == ["missing_cluster"]
 
 
@@ -628,7 +705,7 @@ def test_obb_change_uses_current_and_previous_two_clusters():
     assert [frame for frame, _ in gate._tracks[0].recent_observations] == [1, 2, 3, 4]
 
 
-def test_obb_history_is_bounded_and_missing_track_expires_at_window():
+def test_obb_history_is_bounded_but_unknown_does_not_expire_at_window():
     from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
 
     points = np.array([[x, y, z] for x in np.linspace(-.03, .03, 8)
@@ -641,15 +718,15 @@ def test_obb_history_is_bounded_and_missing_track_expires_at_window():
     assert [frame for frame, _ in gate._tracks[0].recent_observations] == list(range(3, 13))
     assert gate._tracks[0].reference_frame == 3
 
-    for _ in range(9):
-        assert gate.update([], []) == [box]
+    for _ in range(30):
+        assert gate.update([], []) == []
         assert gate.expired_tracks == 0
-    assert gate.update([], []) == []
-    assert gate.expired_tracks == 1
-    assert gate._tracks == []
+        assert len(gate.unknown_obstacles) == 1
+        assert gate._tracks[0].box is None
+    assert len(gate._tracks[0].recent_observations) == 0
 
 
-def test_obbs_hidden_by_persistent_merged_cluster_expire_after_window():
+def test_obbs_supported_by_persistent_merged_cluster_remain_observed():
     from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
 
     normal = np.array([0., 0., 1.])
@@ -662,12 +739,11 @@ def test_obbs_hidden_by_persistent_merged_cluster_expire_after_window():
     assert gate.update(original_boxes, [left, right]) == original_boxes
     merged_points = np.vstack((left, right))
     merged_box = tabletop_obb(merged_points, normal, 0.)
-    for _ in range(9):
+    for _ in range(20):
         assert gate.update([merged_box], [merged_points]) == original_boxes
-    assert gate.update([merged_box], [merged_points]) == [merged_box]
-    assert gate.expired_tracks == 2
-    assert len(gate._tracks) == 1
-    assert gate.update([merged_box], [merged_points]) == [merged_box]
+        assert not gate.unknown_obstacles
+    assert gate.expired_tracks == 0
+    assert len(gate._tracks) == 2
 
 
 def test_missing_obb_retires_only_after_measured_free_space_persists():
@@ -685,12 +761,16 @@ def test_missing_obb_retires_only_after_measured_free_space_persists():
     foreground = [(calibration, np.full((100, 100), .8))]
     invalid = [(calibration, np.zeros((100, 100)))]
     clear = [(calibration, np.full((100, 100), 1.5))]
-    assert gate.update([], [], free_space_views=foreground) == [box]
-    assert gate.update([], [], free_space_views=invalid) == [box]
+    assert gate.update([], [], free_space_views=foreground) == []
+    assert gate.update([], [], free_space_views=invalid) == []
+    assert len(gate.unknown_obstacles) == 1
     assert gate.unstable_reasons == ["missing_cluster"]
-    assert gate.update([], [], free_space_views=clear) == [box]
-    assert gate.update([], [], free_space_views=clear) == [box]
     assert gate.update([], [], free_space_views=clear) == []
+    assert len(gate.unknown_obstacles) == 1
+    assert gate.update([], [], free_space_views=clear) == []
+    assert len(gate.unknown_obstacles) == 1
+    assert gate.update([], [], free_space_views=clear) == []
+    assert not gate.unknown_obstacles
     assert not gate.unstable_reasons
 
 
@@ -720,7 +800,7 @@ def test_new_obb_requires_persistent_cluster_before_safety_publication():
     assert not gate.unstable_reasons
 
 
-def test_one_frame_false_cluster_clears_on_next_observation():
+def test_one_frame_candidate_becomes_unknown_without_free_evidence():
     from real_scripts.live_dual_ur7e_obstacle_model import TemporalOBBGate, tabletop_obb
 
     points = np.array([[x, y, z] for x in np.linspace(-.03, .03, 8)
@@ -730,7 +810,8 @@ def test_one_frame_false_cluster_clears_on_next_observation():
     assert gate.update([box], [points]) == []
     assert gate.unstable_reasons == ["new_cluster"]
     assert gate.update([], []) == []
-    assert not gate.unstable_reasons
+    assert gate.unstable_reasons == ["missing_cluster"]
+    assert len(gate.unknown_obstacles) == 1
 
 
 def test_transient_cluster_merge_keeps_two_observed_boxes():

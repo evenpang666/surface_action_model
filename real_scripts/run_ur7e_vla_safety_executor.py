@@ -30,7 +30,7 @@ for path in (REPO_ROOT, OPENPI_CLIENT):
 
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler  # noqa: E402
 from real_scripts.real_cbf_qp import (  # noqa: E402
-    OrientedBox, point_jacobian_fd, project_joint_delta_qp,
+    OrientedBox, boxes_from_snapshot, point_jacobian_fd, project_joint_delta_qp,
     select_inter_arm_constraints, select_point_flow_constraints, validate_fk_rollout,
 )
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path  # noqa: E402
@@ -117,7 +117,7 @@ def _rgb(snapshot: dict) -> np.ndarray:
 
 
 def _boxes(snapshot: dict) -> list[OrientedBox]:
-    return [OrientedBox(np.asarray(item["center"], np.float32), np.asarray(item["axes"], np.float32), np.asarray(item["half_sizes"], np.float32)) for item in snapshot["obbs"]]
+    return boxes_from_snapshot(snapshot)
 
 
 def _qpos(snapshot: dict) -> np.ndarray:

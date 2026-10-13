@@ -1,0 +1,127 @@
+schema: quest3_recorded_rgbd_calibration_v1
+queried_utc: '2026-10-13T06:06:54.485342+00:00'
+source: device_sdk_factory_calibration
+transform_convention: P_color = depth_to_color @ P_depth; translation in metres
+cameras:
+  front:
+    camera_serial: '260922305390'
+    camera_model: RealSense D455
+    depth_intrinsics:
+      width: 640
+      height: 480
+      fx: 393.73681640625
+      fy: 393.73681640625
+      ppx: 325.6709899902344
+      ppy: 243.7452392578125
+      distortion:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      distortion_model: brown_conrady
+      sdk_distortion_model: brown_conrady
+      image_transform: center_crop_resize
+    color_intrinsics:
+      width: 1280
+      height: 720
+      fx: 648.2451782226562
+      fy: 647.1692504882812
+      ppx: 635.8846435546875
+      ppy: 358.4482421875
+      distortion:
+      - -0.05619201064109802
+      - 0.06242271512746811
+      - -1.7853270037448965e-05
+      - 0.00015174722648225725
+      - -0.020309528335928917
+      distortion_model: inverse_brown_conrady
+      sdk_distortion_model: inverse_brown_conrady
+      image_transform: center_crop_resize
+    depth_to_color:
+    - - 0.9999998211860657
+      - 1.5609584806952626e-05
+      - -0.0006160960183478892
+      - -0.05913672223687172
+    - - -1.572854489495512e-05
+      - 1.0
+      - -0.00019308390619698912
+      - 1.7157506590592675e-05
+    - - 0.0006160929915495217
+      - 0.00019309356866870075
+      - 0.9999998211860657
+      - 0.00016446301015093923
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    depth_scale_m: 0.0010000000474974513
+    depth_profile:
+    - 640
+    - 480
+    - 30
+    color_profile:
+    - 1280
+    - 720
+    - 30
+  side:
+    camera_serial: '260922303231'
+    camera_model: RealSense D455
+    depth_intrinsics:
+      width: 640
+      height: 480
+      fx: 390.00933837890625
+      fy: 390.00933837890625
+      ppx: 319.5634460449219
+      ppy: 239.27967834472656
+      distortion:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      distortion_model: brown_conrady
+      sdk_distortion_model: brown_conrady
+      image_transform: center_crop_resize
+    color_intrinsics:
+      width: 640
+      height: 480
+      fx: 387.74139404296875
+      fy: 387.04168701171875
+      ppx: 322.53564453125
+      ppy: 242.06668090820312
+      distortion:
+      - -0.0570748969912529
+      - 0.06299111247062683
+      - -0.00032734277192503214
+      - 0.0002021524851443246
+      - -0.02014397270977497
+      distortion_model: inverse_brown_conrady
+      sdk_distortion_model: inverse_brown_conrady
+      image_transform: center_crop_resize
+    depth_to_color:
+    - - 0.999999463558197
+      - 0.0008618360734544694
+      - 0.0005303025827743113
+      - -0.05924902483820915
+    - - -0.0008617520215921104
+      - 0.9999996423721313
+      - -0.00015866695321165025
+      - 4.41398769908119e-05
+    - - -0.0005304391379468143
+      - 0.00015820989210624248
+      - 0.9999998211860657
+      - 0.0004008703399449587
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    depth_scale_m: 0.0010000000474974513
+    depth_profile:
+    - 640
+    - 480
+    - 30
+    color_profile:
+    - 640
+    - 480
+    - 30

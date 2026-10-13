@@ -8,9 +8,9 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
-from real_scripts.real_cbf_qp import OrientedBox
+from real_scripts.real_cbf_qp import boxes_from_snapshot
 from safety_module.command_watchdog import CommandWatchdog
-from safety_module.runtime_contract import SnapshotExpired, validate_snapshot
+from safety_module.runtime_contract import SnapshotExpired, SnapshotUnknown, validate_snapshot
 from obstacle_validation.core import vector
 
 
@@ -22,6 +22,8 @@ class ObstacleSceneUnstable(RuntimeError):
 
 
 def _tracked_obbs_cover_unstable_scene(value):
+    if value.get("scene_observation_state") == "unknown" or value.get("unknown_obstacles"):
+        return False
     status = str(value.get("status", ""))
     prefix = "error: unstable obstacle point clusters ("
     if not status.startswith(prefix) or not status.endswith(")"):
@@ -42,10 +44,7 @@ def _tracked_obbs_cover_unstable_scene(value):
 
 
 def boxes_from_json(value):
-    if value.get("coordinate_frame") != "left_base":
-        raise ValueError("Obstacle coordinates must explicitly be left_base")
-    return [OrientedBox(np.asarray(b["center"], dtype=float), np.asarray(b["axes"], dtype=float),
-                        np.asarray(b["half_sizes"], dtype=float)) for b in value["obbs"]]
+    return boxes_from_snapshot(value)
 
 
 def snapshot_state(value):
@@ -93,6 +92,9 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
             hint = ("; restart detection with --no-lingbot-depth for model-free validation"
                     if diagnostics.get("depth_refinement") == "lingbot-depth" else "")
             raise SnapshotExpired(f"{exc}; detector status: {value.get('status', 'unknown')}{hint}") from exc
+        except SnapshotUnknown:
+            # Candidate coverage cannot turn a missing observation into free space.
+            raise
         except RuntimeError as exc:
             # Strict callers may wait for cluster confirmation at startup.
             # Live replay accepts only the explicitly covered OBB fallback;

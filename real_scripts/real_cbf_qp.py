@@ -23,6 +23,21 @@ class OrientedBox:
             raise ValueError("OBB axes must be orthonormal")
 
 
+def boxes_from_snapshot(snapshot):
+    from safety_module.occupancy import ObservationGrid, ObservedBoxes
+    if snapshot.get("coordinate_frame") != "left_base":
+        raise ValueError("Obstacle coordinates must explicitly be left_base")
+    payload = snapshot.get("occupancy_map")
+    if payload is None and snapshot.get("obstacle_backend") == "probabilistic_voxels":
+        raise ValueError("Probabilistic obstacle snapshot is missing its occupancy map")
+    observation = None if payload is None else ObservationGrid(payload)
+    if observation is not None and observation.timestamp_ns != snapshot.get("host_timestamp_ns"):
+        raise ValueError("Occupancy map and snapshot capture timestamps disagree")
+    return ObservedBoxes([OrientedBox(np.asarray(item["center"], float), np.asarray(item["axes"], float),
+                                      np.asarray(item["half_sizes"], float)) for item in snapshot["obbs"]],
+                         observation)
+
+
 @dataclass(frozen=True)
 class PointFlowConstraint:
     normal: np.ndarray
@@ -119,6 +134,7 @@ def validate_fk_rollout(sampler, qpos, gripper_position, joint_chunk, boxes, *, 
     q = np.asarray(qpos, dtype=float).copy()
     grip = np.asarray(gripper_position, dtype=float).copy()
     previous = sampler.link_points(q, grip).reshape(-1, 3)[point_indices]
+    observation = getattr(boxes, "observation", None)
     for horizon, delta in enumerate(np.asarray(joint_chunk)):
         origin = q.copy()
         origin_grip = grip.copy()
@@ -128,6 +144,9 @@ def validate_fk_rollout(sampler, qpos, gripper_position, joint_chunk, boxes, *, 
             grip = origin_grip + (target_grip - origin_grip) * step / substeps
             current = sampler.link_points(q, grip).reshape(-1, 3)[point_indices]
             if not np.isfinite(current).all():
+                return False
+            if observation is not None and not observation.segments_observed(
+                    previous, current, margin_m=collision_margin_m):
                 return False
             if any(segments_intersect_box(previous, current, box, collision_margin_m).any() for box in boxes):
                 return False

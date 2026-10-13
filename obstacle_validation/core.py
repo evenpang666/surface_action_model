@@ -141,8 +141,12 @@ class CollisionChecker:
         start, end = vector(start, 12, "start"), vector(end, 12, "end")
         steps = max(1, int(np.ceil(np.max(np.abs(end - start)) / self.resolution)))
         previous = self.points(start)
+        observation = getattr(self.boxes, "observation", None)
         for index in range(1, steps + 1):
             current = self.points(start + (end - start) * index / steps)
+            if observation is not None and not observation.segments_observed(
+                    previous, current, margin_m=self.margin):
+                return False
             if any(segments_within_box_margin(previous, current, box, self.margin).any() for box in self.boxes):
                 return False
             # Exact minimum separation of linearly interpolated left/right points.

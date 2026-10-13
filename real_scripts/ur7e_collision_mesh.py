@@ -331,13 +331,28 @@ def render_surface_points_depth(
     camera = (world_to_camera @ np.concatenate((points, np.ones((len(points), 1))), axis=1).T).T[:, :3]
     z = camera[:, 2]
     valid = np.isfinite(camera).all(axis=1) & (z > 1e-5)
-    from real_scripts.camera_geometry import project_pixels
-    uv = np.zeros((len(camera), 2), dtype=float)
-    uv[valid] = project_pixels(camera[valid], intrinsics, distortion, distortion_model)
-    u, v = np.rint(uv).astype(np.int64).T
-    valid &= (u >= 0) & (u < int(width)) & (v >= 0) & (v < int(height))
+    from real_scripts.camera_geometry import pixel_rays, project_pixels
+    uv = np.full((len(camera), 2), np.nan, dtype=float)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        uv[valid] = project_pixels(camera[valid], intrinsics, distortion, distortion_model)
+    # Outside the calibrated field of view, the Brown polynomial can fold
+    # distant rays back onto the sensor. Those are not visible robot surfaces.
+    # Check continuous pixels before any integer cast, then require that the
+    # projected pixel unprojects onto the original camera ray.
+    valid &= (np.isfinite(uv).all(axis=1) & (uv[:, 0] >= -.5) & (uv[:, 0] < int(width)-.5)
+              & (uv[:, 1] >= -.5) & (uv[:, 1] < int(height)-.5))
+    indices = np.flatnonzero(valid)
+    if distortion is not None and np.any(np.asarray(distortion)) and len(indices):
+        rays = pixel_rays(uv[indices], intrinsics, distortion, distortion_model)
+        original_xy = camera[indices, :2] / z[indices, None]
+        K = np.asarray(intrinsics, dtype=float)
+        focal_length = max(float(K[0, 0]), float(K[1, 1]))
+        consistent = np.isfinite(rays).all(axis=1) & (
+            np.linalg.norm(rays[:, :2]-original_xy, axis=1) <= .5/focal_length)
+        indices = indices[consistent]
+    u, v = np.rint(uv[indices]).astype(np.int64).T
     depth = np.full((int(height), int(width)), np.inf, dtype=np.float32)
-    np.minimum.at(depth, (v[valid], u[valid]), z[valid].astype(np.float32))
+    np.minimum.at(depth, (v, u), z[indices].astype(np.float32))
     radius = max(0, int(splat_radius_pixels))
     if radius:
         depth = minimum_filter(depth, size=2 * radius + 1, mode="constant", cval=np.inf)

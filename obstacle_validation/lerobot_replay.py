@@ -312,6 +312,10 @@ def _recovery_motion_safe(sampler, q, grip, delta, target_grip, boxes, safety):
 
 
 def _motion_safe(sampler, q, grip, delta, target_grip, boxes, safety, allow_unsafe_start=False):
+    from safety_module.occupancy import observation_rollout_safe
+    if not observation_rollout_safe(sampler, q, grip, [delta], boxes,
+                                    gripper_chunk=[target_grip], margin_m=safety["collision_margin_m"]):
+        return False
     current = CollisionChecker(sampler, grip, boxes, margin=safety["collision_margin_m"],
                                inter_arm_margin=safety["inter_arm_margin_m"])
     if not current.state_safe(q):
@@ -373,6 +377,10 @@ def _motion_failure_context(sampler, q, grip, delta, target_grip, boxes, safety,
         reason = "joint_and_gripper_sweeps_blocked"
     else:
         reason = "combined_joint_gripper_sweep_blocked"
+    from safety_module.occupancy import observation_rollout_safe
+    if not observation_rollout_safe(sampler, q, grip, [delta], boxes,
+                                    gripper_chunk=[target_grip], margin_m=safety["collision_margin_m"]):
+        reason = "unknown_or_expired_voxel_sweep"
 
     def finite(value):
         return float(value) if np.isfinite(value) else None
