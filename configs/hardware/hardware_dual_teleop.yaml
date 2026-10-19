@@ -1,5 +1,5 @@
 # Dual UR7e + two Robotiq 2F-85 + two wrist D435i + front/side D455.
-# Current 2026-10-08 source calibrations; aggregate graph is configured in
+# Current 2026-10-17 source calibrations; aggregate graph is configured in
 # ur7e_dual_quest3.yaml and shared by perception and fixed-point FK.
 mode: dual
 front_camera_topic: /front_camera/camera/color/image_raw
@@ -20,8 +20,8 @@ arms:
     robot_ip: 192.168.124.61
     base_frame: left_base
     tcp_frame: left_tcp
-    front_calibration: ../../../quest3_collect/config/calibration/left_base_to_front_camera.yaml
-    side_calibration: ../../../quest3_collect/config/calibration/left_base_to_side_camera.yaml
+    front_calibration: calibration/left_base_to_front_camera.yaml
+    side_calibration: calibration/left_base_to_side_camera.yaml
     tcp_source: robot_active_tcp
     tcp_state_topic: /left_arm/tcp_pose
     joint_topic: /left_arm/joint_states
@@ -39,8 +39,8 @@ arms:
     robot_ip: 192.168.124.60
     base_frame: right_base
     tcp_frame: right_tcp
-    front_calibration: ../../../quest3_collect/config/calibration/right_base_to_front_camera.yaml
-    side_calibration: ../../../quest3_collect/config/calibration/right_base_to_side_camera.yaml
+    front_calibration: calibration/right_base_to_front_camera.yaml
+    side_calibration: calibration/right_base_to_side_camera.yaml
     tcp_source: robot_active_tcp
     tcp_state_topic: /right_arm/tcp_pose
     joint_topic: /right_arm/joint_states

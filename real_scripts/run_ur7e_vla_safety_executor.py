@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--front-calibration",
         type=Path,
-        default=REPO_ROOT.parent / "quest3_collect" / "config" / "calibration" / "left_base_to_front_camera.yaml",
+        default=REPO_ROOT / "configs" / "hardware" / "calibration" / "left_base_to_front_camera.yaml",
         help="^left_baseT_front-camera calibration used by --video-output.",
     )
     parser.add_argument("--allow-unverified-right-tcp", action="store_true", help="Allow provisional 2F-85 FK in dry-run only.")

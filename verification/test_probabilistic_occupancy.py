@@ -250,6 +250,8 @@ def test_fk_rrt_and_replay_fallbacks_reject_unknown_interior_with_free_endpoints
     checker = CollisionChecker(Sampler(), grip, boxes, margin=0., inter_arm_margin=.03)
     assert checker.state_safe(q) and checker.state_safe(q+delta)
     assert not checker.edge_safe(q, q+delta)
+    assert checker.observation_rejections["unknown"] > 0
+    assert checker.last_observation_blockage["reason"] == "unknown"
     assert not validate_fk_rollout(Sampler(), q, grip, [delta], boxes, point_indices=np.array([0, 1]),
                                   left_mask=np.array([True, False]), collision_margin_m=0., inter_arm_margin_m=.03)
     assert not _motion_safe(Sampler(), q, grip, delta, grip, boxes,
@@ -278,6 +280,64 @@ def test_motion_margin_checks_unknown_at_the_local_map_boundary():
     assert view.segments_observed([[.81, .15, .15]], [[.815, .15, .15]], now_ns=target.timestamp_ns)
     assert not view.segments_observed([[.81, .15, .15]], [[.815, .15, .15]],
                                        margin_m=.01, now_ns=target.timestamp_ns)
+
+
+@pytest.mark.parametrize("state", [UNKNOWN, OCCUPIED, FREE])
+@pytest.mark.parametrize("angle", [0., .7])
+def test_voxel_margin_uses_swept_distance_instead_of_full_neighbour_cells(state, angle):
+    axes = np.array([[np.cos(angle), -np.sin(angle), 0.],
+                     [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]])
+    active = np.zeros(64, bool); active[21] = True  # cell (1,1,1)
+    target = LocalOccupancyGrid([1., .2, -.3], axes, [4, 4, 4], .02, active=active)
+    stamp = time.monotonic_ns()-3_000_000
+    for index in range(3):
+        update(target, hits=target.centers([21]) if state == OCCUPIED else (),
+               free=[21] if state == FREE else (), stamp=stamp+index*1_000_000)
+    view = ObservationGrid(target.snapshot())
+    now = target.timestamp_ns+(3_000_000_000 if state == FREE else 0)
+
+    def safe(a, b):
+        return view.segments_observed(np.array([a]) @ axes.T+target.origin,
+                                       np.array([b]) @ axes.T+target.origin,
+                                       margin_m=.01, now_ns=now)
+
+    # 19 mm separation is safe even in the adjacent 20 mm cell.
+    assert safe([.059, .03, .03], [.059, .031, .03])
+    assert view.last_blockage is None
+    # The guard has rounded corners: sqrt(8²+8²) mm exceeds 10 mm.
+    assert safe([.048, .048, .03], [.048, .049, .03])
+    assert not safe([.049, .03, .03], [.049, .031, .03])
+    assert view.last_blockage["reason"] == {
+        UNKNOWN: "unknown", OCCUPIED: "occupied", FREE: "expired_free"}[state]
+    assert not safe([.047, .047, .03], [.047, .048, .03])
+    # Endpoints are safe but the segment passes within 8 mm of the cell.
+    assert not safe([.01, .048, .03], [.05, .048, .03])
+
+
+def test_restoration_can_advance_past_an_unknown_neighbour_outside_margin():
+    from obstacle_validation.core import CollisionChecker, JointPath, PathFollower
+    from safety_module.occupancy import ObservedBoxes
+
+    active = np.zeros(64, bool); active[21] = True
+    target = LocalOccupancyGrid(np.zeros(3), np.eye(3), [4, 4, 4], .02, active=active)
+    update(target)
+
+    class Points:
+        left_link_names, points_per_link = ["left"], 1
+        def link_points(self, q, grip):
+            return np.array([[[q[0], .03, .03]], [[3., 3., 3.]]])
+
+    q = np.zeros((2, 12)); q[:, 0] = [.059, .061]
+    path = JointPath(q, np.zeros(2), np.full(12, -.1), np.full(12, .1),
+                     .05, .5, 1.2, "test", 7)
+    boxes = ObservedBoxes([], ObservationGrid(target.snapshot()))
+    checker = CollisionChecker(Points(), np.zeros(2), boxes,
+                                observation_now_ns=target.timestamp_ns)
+    follower = PathFollower(path, avoid=True, detour_lower=path.lower, detour_upper=path.upper,
+                            direct_goal_cbf=True, tolerance=1e-6)
+    delta, state = follower.next_delta(q[0], checker)
+    assert state == "nominal" and delta[0] > 0.
+    assert follower.replans == 0 and checker.edge_safe(q[0], q[0]+delta)
 
 
 def test_historical_unknown_still_stops_global_snapshot_and_missing_map_is_rejected():

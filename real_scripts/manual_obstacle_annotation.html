@@ -33,7 +33,7 @@ a{color:#69dec3}iframe{width:100%;height:620px;border:1px solid #34475d;margin-t
 <p>side_cam · RGB 对齐深度预览</p><canvas class="reference" id="side-rgb" aria-label="side 对齐深度预览" width="640" height="360"></canvas></section>
 </div>
 <p>黄色：筛选出的真实体素单元；蓝色：每个障碍物的 3D 包围框。2D 框包含的背景深度也可能被选中，可通过缩小、旋转或重画框比较结果。图像与 3D 结果固定在捕获帧，不随当前物体移动。</p>
-<div id="status" role="status">等待捕获。此验证仅增加可视化结果，不改变检测器的安全地图。</div>
+<div id="status" role="status">等待捕获。保存的结果可通过回放命令的 --manual-selection 指定；检测器本身的安全地图不会改变。</div>
 <iframe id="preview" title="冻结帧体素筛选预览" hidden></iframe>
 </main><script>
 const status=document.getElementById('status'),captureButton=document.getElementById('capture'),applyButton=document.getElementById('apply');
@@ -77,7 +77,7 @@ applyButton.onclick=async()=>{setBusy(true);status.textContent='正在映射深�
  const frontIds=new Set(views.front.boxes.map(b=>b.object_id)),sideIds=new Set(views.side.boxes.map(b=>b.object_id));
  if(!frontIds.size||frontIds.size!==sideIds.size||[...frontIds].some(id=>!sideIds.has(id)))throw Error('每个障碍物都需要在 front 和 side RGB 图上使用相同编号标注。');
  const data=await request('/manual-obstacles/select',{capture_id:capture.capture_id,annotations:Object.fromEntries(Object.entries(views).map(([n,v])=>[n,v.boxes])),mode:document.getElementById('mode').value});
- status.textContent=`冻结帧 ${data.frame}：筛选出 ${data.voxel_count} 个占据体素，边长 ${(data.resolution_m*1000).toFixed(1)} mm。\n`+data.objects.map(o=>`障碍物 ${o.object_id}：${o.voxel_count} 个体素`).join('；')+`\n结果已保存：${data.output_dir}`;
+ status.textContent=`冻结帧 ${data.frame}：筛选出 ${data.voxel_count} 个占据体素，边长 ${(data.resolution_m*1000).toFixed(1)} mm。\n`+data.objects.map(o=>`障碍物 ${o.object_id}：${o.voxel_count} 个体素`).join('；')+`\n结果已保存：${data.output_dir}\n回放参数：--manual-selection ${data.output_dir}/selection.json`;
  if(!data.voxel_count)status.textContent+='\n没有占据体素同时满足两路标注，请检查两个框的对应位置、对齐深度有效性和工作区。';
  const preview=document.getElementById('preview');preview.hidden=false;preview.src='/?manual=1&'+Date.now();
 }catch(e){status.textContent='筛选失败：'+e.message}finally{setBusy(false)}};

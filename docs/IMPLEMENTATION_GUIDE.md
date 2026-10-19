@@ -30,8 +30,8 @@ front/side D455 → 原始深度与核验补全 → 双臂剔除 → 概率占�
 | left_wrist | D435i | 420222071502 |
 | right_wrist | D435i | 405622072940 |
 
-已接入 **2026-10-08 双臂双视角标定**：
-`../quest3_collect/config/calibration/dual_arm_camera_transforms.yaml`。
+已接入 **2026-10-17 双臂双视角标定**：
+`configs/hardware/calibration/dual_arm_camera_transforms.yaml`。
 障碍物检测与固定表面点 FK 共用汇总文件中的基座/相机变换，并验证四份
 源文件的 SHA256、质量与坐标闭环。快照标定哈希不一致时拒绝执行。
 流程见 [CALIBRATION.md](CALIBRATION.md)。历史外参仅适用于对应旧采集数据。
@@ -74,7 +74,7 @@ python scripts/preprocess_quest3_hdf5.py \
 python scripts/preprocess_cotracker_surface.py \
   --episode ../quest3_collect/data/dual_vr_episodes/episode_00000.hdf5 \
   --geometry-shard outputs/gates/episode_00000.shard \
-  --calibration ../quest3_collect/config/calibration/left_base_to_front_camera.yaml \
+  --calibration configs/hardware/calibration/left_base_to_front_camera.yaml \
   --output outputs/tracks/episode_00000.npz \
   --preview outputs/tracks/episode_00000.png \
   --visualization outputs/tracks/episode_00000.html

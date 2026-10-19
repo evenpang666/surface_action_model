@@ -2,7 +2,9 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -15,6 +17,106 @@ from obstacle_validation.core import vector
 
 
 EXECUTE_ACK = "I_UNDERSTAND_DUAL_UR7E_WILL_MOVE"
+
+
+def timed_call(stats, name, function, *args, **kwargs):
+    if stats is None:
+        return function(*args, **kwargs)
+    started = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        elapsed = time.perf_counter()-started
+        item = stats.setdefault(name, {"calls": 0, "total_s": 0., "max_s": 0.})
+        item["calls"] += 1
+        item["total_s"] += elapsed
+        item["max_s"] = max(item["max_s"], elapsed)
+
+
+class LatestSnapshotCache:
+    """Fetch in one worker; control reads reuse the latest accepted scene."""
+
+    def __init__(self, fetch, validate, initial, *, poll_interval_s=.1, reuse_on_transport_error=False):
+        self.fetch, self.validate = fetch, validate
+        self.latest, self.error = initial, None
+        self.poll_interval_s = poll_interval_s
+        self.reuse_on_transport_error = reuse_on_transport_error
+        self.refresh_errors = 0
+        self.last_refresh_error = None
+        self.condition = threading.Condition()
+        self.stopping = threading.Event()
+        self.reads = self.refreshes = 0
+        self.thread = threading.Thread(target=self._refresh, name="replay-obstacles", daemon=True)
+        self.thread.start()
+
+    def _refresh(self):
+        while not self.stopping.is_set():
+            retain = False
+            try:
+                value, error = self.fetch(), None
+            except Exception as exc:
+                value, error = None, exc
+                retain = (self.reuse_on_transport_error
+                          and isinstance(exc, (URLError, TimeoutError, ConnectionError))
+                          and not isinstance(exc, HTTPError))
+            with self.condition:
+                if error is not None:
+                    self.refresh_errors += 1
+                    self.last_refresh_error = f"{type(error).__name__}: {error}"
+                # A transport outage neither erases an accepted frame nor
+                # clears a previously reported unsafe/invalid scene.
+                if not (retain and (self.latest is not None or self.error is not None)):
+                    self.latest, self.error = value, error
+                self.refreshes += 1
+                self.condition.notify_all()
+            self.stopping.wait(self.poll_interval_s)
+
+    def read(self, *, max_wait_s=0., after_timestamp_ns=None):
+        if not np.isfinite(max_wait_s) or max_wait_s < 0:
+            raise ValueError("Snapshot wait must be finite and nonnegative")
+        if after_timestamp_ns is not None and (not isinstance(after_timestamp_ns, int)
+                                              or after_timestamp_ns < 0):
+            raise ValueError("Invalid previous capture timestamp")
+        deadline = time.monotonic()+max_wait_s
+        with self.condition:
+            self.reads += 1
+            while True:
+                try:
+                    if self.error is not None:
+                        raise self.error
+                    self.validate(self.latest)
+                    if after_timestamp_ns is not None and self.latest["host_timestamp_ns"] <= after_timestamp_ns:
+                        raise SnapshotExpired("Waiting for a newer capture after swept free-space evidence expired")
+                    return self.latest
+                except SnapshotExpired:
+                    remaining = deadline-time.monotonic()
+                    if remaining <= 0 or self.stopping.is_set():
+                        raise
+                    self.condition.wait(remaining)
+
+    def close(self):
+        self.stopping.set()
+        with self.condition:
+            self.condition.notify_all()
+        self.thread.join(timeout=3.)
+
+
+class CapturedFrameObservation:
+    """Reuse a frame's published occupancy belief without elapsed-time decay.
+
+    Only replay's explicit latest-frame policy uses this adapter. The original
+    capture time and cell ages remain intact; unknown/occupied cells still block.
+    """
+
+    def __init__(self, observation):
+        self.observation = observation
+
+    def __getattr__(self, name):
+        return getattr(self.observation, name)
+
+    def segments_observed(self, start, end, *, margin_m=0., now_ns=None):
+        return self.observation.segments_observed(start, end, margin_m=margin_m,
+                                                 now_ns=self.observation.timestamp_ns)
 
 
 class ObstacleSceneUnstable(RuntimeError):
@@ -47,6 +149,12 @@ def boxes_from_json(value):
     return boxes_from_snapshot(value)
 
 
+def validate_obstacle_snapshot(value, max_age, *, allow_tracked_obbs=False, allow_scoped_unknown=False):
+    if allow_tracked_obbs and _tracked_obbs_cover_unstable_scene(value):
+        value = {**value, "status": "tracked_obbs_in_use"}
+    return validate_snapshot(value, max_age, allow_scoped_unknown=allow_scoped_unknown)
+
+
 def snapshot_state(value):
     q = vector([*value["qpos"]["left"], *value["qpos"]["right"]], 12, "snapshot joints")
     grip = vector([value["gripper_position"]["left"], value["gripper_position"]["right"]], 2, "snapshot grippers")
@@ -56,7 +164,8 @@ def snapshot_state(value):
 
 
 def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
-                  allow_tracked_obbs=False):
+                  allow_tracked_obbs=False, snapshot_transform=None, after_timestamp_ns=None,
+                  timing_stats=None):
     """Read the small safety payload; optionally wait before controllers connect.
 
     Finite-age execution reads remain fail-fast. With allow_tracked_obbs, a
@@ -65,9 +174,16 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
     Older servers ignore compact=1 and still return a compatible full snapshot.
     An infinite max_age disables only the age cutoff and requires a finite
     http_timeout_s so an unresponsive detector cannot block indefinitely.
+    A supplied transform runs before validation; the manual replay filter uses
+    it to retain unknown checks inside its explicitly marked voxel scope.
+    ``after_timestamp_ns`` waits for a newer capture when swept free-space
+    evidence has expired even though the snapshot's overall age is acceptable.
     """
     if not np.isfinite(max_wait_s) or max_wait_s < 0:
         raise ValueError("Snapshot wait must be finite and nonnegative")
+    if after_timestamp_ns is not None and (not isinstance(after_timestamp_ns, int)
+                                          or after_timestamp_ns < 0):
+        raise ValueError("Invalid previous capture timestamp")
     timeout_s = max_age if http_timeout_s is None else float(http_timeout_s)
     if not np.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("Snapshot HTTP timeout must be finite and positive")
@@ -75,14 +191,18 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
     query = [(k, v) for k, v in parse_qsl(parts.query) if k != "compact"]
     url = urlunsplit(parts._replace(query=urlencode([*query, ("compact", "1")])))
     deadline = time.monotonic() + max_wait_s
-    while True:
+    def fetch():
         with urlopen(Request(url, headers={"Cache-Control": "no-cache"}), timeout=timeout_s) as response:
-            value = json.load(response)
+            return json.load(response)
+    while True:
+        value = timed_call(timing_stats, "fetch_and_json", fetch)
+        if snapshot_transform is not None:
+            value = timed_call(timing_stats, "manual_filter", snapshot_transform, value)
         try:
-            if allow_tracked_obbs and _tracked_obbs_cover_unstable_scene(value):
-                validate_snapshot({**value, "status": "tracked_obbs_in_use"}, max_age)
-            else:
-                validate_snapshot(value, max_age)
+            validate_obstacle_snapshot(value, max_age, allow_tracked_obbs=allow_tracked_obbs,
+                                       allow_scoped_unknown=snapshot_transform is not None)
+            if after_timestamp_ns is not None and value["host_timestamp_ns"] <= after_timestamp_ns:
+                raise SnapshotExpired("Waiting for a newer capture after swept free-space evidence expired")
         except SnapshotExpired as exc:
             remaining = deadline - time.monotonic()
             if max_wait_s > 0 and remaining > 0:
@@ -91,6 +211,9 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
             diagnostics = value.get("diagnostics", {})
             hint = ("; restart detection with --no-lingbot-depth for model-free validation"
                     if diagnostics.get("depth_refinement") == "lingbot-depth" else "")
+            capture_to_publish = diagnostics.get("capture_to_publish_seconds")
+            if isinstance(capture_to_publish, (int, float)) and np.isfinite(capture_to_publish):
+                hint += f"; capture-to-publish {capture_to_publish:.3f}s"
             raise SnapshotExpired(f"{exc}; detector status: {value.get('status', 'unknown')}{hint}") from exc
         except SnapshotUnknown:
             # Candidate coverage cannot turn a missing observation into free space.
@@ -107,7 +230,7 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
                 raise ObstacleSceneUnstable(str(exc)) from exc
             raise
         snapshot_state(value)
-        boxes_from_json(value)
+        timed_call(timing_stats, "decode_validate", boxes_from_json, value)
         return value
 
 

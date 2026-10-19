@@ -92,7 +92,7 @@ def main() -> None:
             "logical_action_dim": metadata.get("logical_action_dim"), "joint_dim": metadata.get("joint_dim"),
             "action_horizon": metadata.get("action_horizon"), "point_count": len(metadata.get("selected_point_indices", [])),
         }
-        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch") or metadata.get("coordinate_frame") != "left_base":
+        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch", "SurfaceActionDetectionModelPytorch") or metadata.get("coordinate_frame") != "left_base":
             errors.append("joint PI05 checkpoint contract is invalid")
     if args.obstacle_url is not None:
         with urlopen(args.obstacle_url, timeout=2.0) as response:

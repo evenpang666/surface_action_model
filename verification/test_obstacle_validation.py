@@ -8,6 +8,7 @@ import pytest
 from obstacle_validation.core import CollisionChecker, JointPath, PathFollower, rrt_detour, segments_within_box_margin
 from obstacle_validation.runtime import boxes_from_json, read_snapshot
 from real_scripts.real_cbf_qp import OrientedBox
+from safety_module.occupancy import LocalOccupancyGrid, ObservationGrid, ObservedBoxes
 
 
 class TwoPointSampler:
@@ -52,6 +53,22 @@ def test_rrt_finds_checked_detour_instead_of_stop():
     assert route is not None and len(route) >= 2
     assert checker.path_safe(np.asarray([path.q[0], *route]))
     np.testing.assert_allclose(route[-1], path.q[-1])
+
+
+def test_planning_freezes_observation_time_but_execution_rechecks_expiry():
+    captured = time.monotonic_ns() - 3_000_000_000
+    grid = LocalOccupancyGrid([-.5, -.5, -.5], np.eye(3), [20, 20, 20], .05)
+    free = np.arange(grid.size)
+    for stamp in (captured-200_000_000, captured-100_000_000, captured):
+        grid.update(timestamp_ns=stamp, raw_hits=np.empty((0, 3)), free_ids=free)
+    boxes = ObservedBoxes([], ObservationGrid(grid.snapshot()))
+    start, end = np.zeros(12), np.zeros(12)
+    end[0] = .1
+    planner = CollisionChecker(TwoPointSampler(), np.zeros(2), boxes,
+                               observation_now_ns=captured+500_000_000)
+    execution = CollisionChecker(TwoPointSampler(), np.zeros(2), boxes)
+    assert planner.edge_safe(start, end)
+    assert not execution.edge_safe(start, end)
 
 
 def test_segment_margin_matches_euclidean_clearance_at_box_corners():
@@ -176,6 +193,24 @@ def test_startup_wait_reads_new_capture_and_requests_compact_payload(monkeypatch
     assert value["host_timestamp_ns"] == fresh["host_timestamp_ns"]
     assert len(requests) == 2
     assert parse_qs(urlsplit(requests[0]).query) == {"session": ["7"], "compact": ["1"]}
+
+
+def test_expired_free_wait_requires_a_new_capture_even_if_old_snapshot_is_fresh(monkeypatch):
+    import io
+    import json
+    import obstacle_validation.runtime as runtime
+    from safety_module.runtime_contract import SnapshotExpired
+
+    old = snapshot(np.zeros(12))
+    newer = {**old, "host_timestamp_ns": old["host_timestamp_ns"]+1}
+    replies = iter([old, old, newer])
+    monkeypatch.setattr(runtime, "urlopen", lambda *a, **k: io.StringIO(json.dumps(next(replies))))
+    value = read_snapshot("http://unused", 1., max_wait_s=.5,
+                          after_timestamp_ns=old["host_timestamp_ns"])
+    assert value["host_timestamp_ns"] == newer["host_timestamp_ns"]
+    monkeypatch.setattr(runtime, "urlopen", lambda *a, **k: io.StringIO(json.dumps(old)))
+    with pytest.raises(SnapshotExpired, match="newer capture"):
+        read_snapshot("http://unused", 1., after_timestamp_ns=old["host_timestamp_ns"])
 
 
 def test_startup_waits_for_obb_point_confirmation_but_motion_read_fails(monkeypatch):

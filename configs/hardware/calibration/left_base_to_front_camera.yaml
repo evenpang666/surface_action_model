@@ -1,62 +1,63 @@
 parent_frame: left_base
 child_frame: front_camera_color_optical_frame
 translation:
-- 0.10369762960511936
-- 0.05855929694399481
-- -0.2977784628174631
+- 0.14882675776651832
+- 0.2757551506698805
+- -0.16827779654048258
 quaternion_xyzw:
-- -0.02172696800854984
-- 0.4899718544803253
-- 0.5187421939038114
-- 0.7002585643475752
+- 0.01048743056448175
+- 0.4677869564226786
+- 0.4812284755229796
+- 0.7412722384838052
 matrix:
-- - -0.01833176383805653
-  - -0.7477985335539566
-  - 0.6636725846749574
-  - 0.10369762960511936
-- - 0.7052161223244214
-  - 0.46086895025003227
-  - 0.5387671403390714
-  - 0.05855929694399481
-- - -0.7087553648814897
-  - 0.4779091586379001
-  - 0.5189110413565329
-  - -0.2977784628174631
+- - 0.09918903549327225
+  - -0.7036308520972298
+  - 0.7036086690873274
+  - 0.14882675776651832
+- - 0.7232543849950425
+  - 0.5366183362919682
+  - 0.43467672555668635
+  - 0.2757551506698805
+- - -0.6834212681965329
+  - 0.4657728900785938
+  - 0.5621307544019245
+  - -0.16827779654048258
 - - 0.0
   - 0.0
   - 0.0
   - 1.0
 calibrated: true
-created_utc: '2026-09-08T09:43:09.522523+00:00'
+created_utc: '2026-10-17T08:03:59.209204+00:00'
 method: table-fixed ChArUco observed by camera and touched by calibrated TCP
 camera_serial: '260922305390'
 board:
-  squares_x: 10
-  squares_y: 7
-  square_size_m: 0.037
-  marker_size_m: 0.027
+  squares_x: 11
+  squares_y: 8
+  square_size_m: 0.07
+  marker_size_m: 0.052
   dictionary: DICT_5X5_100
 touch_corner_ids:
-- 0
-- 26
-- 36
-- 43
-touch_rms_mm: 1.4972320187157886
+- 17
+- 39
+- 62
+- 69
+touch_rms_mm: 2.2059268033426087
 quality_limits:
   max_touch_rms_mm: 2.5
   max_camera_spread_mm: 3.0
   max_board_motion_mm: 5.0
   max_board_motion_deg: 2.0
-final_board_motion_mm: 0.9440118252672467
-final_board_motion_deg: 0.27049917429848025
+final_board_motion_mm: 0.7413316481113563
+final_board_motion_deg: 0.12734535214872636
 camera_samples: 30
-camera_translation_max_spread_mm: 1.291258249415608
-camera_rotation_max_spread_deg: 0.21789291314017772
+color_fps: 30
+camera_translation_max_spread_mm: 0.1100411842438777
+camera_rotation_max_spread_deg: 0.012546720571097951
 intrinsics:
   width: 1280
   height: 720
-  fx: 649.8314819335938
-  fy: 648.7528686523438
+  fx: 647.0114135742188
+  fy: 645.9375610351562
   ppx: 635.8846435546875
   ppy: 358.4482421875
   distortion:
@@ -65,3 +66,4 @@ intrinsics:
   - -1.7853270037448965e-05
   - 0.00015174722648225725
   - -0.020309528335928917
+camera_quality_passed: true

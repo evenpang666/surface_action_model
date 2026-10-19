@@ -1,0 +1,41 @@
+signature:
+  robot_ip: 192.168.124.60
+  base_frame: right_base
+  observations:
+  - camera_serial: '260922305390'
+    squares_x: 11
+    squares_y: 8
+    square_size_m: 0.07
+    marker_size_m: 0.052
+    dictionary: DICT_5X5_100
+  - camera_serial: '260922303231'
+    squares_x: 11
+    squares_y: 8
+    square_size_m: 0.07
+    marker_size_m: 0.052
+    dictionary: DICT_5X5_100
+  observation_ids:
+  - 55716ab6210d4c06813c856f460686bc
+  - eea14eca4b2a4d9a835cf5bdf8bd8777
+touch_corner_ids:
+- 19
+- 12
+- 62
+- 69
+touches:
+  19:
+  - -0.860080057631079
+  - 0.22034912047688027
+  - 0.7346388738255052
+  12:
+  - -0.8564304126014902
+  - 0.5698242838027765
+  - 0.39133017468020775
+  62:
+  - -0.5071688175161458
+  - 0.5776358176649272
+  - 0.3997207087691913
+  69:
+  - -0.5131994841683521
+  - 0.22514577672766675
+  - 0.74660107207181

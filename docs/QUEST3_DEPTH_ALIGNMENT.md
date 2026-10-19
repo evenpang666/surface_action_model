@@ -21,7 +21,7 @@ front RGB 相机内参及其到共同 `left_base` 坐标系的外参。
 python scripts/preprocess_cotracker_surface.py \
   --episode ../quest3_collect/data/dual_vr_episodes/任务/episode_00000.hdf5 \
   --geometry-shard outputs/gates/episode_00000.shard \
-  --calibration ../quest3_collect/config/calibration/left_base_to_front_camera.yaml \
+  --calibration configs/hardware/calibration/left_base_to_front_camera.yaml \
   --output outputs/tracks/episode_00000.npz \
   --preview outputs/tracks/episode_00000.png \
   --visualization outputs/tracks/episode_00000.html

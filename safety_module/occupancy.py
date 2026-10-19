@@ -14,6 +14,8 @@ import zlib
 
 import numpy as np
 
+from safety_module.geometry import segments_within_aabb_margin
+
 
 UNKNOWN, FREE, OCCUPIED, OUTSIDE = 0, 1, 2, 3
 MAP_SCHEMA = "local_probabilistic_occupancy_v1"
@@ -286,11 +288,14 @@ class LocalOccupancyGrid(GridGeometry):
                 "occupied_voxels": int(counts[OCCUPIED]), "outside_voxels": int(counts[OUTSIDE]),
                 "historical_unknown_voxels": sum(x["voxel_count"] for x in self.unknown_obstacles)}
 
-    def boxes(self, *, tile_voxels=4):
+    def boxes(self, *, tile_voxels=4, occupied_ids=None):
         """Pack solid cuboids within bounded tiles; never span an empty gap."""
         if tile_voxels < 1 or tile_voxels > 32:
             raise ValueError("Occupancy box tiles must contain 1..32 voxels per axis")
-        cells = np.column_stack(np.unravel_index(self.current_hits, tuple(self.shape)))
+        occupied_ids = self.current_hits if occupied_ids is None else np.asarray(occupied_ids, dtype=np.int64)
+        if np.any(occupied_ids < 0) or np.any(occupied_ids >= self.size):
+            raise ValueError("Occupied voxel ID exceeds the grid")
+        cells = np.column_stack(np.unravel_index(occupied_ids, tuple(self.shape)))
         if not len(cells):
             return []
         groups = {}
@@ -350,8 +355,10 @@ class ObservationGrid(GridGeometry):
                (("unknown_voxels", UNKNOWN), ("free_voxels", FREE),
                 ("occupied_voxels", OCCUPIED), ("outside_voxels", OUTSIDE))):
             raise ValueError("Occupancy state counts disagree with its grid")
+        self.last_blockage = None
 
     def segments_observed(self, start, end, *, margin_m=0., now_ns=None):
+        self.last_blockage = None
         if not np.isfinite(margin_m) or margin_m < 0:
             raise ValueError("Invalid occupancy motion margin")
         start, end = (np.asarray(p, float).reshape(-1, 3) for p in (start, end))
@@ -366,7 +373,7 @@ class ObservationGrid(GridGeometry):
         traversal = GridGeometry(self.origin - np.full(3, radius * self.resolution_m) @ self.axes.T,
                                  self.axes, shape, self.resolution_m,
                                  max_voxels=int(np.prod(shape)))
-        ids, _ = traversal.ray_cells(start, end)
+        ids, ray_ids = traversal.ray_cells(start, end)
         if not len(ids):
             return True
         now = time.monotonic_ns() if now_ns is None else int(now_ns)
@@ -374,6 +381,7 @@ class ObservationGrid(GridGeometry):
             raise ValueError("Occupancy clock differs from the motion clock")
         decay = 2 ** (-(now - self.timestamp_ns) / 1e9 / self.decay_half_life_s)
         cells = np.column_stack(np.unravel_index(ids, tuple(shape))) - radius
+        local_start, local_end = (self.coordinates(p)*self.resolution_m for p in (start, end))
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):
                 for dz in range(-radius, radius + 1):
@@ -387,7 +395,28 @@ class ObservationGrid(GridGeometry):
                         (now - self.timestamp_ns) / 1e9 + self.age_ms[selected] / 1000 <= self.free_ttl_s)
                     fresh_free &= self.log_odds[selected] * decay <= self.free_log
                     # Outside is explicitly out of this local detector's scope.
-                    if np.any((state != OUTSIDE) & ~fresh_free):
+                    blocked = (state != OUTSIDE) & ~fresh_free
+                    if not blocked.any():
+                        continue
+                    # The stencil is only a broad phase. Treating an entire
+                    # neighbouring cell as within margin rounds a 10 mm guard
+                    # up to whole 20 mm cells and can block every RRT edge.
+                    rows = np.flatnonzero(inside)[blocked]
+                    centres = (queried[rows]+.5)*self.resolution_m
+                    hit = segments_within_aabb_margin(
+                        local_start[ray_ids[rows]]-centres,
+                        local_end[ray_ids[rows]]-centres,
+                        np.full(3, self.resolution_m/2), margin_m)
+                    if hit.any():
+                        index = int(np.flatnonzero(hit)[0])
+                        voxel = int(selected[blocked][index])
+                        voxel_state = int(self.state[voxel])
+                        self.last_blockage = {
+                            "reason": ("expired_free" if voxel_state == FREE else
+                                       "occupied" if voxel_state == OCCUPIED else "unknown"),
+                            "voxel_id": voxel, "point_id": int(ray_ids[rows[index]]),
+                            "capture_age_s": (now-self.timestamp_ns)/1e9,
+                            "observation_age_s": (now-self.timestamp_ns)/1e9+self.age_ms[voxel]/1000}
                         return False
         return True
 
@@ -399,7 +428,7 @@ class ObservedBoxes(list):
 
 
 def observation_rollout_safe(sampler, qpos, gripper, joint_chunk, boxes,
-                             *, gripper_chunk=None, substeps=4, margin_m=0.):
+                             *, gripper_chunk=None, substeps=4, margin_m=0., now_ns=None):
     """Unknown-space guard shared by recovery and rounded-OBB fallback paths."""
     observation = getattr(boxes, "observation", None)
     if observation is None:
@@ -412,7 +441,7 @@ def observation_rollout_safe(sampler, qpos, gripper, joint_chunk, boxes,
         for step in range(1, substeps + 1):
             q, grip = origin + delta * step / substeps, opening + (target - opening) * step / substeps
             current = np.asarray(sampler.link_points(q, grip)).reshape(-1, 3)
-            if not observation.segments_observed(previous, current, margin_m=margin_m):
+            if not observation.segments_observed(previous, current, margin_m=margin_m, now_ns=now_ns):
                 return False
             previous = current
     return True

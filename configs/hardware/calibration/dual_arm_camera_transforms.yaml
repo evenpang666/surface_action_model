@@ -1,0 +1,145 @@
+calibrated: true
+created_utc: '2026-10-17T08:11:11.577839+00:00'
+method: independent arm/board sessions linked through fixed front/side cameras
+transform_convention: parent_T_child maps child coordinates into parent coordinates
+left_base_to_right_base:
+  parent_frame: left_base
+  child_frame: right_base
+  translation:
+  - 0.004376437383198151
+  - 0.30918385208882304
+  - -0.3077101366326894
+  quaternion_xyzw:
+  - -9.064924219357794e-05
+  - 0.7017330482408527
+  - 0.7124024684339403
+  - 0.007310523821492736
+  matrix:
+  - - -0.9998930960483403
+    - -0.010543293570043539
+    - 0.01013091484318619
+    - 0.004376437383198151
+  - - 0.01028884729386265
+    - -0.015034570496112343
+    - 0.9998340368838025
+    - 0.30918385208882304
+  - - -0.010389229818787675
+    - 0.9998313861100246
+    - 0.01514144157863162
+    - -0.3077101366326894
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+front_camera_to_side_camera:
+  parent_frame: front_camera_color_optical_frame
+  child_frame: side_camera_color_optical_frame
+  translation:
+  - 1.037970060288524
+  - -0.3873662714690763
+  - 0.528200169817412
+  quaternion_xyzw:
+  - 0.1407014422395754
+  - -0.5413625989102567
+  - -0.41748850480958516
+  - 0.716123585007988
+  matrix:
+  - - 0.06525976970597902
+    - 0.4456057326452537
+    - -0.8928475197320141
+    - 1.037970060288524
+  - - -0.7502877264102054
+    - 0.6118129050071208
+    - 0.2505060814929503
+    - -0.3873662714690763
+  - - 0.657882580751404
+    - 0.6535445664225467
+    - 0.3742592813056719
+    - 0.528200169817412
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+left_base_to_right_base_via_front:
+  parent_frame: left_base
+  child_frame: right_base
+  translation:
+  - 0.005663299879888117
+  - 0.31052475696689413
+  - -0.3107212728293343
+  quaternion_xyzw:
+  - -0.0004715930504103871
+  - 0.7013300456507193
+  - 0.7127944342678526
+  - 0.007748493035862501
+  matrix:
+  - - -0.999879476911336
+    - -0.011707650170998177
+    - 0.010196204145987525
+    - 0.005663299879888117
+  - - 0.010384680668705844
+    - -0.016152255846466148
+    - 0.9998156145202369
+    - 0.31052475696689413
+  - - -0.011540799752275215
+    - 0.9998009979783693
+    - 0.01627188933510926
+    - -0.3107212728293343
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+left_base_to_right_base_via_side:
+  parent_frame: left_base
+  child_frame: right_base
+  translation:
+  - 0.003089574886508184
+  - 0.307842947210752
+  - -0.30469900043604453
+  quaternion_xyzw:
+  - 0.00029029462521569315
+  - 0.7021355926108704
+  - 0.712010037412956
+  - 0.006872549833471387
+  matrix:
+  - - -0.9999053675756341
+    - -0.009378996550689906
+    - 0.010064309074065527
+    - 0.003089574886508184
+  - - 0.010194301305519553
+    - -0.013916755295536857
+    - 0.9998511889991112
+    - 0.307842947210752
+  - - -0.009237538326223104
+    - 0.9998591692562239
+    - 0.01401105063602449
+    - -0.30469900043604453
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+consistency:
+  base_via_front_vs_side:
+    translation_error_mm: 7.07699997800395
+    rotation_error_deg: 0.18519691417851064
+    passed: true
+  cameras_via_left_vs_right:
+    translation_error_mm: 5.650385875477251
+    rotation_error_deg: 0.1851969141824466
+    passed: true
+quality_limits:
+  max_translation_mm: 10.0
+  max_rotation_deg: 3.0
+source_calibrations:
+  left/front:
+    path: left_base_to_front_camera.yaml
+    sha256: ca744d4208222b2aaeb31f21f39f32fea028b487d4d7578b488da45026e0f49a
+  left/side:
+    path: left_base_to_side_camera.yaml
+    sha256: 4ca101471f1bfedb88918bdacb51d9195d146f7c804505f07747feb3b29590fc
+  right/front:
+    path: right_base_to_front_camera.yaml
+    sha256: d7e72e4b1d531055d4f9e7cfa0db8da6927eb891e9d171b483a94d5d9b9691d4
+  right/side:
+    path: right_base_to_side_camera.yaml
+    sha256: 441a38e511fd40ff35235e75500b3173cabaa642b9abc603c69b5ce23c3461ca

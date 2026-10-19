@@ -150,4 +150,22 @@ LingBot 不替换已接受原始实测点，只向原始空洞增加补全点；
 地图中 occupied 且体素中心投影落在两路同编号框内的体素。这是双视角图像约束
 下的三维体素筛选，不等于从二维框直接得到了 3D OBB；页面可选从筛选体素拟合
 3D OBB。原生 Z16 深度另存为审计证据。捕获和标注元数据均写
-`annotation_image=recorded_rgb`。人工筛选不会改动在线安全地图。
+`annotation_image=recorded_rgb`。人工筛选不会改动在线检测服务的安全地图。
+执行无模型数据集避障时，可显式指定保存的 `selection.json`：
+
+```bash
+python -m obstacle_validation.lerobot_replay replay \
+  --dataset outputs/obstacle_validation/trans_lerobot \
+  --mode avoid --live --manual-selection outputs/manual_obstacles/<capture_id>/selection.json \
+  --execute --execute-ack I_UNDERSTAND_DUAL_UR7E_WILL_MOVE \
+  --output outputs/obstacle_validation/trans_avoid
+```
+
+回放每帧在保存的 3D OBB 范围内筛选实时 occupied 体素，再生成避障 OBB。
+仅此显式模式把未标记区域排除出回放的体素扫掠检查；标记区域内的 unknown
+仍阻止经过它的动作。回放会按 `left_base` 世界坐标把保存的 OBB 投到当前体素网格；
+标定摘要不一致、标记障碍物落在当前地图工作区外，或双相机测量不足时会拒绝运行。
+标记范围固定，物体移出范围后不会被筛选；
+应重新捕获并标记。运行前先检查页面预览中选中体素和 3D OBB 覆盖了目标障碍物。
+回放报告中的 `stale_scene_pauses` 记录因过期快照而先停臂、等待新帧并重新核验动作的次数；
+此等待不延长快照的 2 秒有效期。

@@ -1449,6 +1449,7 @@ def main() -> None:
                 diagnostics["obb_history_frames"] = args.obb_history_frames
                 diagnostics["obb_removal_confirm_frames"] = args.obb_removal_confirm_frames
                 diagnostics["obb_merge_overlap_ratio"] = args.obb_merge_overlap_ratio
+                diagnostics["box_margin_m"] = args.box_margin_m
                 diagnostics["capture_seconds"] = capture_done - began
                 diagnostics["frame_interval_seconds"] = frame_interval_seconds
                 diagnostics["robot_geometry_seconds"] = geometry_done - capture_done

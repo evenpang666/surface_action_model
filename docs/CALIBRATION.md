@@ -2,25 +2,26 @@
 
 ## 当前接入
 
-项目使用用户提供的 2026-10-08 汇总文件：
+项目使用 2026-10-17 的双臂双视角标定，文件已复制到项目内：
 
 ```text
-/home/mypc/Documents/pyw/projects/quest3_collect/config/calibration/dual_arm_camera_transforms.yaml
+configs/hardware/calibration/dual_arm_camera_transforms.yaml
 ```
 
 入口为 `configs/ur7e_dual_quest3.yaml` 的 `safety.dual_arm_camera_calibration`。
-四份源文件在汇总的 `source_calibrations` 中引用；本次没有复制或改写源文件。
+四份源文件及标定观测记录均在同目录。汇总文件通过相对路径引用四份源文件，
+并保留源文件的 SHA256 校验。
 
 | 源标定 | camera serial | touch RMS |
 | --- | --- | --- |
-| left/front | 260922305390 | 2.310 mm |
-| left/side | 260922303231 | 2.310 mm |
-| right/front | 260922305390 | 1.698 mm |
-| right/side | 260922303231 | 1.698 mm |
+| left/front | 260922305390 | 2.206 mm |
+| left/side | 260922303231 | 2.206 mm |
+| right/front | 260922305390 | 1.955 mm |
+| right/side | 260922303231 | 1.955 mm |
 
 touch RMS 限值为 2.5 mm；相机质量、板运动、平移 spread 检查均通过。
-重新计算的基座闭环误差为 0.302 mm / 0.0205°，相机闭环误差为
-0.482 mm / 0.0205°，低于汇总的 10 mm / 3° 限值。
+重新计算的基座闭环误差为 7.077 mm / 0.1852°，相机闭环误差为
+5.650 mm / 0.1852°，低于汇总的 10 mm / 3° 限值。
 `camera_calibration_valid=true` 表示这组文件已经校验接入，不代替实机验收。
 
 ## 共用坐标图
@@ -41,7 +42,7 @@ obstacle_point  = left_base_T_camera @ depth_unproject(pixel, depth)
 ```
 
 使用汇总的相对矩阵并以 left/front 为锚点，保证运行时坐标图严格闭合。
-合成 side 外参与独立 left/side 测量相差约 0.241 mm / 0.0103°，在质量限值内。
+合成 side 外参与独立 left/side 测量相差约 2.825 mm / 0.0926°，在质量限值内。
 加载器重算四份源标定的闭环，不仅信任 `passed=true`；源文件 SHA256 不一致、
 旋转不合法、相机序列号不匹配或质量超限时拒绝加载。
 

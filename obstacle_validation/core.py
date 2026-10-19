@@ -8,7 +8,7 @@ import time
 import numpy as np
 from scipy.spatial import cKDTree
 
-from real_scripts.real_cbf_qp import OrientedBox, segments_intersect_box
+from safety_module.geometry import segments_within_aabb_margin
 
 
 def vector(value, size, name):
@@ -77,44 +77,30 @@ def smooth_joint_path(knots, gripper, *, dt=.05, speed=.5, acceleration=1.2,
 
 
 def segments_within_box_margin(start, end, box, margin):
-    """Exact distance from point segments to an OBB, including rounded corners.
-
-    Axis-wise box expansion is a conservative broad phase, not the Euclidean
-    margin used by clearance(). On each interval between box-plane crossings,
-    squared distance to the box is a quadratic with an analytic minimum.
-    """
-    candidate = segments_intersect_box(start, end, box, margin)
-    if margin == 0 or not candidate.any():
-        return candidate
-    a = (start[candidate]-box.center) @ box.axes
-    d = (end[candidate]-start[candidate]) @ box.axes
-    with np.errstate(divide="ignore", invalid="ignore"):
-        crossings = np.concatenate(((box.half_sizes-a)/d, (-box.half_sizes-a)/d), axis=1)
-    crossings = np.nan_to_num(crossings, nan=0., posinf=1., neginf=0.)
-    boundaries = np.sort(np.column_stack((np.zeros(len(a)), np.clip(crossings, 0, 1), np.ones(len(a)))), axis=1)
-    mid = (boundaries[:, :-1]+boundaries[:, 1:])/2
-    positions = a[:, None, :]+mid[..., None]*d[:, None, :]
-    side = np.where(positions > box.half_sizes, 1., np.where(positions < -box.half_sizes, -1., 0.))
-    active = side != 0
-    offset = a[:, None, :]-side*box.half_sizes
-    numerator = (offset*d[:, None, :]*active).sum(-1)
-    denominator = (d[:, None, :]**2*active).sum(-1)
-    optimum = np.clip(-numerator/np.maximum(denominator, 1e-30), boundaries[:, :-1], boundaries[:, 1:])
-    distances = np.maximum(np.abs(a[:, None, :]+optimum[..., None]*d[:, None, :])-box.half_sizes, 0)
-    result = np.zeros_like(candidate)
-    result[candidate] = (np.square(distances).sum(-1) <= margin**2).any(-1)
-    return result
+    """Exact Euclidean distance from point segments to an OBB, with round corners."""
+    return segments_within_aabb_margin((np.asarray(start)-box.center) @ box.axes,
+                                       (np.asarray(end)-box.center) @ box.axes,
+                                       box.half_sizes, margin)
 
 
 class CollisionChecker:
     """Check every selected fixed point, with segments between small FK steps."""
 
     def __init__(self, sampler, gripper, boxes, *, margin=.01, inter_arm_margin=.035,
-                 resolution=.01):
+                 resolution=.01, observation_now_ns=None):
         if not all(np.isfinite(v) and v >= 0 for v in (margin, inter_arm_margin)) or not np.isfinite(resolution) or resolution <= 0:
             raise ValueError("Invalid collision-check settings")
         self.sampler, self.gripper, self.boxes = sampler, vector(gripper, 2, "gripper"), boxes
         self.margin, self.inter_arm_margin, self.resolution = margin, inter_arm_margin, resolution
+        if observation_now_ns is not None and (not isinstance(observation_now_ns, int)
+                                                or observation_now_ns <= 0):
+            raise ValueError("Invalid fixed observation check time")
+        # A planner checks many candidates against one immutable observation.
+        # Physical execution must use a separate checker with the current time.
+        self.observation_now_ns = observation_now_ns
+        self.edge_rejections = {"unobserved": 0, "obstacle": 0, "inter_arm": 0}
+        self.observation_rejections = {"unknown": 0, "expired_free": 0, "occupied": 0}
+        self.last_observation_blockage = None
         self.left_count = len(sampler.left_link_names) * sampler.points_per_link
 
     def points(self, q):
@@ -145,9 +131,16 @@ class CollisionChecker:
         for index in range(1, steps + 1):
             current = self.points(start + (end - start) * index / steps)
             if observation is not None and not observation.segments_observed(
-                    previous, current, margin_m=self.margin):
+                    previous, current, margin_m=self.margin,
+                    now_ns=self.observation_now_ns):
+                self.edge_rejections["unobserved"] += 1
+                blockage = getattr(observation, "last_blockage", None)
+                if blockage:
+                    self.last_observation_blockage = dict(blockage)
+                    self.observation_rejections[blockage["reason"]] += 1
                 return False
             if any(segments_within_box_margin(previous, current, box, self.margin).any() for box in self.boxes):
+                self.edge_rejections["obstacle"] += 1
                 return False
             # Exact minimum separation of linearly interpolated left/right points.
             first = previous[:self.left_count, None] - previous[None, self.left_count:]
@@ -155,6 +148,7 @@ class CollisionChecker:
             delta = last - first
             t = np.clip(-(first * delta).sum(-1) / np.maximum((delta * delta).sum(-1), 1e-15), 0, 1)
             if np.any(np.linalg.norm(first + t[..., None] * delta, axis=-1) <= self.inter_arm_margin):
+                self.edge_rejections["inter_arm"] += 1
                 return False
             previous = current
         return True
@@ -251,6 +245,7 @@ class PathFollower:
         self.rng = np.random.default_rng(path.seed)
         self.last_delta = np.zeros(12)
         self.before_plan = None
+        self.last_plan_duration_s = None
 
     @property
     def completed(self):
@@ -324,8 +319,10 @@ class PathFollower:
                 return np.zeros(12), "no_safe_rejoin"
             if self.before_plan is not None:
                 self.before_plan()
+            plan_start = time.monotonic()
             route = rrt_detour(q, self.path.q[goal], checker, self.lower, self.upper,
                                rng=self.rng, timeout_s=self.planning_timeout)
+            self.last_plan_duration_s = time.monotonic() - plan_start
             self.replans += 1
             if route is None:
                 return np.zeros(12), "planning_failed"

@@ -67,6 +67,7 @@ class Quest3JointSafetyPolicy:
         from openpi.models.pi0_config import Pi0Config
         from openpi.models_pytorch.pi0_pytorch import PI05SafetyPytorch
         from openpi.models_pytorch.surface_action_pytorch import SurfaceActionModelPytorch
+        from openpi.models_pytorch.surface_detection_pytorch import SurfaceActionDetectionModelPytorch, original_obb_coordinates
 
         self.torch = torch
         self.device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
@@ -77,11 +78,15 @@ class Quest3JointSafetyPolicy:
         # model at once; that can exhaust both 32 GB host RAM and 16 GB GPUs.
         # The checkpoint is a zip-format torch.save file, which supports mmap.
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch"):
+        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch", "SurfaceActionDetectionModelPytorch"):
             raise ValueError(f"{checkpoint} is not a jointly trained PI05SafetyPytorch checkpoint")
         self.info = dict(payload["metadata"])
-        model_class = SurfaceActionModelPytorch if payload["model_type"] == "SurfaceActionModelPytorch" else PI05SafetyPytorch
+        model_class = {"PI05SafetyPytorch": PI05SafetyPytorch,
+                       "SurfaceActionModelPytorch": SurfaceActionModelPytorch,
+                       "SurfaceActionDetectionModelPytorch": SurfaceActionDetectionModelPytorch}[payload["model_type"]]
         self.model_type = payload["model_type"]
+        self.detection_ready = self.model_type == "SurfaceActionDetectionModelPytorch" and self.info.get("detection_stage") in ("joint", "detection")
+        self.original_obb_coordinates = original_obb_coordinates
         self.measured_surface = self.info.get("point_target") == "visual"
         required = ("action_mean", "action_std", "qpos_mean", "qpos_std", "action_horizon", "logical_action_dim", "joint_dim", "selected_point_indices", "camera_map")
         missing = [key for key in required if key not in self.info]
@@ -129,6 +134,8 @@ class Quest3JointSafetyPolicy:
             "points_per_link": self.info.get("points_per_link"),
             "point_target": self.info.get("point_target", "fixed"),
             "action_period_s": self.info.get("action_period_s"),
+            "detection_views": self.info.get("detection_views") if self.detection_ready else None,
+            "detection_ready": self.detection_ready,
         }
 
     def _points(self, value: object) -> np.ndarray:
@@ -196,8 +203,8 @@ class Quest3JointSafetyPolicy:
         normalized = normalized_actions[0, :, : self.logical_action_dim].float().cpu().numpy()
         actions = normalized * self.action_std[None, :] + self.action_mean[None, :]
         point_offsets = offsets[0].float().cpu().numpy()
-        return {
-            "schema_version": 3 if self.model_type == "SurfaceActionModelPytorch" else 2,
+        result = {
+            "schema_version": 4 if self.model_type == "SurfaceActionDetectionModelPytorch" else (3 if self.model_type == "SurfaceActionModelPytorch" else 2),
             "action_chunk": actions.astype(np.float32),
             "current_surface": current,
             "surface_chunk": (current[None, ...] + point_offsets).astype(np.float32),
@@ -209,6 +216,31 @@ class Quest3JointSafetyPolicy:
             "point_identity_version": self.info.get("point_identity_version", ""),
             "points_per_link": int(self.info.get("points_per_link", 0)),
         }
+        if self.detection_ready:
+            if "rgb_side" not in obs:
+                result["detection_status"] = "missing_side_rgb"
+            else:
+                front = np.asarray(obs["rgb_front"], dtype=np.uint8)
+                side = np.asarray(obs["rgb_side"], dtype=np.uint8)
+                if front.ndim != 3 or side.ndim != 3 or front.shape[-1] != 3 or side.shape[-1] != 3:
+                    raise ValueError("Detection front/side inputs must be HxWx3 RGB")
+                images = {view: torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device)[None].permute(0, 3, 1, 2).float() / 255.0 * 2.0 - 1.0
+                          for view, rgb in (("front", front), ("side", side))}
+                with torch.inference_mode():
+                    logits, predicted = self.model.detect(images)
+                result["detections"] = {}
+                for view_index, (view, rgb) in enumerate((("front", front), ("side", side))):
+                    boxes = self.original_obb_coordinates(predicted[0, view_index], *rgb.shape[:2]).float().cpu().numpy()
+                    scores = logits[0, view_index].sigmoid().float().cpu().numpy()
+                    result["detections"][view] = [
+                        {"cx": float(box[0]), "cy": float(box[1]), "width": float(box[2]),
+                         "height": float(box[3]), "angle_deg": float(box[4]), "score": float(score)}
+                        for box, score in zip(boxes, scores, strict=True)
+                        if score >= 0.5 and 0 <= box[0] < rgb.shape[1] and 0 <= box[1] < rgb.shape[0]
+                        and box[2] >= 1 and box[3] >= 1
+                    ]
+                result["detection_status"] = "ok"
+        return result
 
     def reset(self) -> None:
         return None

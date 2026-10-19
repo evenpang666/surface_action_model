@@ -38,6 +38,7 @@ for path in (REPO_ROOT, OPENPI_SRC):
 from safety_module.tokenizer import MODEL_IMAGE_KEYS, _Tokenizer
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
 from safety_module.shards import open_shard, SampleArray
+from safety_module.detection_annotations import load_detection_annotations
 DEFAULT_PRETRAINED = REPO_ROOT / "outputs" / "pretrained" / "pi05_base_pytorch" / "model.safetensors"
 
 
@@ -57,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--point-loss-weight", type=float, default=10.0)
+    parser.add_argument("--detection-stage", choices=("none", "joint", "action_point", "detection"), default="none",
+                        help="Use the three-head checkpoint; detection stage freezes action/point and resumes their weights.")
+    parser.add_argument("--detection-loss-weight", type=float, default=1.0)
+    parser.add_argument("--resume", type=Path, default=None, help="Load action/point or three-head checkpoint weights before this stage.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--action-horizon", type=int, default=None, help="Defaults to the horizon stored in the dataset.")
     parser.add_argument("--max-points", type=int, default=128, help="Stable evenly-spaced point subset; use 0 for all points.")
@@ -146,6 +151,9 @@ class _Episode:
     arm_count: int
     current_mask: np.ndarray
     action_step_mask: np.ndarray
+    detection_boxes: np.ndarray | None = None
+    detection_valid: np.ndarray | None = None
+    detection_reviewed: np.ndarray | None = None
 
 
 class Ur7eSurfaceDataset(Dataset):
@@ -161,10 +169,13 @@ class Ur7eSurfaceDataset(Dataset):
         qpos_std: np.ndarray,
         action_mean: np.ndarray,
         action_std: np.ndarray,
+        include_detection: bool = False,
+        reviewed_only: bool = False,
     ):
         self.qpos_mean, self.qpos_std = qpos_mean, qpos_std
         self.action_mean, self.action_std = action_mean, action_std
         self.tokenizer = tokenizer
+        self.include_detection = include_detection
         self.episodes: list[_Episode] = []
         self.index: list[tuple[int, int]] = []
         image_shape: tuple[int, int, int] | None = None
@@ -183,7 +194,8 @@ class Ur7eSurfaceDataset(Dataset):
             episode_index = len(self.episodes)
             self.episodes.append(episode)
             self.index.extend((episode_index, sample_index) for sample_index in range(episode.sample_count)
-                              if episode.current_mask[sample_index].any() and episode.action_step_mask[sample_index].any())
+                              if episode.current_mask[sample_index].any() and episode.action_step_mask[sample_index].any()
+                              and (not reviewed_only or bool(episode.detection_reviewed[sample_index, 0])))
         if not self.index or image_shape is None:
             raise ValueError("Dataset contains no samples or RGB frames")
         self.image_shape = image_shape
@@ -223,6 +235,11 @@ class Ur7eSurfaceDataset(Dataset):
             sample_frames = np.asarray(data["sample_frame_indices"], dtype=np.int64)
             qpos = np.asarray(data["qpos"], dtype=np.float32)[sample_frames]
             rgb = {key[4:]: SampleArray(np.asarray(data[key], dtype=np.uint8), frames=sample_frames) for key in data.files if key.startswith("rgb_")}
+            detection_boxes = detection_valid = detection_reviewed = None
+            if self.include_detection:
+                rgb_shapes = {name: tuple(array.shape[1:]) for name, array in rgb.items()}
+                detection_boxes, detection_valid, detection_reviewed = load_detection_annotations(
+                    path, data, sample_frames, rgb_shapes)
             task_text = str(np.asarray(data["task_text"]).item()).strip()
             task_text_source = (
                 str(np.asarray(data["task_text_source"]).item())
@@ -270,6 +287,9 @@ class Ur7eSurfaceDataset(Dataset):
             arm_count=arm_count,
             current_mask=current_mask[:, ids],
             action_step_mask=action_step_mask,
+            detection_boxes=detection_boxes,
+            detection_valid=detection_valid,
+            detection_reviewed=detection_reviewed,
         )
 
     def set_camera_map(self, mapping: dict[str, str]) -> None:
@@ -300,7 +320,7 @@ class Ur7eSurfaceDataset(Dataset):
             image_masks[target] = np.asarray(True)
         actions = np.zeros((episode.actions.shape[1], 32), dtype=np.float32)
         actions[:, : episode.action_dim] = (episode.actions[sample_index] - self.action_mean) / self.action_std
-        return {
+        result = {
             "images": images,
             "image_masks": image_masks,
             "state": state,
@@ -313,6 +333,12 @@ class Ur7eSurfaceDataset(Dataset):
             "target_point_mask": episode.target_mask[sample_index][:, ids],
             "action_mask": (np.arange(32) < episode.action_dim)[None] & episode.action_step_mask[sample_index, :, None],
         }
+        if self.include_detection:
+            result["detection_images"] = {view: episode.rgb[view][sample_index] for view in ("front", "side")}
+            result["detection_targets"] = episode.detection_boxes[sample_index]
+            result["detection_valid"] = episode.detection_valid[sample_index]
+            result["detection_reviewed"] = episode.detection_reviewed[sample_index]
+        return result
 
 
 def _normalization_stats(paths: list[Path]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int]:
@@ -366,7 +392,10 @@ def _to_observation(batch: dict[str, Any], device: torch.device) -> SimpleNamesp
 
 def _save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, metadata: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_type": "SurfaceActionModelPytorch", "schema_version": 3, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch, "metadata": metadata}, path)
+    three_head = bool(metadata.get("detection_stage"))
+    torch.save({"model_type": "SurfaceActionDetectionModelPytorch" if three_head else "SurfaceActionModelPytorch",
+                "schema_version": 4 if three_head else 3, "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch, "metadata": metadata}, path)
 
 
 def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, int, bool]:
@@ -398,6 +427,14 @@ def main() -> None:
         raise ValueError("--gradient-accumulation-steps must be positive")
     if args.max_steps is not None and args.max_steps < 1:
         raise ValueError("--max-steps must be positive when supplied")
+    if args.detection_loss_weight < 0:
+        raise ValueError("--detection-loss-weight must be nonnegative")
+    if args.detection_stage == "detection" and args.resume is None:
+        raise ValueError("Detection-only stage requires --resume with trained action/point weights")
+    if args.detection_stage == "none" and args.resume is not None:
+        raise ValueError("--resume is supported only for the three-head training stages")
+    if args.resume is not None and args.output.resolve() == args.resume.resolve():
+        raise ValueError("Stage output must not overwrite its resume checkpoint")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device, rank, world_size, is_distributed = (torch.device("cpu"), 0, 1, False) if args.validate_only else _distributed_context(args)
@@ -424,6 +461,19 @@ def main() -> None:
         raise ValueError("Shards use different action periods")
     qpos_mean, qpos_std, action_mean, action_std, detected_horizon, logical_action_dim, joint_dim = _normalization_stats(shards)
     horizon = detected_horizon if args.action_horizon is None else args.action_horizon
+    resume_payload = None
+    if args.resume is not None:
+        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
+        if resume_payload.get("model_type") not in ("SurfaceActionModelPytorch", "SurfaceActionDetectionModelPytorch"):
+            raise ValueError("--resume must be a surface action or three-head checkpoint")
+        previous = resume_payload["metadata"]
+        if (int(previous["action_horizon"]) != horizon or int(previous["logical_action_dim"]) != logical_action_dim
+                or int(previous["joint_dim"]) != joint_dim or previous.get("point_target") != args.point_target):
+            raise ValueError("Resume checkpoint action/point contract differs from the training dataset")
+        if previous.get("precision") != args.precision:
+            raise ValueError("Resume checkpoint precision differs from --precision")
+        qpos_mean, qpos_std = np.asarray(previous["qpos_mean"], np.float32), np.asarray(previous["qpos_std"], np.float32)
+        action_mean, action_std = np.asarray(previous["action_mean"], np.float32), np.asarray(previous["action_std"], np.float32)
     tokenizer = None if args.validate_only else _Tokenizer(max_len=200, model_path=args.tokenizer_model)
     dataset = Ur7eSurfaceDataset(
         shards,
@@ -435,11 +485,25 @@ def main() -> None:
         qpos_std=qpos_std,
         action_mean=action_mean,
         action_std=action_std,
+        include_detection=args.detection_stage in ("joint", "detection"),
+        reviewed_only=args.detection_stage == "detection",
     )
     rgb_names = sorted(dataset.episodes[0].rgb)
     camera_values = args.camera_map or [f"{source}={target}" for source, target in project["quest3"]["camera_to_model"].items()]
     dataset.set_camera_map(_parse_camera_map(camera_values, rgb_names))
+    if resume_payload is not None and dataset.camera_map != resume_payload["metadata"]["camera_map"]:
+        raise ValueError("Resume checkpoint camera map differs from the training dataset")
+    if args.detection_stage in ("joint", "detection"):
+        reviewed_count = sum(int(np.count_nonzero(episode.detection_reviewed[:, 0])) for episode in dataset.episodes)
+        if not reviewed_count:
+            raise ValueError("Detection training requires at least one reviewed front/side RGB frame")
     reference = dataset.episodes[0]
+    if resume_payload is not None:
+        if (reference.surface_model_hash != previous.get("surface_model_hash")
+                or reference.point_identity_version != previous.get("point_identity_version")
+                or dataset.point_count != int(previous.get("point_count", -1))
+                or reference.selected_point_indices.tolist() != previous.get("selected_point_indices")):
+            raise ValueError("Resume checkpoint surface point contract differs from the training dataset")
     for episode in dataset.episodes[1:]:
         if (episode.surface_model_hash, episode.point_identity_version, episode.points_per_link, episode.arm_count) != (
             reference.surface_model_hash, reference.point_identity_version, reference.points_per_link, reference.arm_count
@@ -451,12 +515,14 @@ def main() -> None:
             "logical_action_dim": logical_action_dim, "action_horizon": horizon,
             "point_count": dataset.point_count, "rgb_views": rgb_names,
             "camera_map": dataset.camera_map, "coordinate_frame": "left_base",
+            "detection_stage": args.detection_stage,
+            "reviewed_detection_frames": sum(int(np.count_nonzero(ep.detection_reviewed[:, 0])) for ep in dataset.episodes) if args.detection_stage in ("joint", "detection") else 0,
             "episode_task_texts": [episode.task_text for episode in dataset.episodes],
             "episode_task_text_sources": [episode.task_text_source for episode in dataset.episodes],
         })
         return
-    pretrained = None if args.allow_random_init else args.pretrained
-    if pretrained is None and not args.allow_random_init:
+    pretrained = None if args.allow_random_init or resume_payload is not None else args.pretrained
+    if pretrained is None and not args.allow_random_init and resume_payload is None:
         raise ValueError("Joint world-action training requires the default PI05 weights (or explicit testing-only --allow-random-init)")
     if pretrained is not None and not pretrained.is_file():
         raise FileNotFoundError(
@@ -469,23 +535,33 @@ def main() -> None:
     try:
         from openpi.models.pi0_config import Pi0Config
         from openpi.models_pytorch.surface_action_pytorch import SurfaceActionModelPytorch
+        from openpi.models_pytorch.surface_detection_pytorch import SurfaceActionDetectionModelPytorch
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "OpenPI dependencies are unavailable. Run this script in the OpenPI environment, for example: "
             "cd openpi && uv run --project . ../scripts/train_pi05_ur7e_surface_pytorch.py ..."
         ) from exc
     config = Pi0Config(action_dim=32, action_horizon=horizon, pi05=True, dtype=args.precision)
-    model = SurfaceActionModelPytorch(config, joint_dim=joint_dim).to(device)
+    model_class = SurfaceActionModelPytorch if args.detection_stage == "none" else SurfaceActionDetectionModelPytorch
+    model = model_class(config, joint_dim=joint_dim).to(device)
     if not args.freeze_base:
         raise ValueError("Surface Action Model freezes the VLM by design; omit --no-freeze-base")
-    if pretrained is not None:
+    if resume_payload is not None:
+        missing, unexpected = model.load_state_dict(resume_payload["model_state_dict"], strict=False)
+        if unexpected or (resume_payload["model_type"] == "SurfaceActionDetectionModelPytorch" and missing) or any(
+                not key.startswith("detection_expert.") for key in missing):
+            raise RuntimeError(f"Resume weights do not fit the three-head model: missing={missing}, unexpected={unexpected}")
+        if is_primary:
+            print(f"[resume] loaded={args.resume}; initialized_detection_keys={len(missing)}")
+        del resume_payload
+    elif pretrained is not None:
         from safetensors.torch import load_model
 
         # load_model understands the tied-weight aliases recorded by
         # safetensors.save_model. load_file()+load_state_dict() silently leaves
         # PaliGemma's shared token embedding random.
         missing, unexpected = load_model(model, str(pretrained), strict=False, device=str(device))
-        disallowed_missing = [key for key in missing if not key.startswith("surface_")]
+        disallowed_missing = [key for key in missing if not key.startswith(("surface_", "detection_expert."))]
         if disallowed_missing or unexpected:
             raise RuntimeError(
                 "Pretrained PI05 backbone is incomplete or incompatible: "
@@ -496,14 +572,19 @@ def main() -> None:
     if args.freeze_base:
         trainable_prefixes = (
             "paligemma_with_expert.gemma_expert.",
-            "action_in_proj.", "action_out_proj.", "time_mlp_", "surface_",
+            "action_in_proj.", "action_out_proj.", "time_mlp_", "surface_", "detection_expert.",
         )
         for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name.startswith(trainable_prefixes))
+            trainable = name.startswith(trainable_prefixes)
+            if args.detection_stage == "detection":
+                trainable = name.startswith("detection_expert.")
+            elif args.detection_stage == "action_point":
+                trainable = trainable and not name.startswith("detection_expert.")
+            parameter.requires_grad_(trainable)
         if is_primary:
             trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
             total = sum(parameter.numel() for parameter in model.parameters())
-            print(f"[freeze-base] frozen=PaliGemma trunk; trainable=action expert + action/surface heads ({trainable:,}/{total:,} parameters)")
+            print(f"[freeze-base] stage={args.detection_stage}; trainable={trainable:,}/{total:,} parameters")
     if not args.no_gradient_checkpointing:
         model.gradient_checkpointing_enable()
     # FP16 optimizer updates need FP32 master parameters and loss scaling.
@@ -516,7 +597,11 @@ def main() -> None:
         model = DistributedDataParallel(model, device_ids=[device.index], output_device=device.index, broadcast_buffers=False)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     metadata = {
-        "schema_version": 3,
+        "schema_version": 4 if args.detection_stage != "none" else 3,
+        "detection_stage": args.detection_stage if args.detection_stage != "none" else None,
+        "detection_views": ["front", "side"] if args.detection_stage != "none" else None,
+        "detection_resolution": 224 if args.detection_stage != "none" else None,
+        "detection_queries": 32 if args.detection_stage != "none" else None,
         "action_period_s": float(np.median(periods)) if periods else None,
         "dataset": [str(path) for path in shards], "point_target": args.point_target, "point_count": dataset.point_count,
         "camera_map": dataset.camera_map,
@@ -544,7 +629,7 @@ def main() -> None:
         if sampler is not None:
             sampler.set_epoch(epoch)
         model.train()
-        total_loss = total_action = total_point = 0.0
+        total_loss = total_action = total_point = total_detection = 0.0
         optimizer.zero_grad(set_to_none=True)
         requested_batches = min(len(loader), args.max_train_batches or len(loader))
         reached_step_limit = False
@@ -555,6 +640,15 @@ def main() -> None:
             sync_context = model.no_sync() if is_distributed and not should_step else nullcontext()
             amp_context = torch.autocast(device_type="cuda", dtype=torch.float16) if device.type == "cuda" and args.precision == "float16" else nullcontext()
             with sync_context, amp_context:
+                detection_kwargs = {}
+                if args.detection_stage in ("joint", "detection"):
+                    detection_kwargs = {
+                        "detection_images": {view: batch["detection_images"][view].to(device=device, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0 for view in ("front", "side")},
+                        "detection_targets": batch["detection_targets"].to(device=device, dtype=torch.float32),
+                        "detection_valid": batch["detection_valid"].to(device=device, dtype=torch.bool),
+                        "detection_reviewed": batch["detection_reviewed"].to(device=device, dtype=torch.bool),
+                        "detection_loss_weight": args.detection_loss_weight,
+                    }
                 losses = model(
                     _to_observation(batch, device),
                 batch["actions"].to(device=device, dtype=torch.float32),
@@ -564,6 +658,7 @@ def main() -> None:
                 batch["target_point_mask"].to(device=device, dtype=torch.bool),
                 point_loss_weight=args.point_loss_weight,
                 action_mask=batch["action_mask"].to(device=device),
+                **({"train_stage": args.detection_stage, **detection_kwargs} if args.detection_stage != "none" else {}),
                 )
                 scaler.scale(losses["loss"] / accumulation_size).backward()
             if should_step:
@@ -575,17 +670,18 @@ def main() -> None:
                 completed_steps += 1
                 reached_step_limit = args.max_steps is not None and completed_steps >= args.max_steps
             total_loss += float(losses["loss"].detach())
-            total_action += float(losses["action_loss"])
-            total_point += float(losses["point_loss"])
+            total_action += float(losses["action_loss"]) if "action_loss" in losses else 0.0
+            total_point += float(losses["point_loss"]) if "point_loss" in losses else 0.0
+            total_detection += float(losses["detection_loss"].detach()) if "detection_loss" in losses else 0.0
             if (args.max_train_batches is not None and batch_index >= args.max_train_batches) or reached_step_limit:
                 break
         batches = batch_index
-        aggregate = torch.tensor((total_loss, total_action, total_point, float(batches)), dtype=torch.float64, device=device)
+        aggregate = torch.tensor((total_loss, total_action, total_point, total_detection, float(batches)), dtype=torch.float64, device=device)
         if is_distributed:
             distributed.all_reduce(aggregate, op=distributed.ReduceOp.SUM)
         if is_primary:
-            global_batches = aggregate[3].item()
-            print(f"epoch={epoch:03d} step={completed_steps} loss={aggregate[0].item() / global_batches:.6f} action={aggregate[1].item() / global_batches:.6f} point={aggregate[2].item() / global_batches:.6f}")
+            global_batches = aggregate[4].item()
+            print(f"epoch={epoch:03d} step={completed_steps} loss={aggregate[0].item() / global_batches:.6f} action={aggregate[1].item() / global_batches:.6f} point={aggregate[2].item() / global_batches:.6f} detection={aggregate[3].item() / global_batches:.6f}")
             if epoch % args.save_every == 0 or epoch == args.epochs or reached_step_limit:
                 _save_checkpoint(args.output, model.module if is_distributed else model, optimizer, epoch, metadata)
         if reached_step_limit:

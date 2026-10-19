@@ -1,4 +1,4 @@
-"""Frozen RGB-D OBB annotations for visualization, never safety-map updates."""
+"""Frozen RGB-D OBB annotations and saved voxel selection for explicit replay."""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
