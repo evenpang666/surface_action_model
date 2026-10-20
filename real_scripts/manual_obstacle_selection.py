@@ -6,13 +6,33 @@ import base64
 import json
 from pathlib import Path
 import threading
-import uuid
 
 import cv2
 import numpy as np
 
 from real_scripts.camera_geometry import pixel_rays, project_pixels
-from safety_module.occupancy import ObservationGrid, OCCUPIED
+from safety_module.occupancy import LocalOccupancyGrid, ObservationGrid, OCCUPIED
+from safety_module.voxel_selection import VoxelSelectionScope
+
+
+def latest_annotation_path(output_dir):
+    """Newest completed annotation capture, supporting timestamp and legacy IDs."""
+    candidates = [path for path in Path(output_dir).glob("*/annotations.json") if path.is_file()]
+    return max(candidates, key=lambda path: (path.parent.stat().st_mtime_ns, path.parent.name), default=None)
+
+
+def timestamp_capture_directory(output_dir):
+    """Reserve a readable local capture time, including timezone and microseconds."""
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    while True:
+        capture_id = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f%z")
+        directory = root / capture_id
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            continue
+        return capture_id, directory
 
 
 @dataclass(frozen=True)
@@ -115,14 +135,29 @@ def fitted_obb(points, resolution_m):
             "corners": (center + (signs*half) @ axes.T).tolist()}
 
 
-def select_voxels(frames, map_payload, annotations, mode="depth"):
-    """Lift RGB OBB pixels through aligned depth; retain two-view voxel intersection."""
+def selection_rule(camera_names):
+    names = tuple(camera_names)
+    if names == ("front",):
+        return "single_view_depth"
+    if names == ("front", "side"):
+        return "dual_view_intersection"
+    raise ValueError("Manual selection supports front-only or front/side cameras")
+
+
+def select_voxels(frames, map_payload, annotations, mode="depth", *, camera_names=("front", "side")):
+    """Lift accepted depth endpoints, then enforce all configured view OBBs.
+
+    A missing side view never downgrades the default dual-view contract.
+    Front-only selection must be explicitly configured by the single-arm scene.
+    """
+    camera_names = tuple(camera_names)
+    fusion_rule = selection_rule(camera_names)
     if mode not in ("depth", "obb"):
         raise ValueError("Selection mode must be depth or obb")
     if not isinstance(annotations, dict) or set(annotations) - set(frames):
-        raise ValueError("Annotations must use the captured front/side camera names")
-    if set(frames) != {"front", "side"}:
-        raise ValueError("Joint selection requires captured front and side RGB-D views")
+        raise ValueError("Annotations must use the captured camera names")
+    if set(frames) != set(camera_names):
+        raise ValueError(f"Selection requires all configured RGB-D views: {list(camera_names)}")
     grid = ObservationGrid(map_payload)
     object_points, diagnostics, grouped = {}, {}, {}
     total_boxes = 0
@@ -157,7 +192,7 @@ def select_voxels(frames, map_payload, annotations, mode="depth"):
         diagnostics[name] = view_counts
     if not total_boxes:
         raise ValueError("Draw at least one OBB before selecting voxels")
-    if set(grouped["front"]) != set(grouped["side"]):
+    if any(set(grouped[name]) != set(grouped["front"]) for name in camera_names):
         raise ValueError("Each obstacle ID must have an OBB in BOTH front and side RGB images")
     occupied = np.flatnonzero(grid.state == OCCUPIED)
     occupied_centers = grid.centers(occupied)
@@ -193,7 +228,8 @@ def select_voxels(frames, map_payload, annotations, mode="depth"):
     return {"mode": mode, "voxel_count": len(ids), "voxel_ids": ids.tolist(),
             "centers": grid.centers(ids).tolist(), "resolution_m": grid.resolution_m,
             "axes": grid.axes.tolist(), "objects": objects, "accepted_points": diagnostics,
-            "fusion_rule": "dual_view_intersection", "annotation_image": "recorded_rgb"}
+            "fusion_rule": fusion_rule, "camera_names": list(camera_names),
+            "annotation_image": "recorded_rgb"}
 
 
 def pixels_in_obb(pixels, box):
@@ -226,29 +262,69 @@ def project_rgb_centers(centers, frame):
 class ManualSelectionStore:
     """One immutable capture and its annotations; HTTP work stays off the detector."""
 
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, *, camera_names=("front", "side"), coordinate_frame="left_base"):
         self.output_dir = Path(output_dir)
+        self.camera_names = tuple(camera_names)
+        self.fusion_rule = selection_rule(self.camera_names)
+        expected_frame = "ur_base" if self.camera_names == ("front",) else "left_base"
+        if coordinate_frame != expected_frame:
+            raise ValueError(f"Manual selection for {self.camera_names} requires {expected_frame}")
+        self.coordinate_frame = coordinate_frame
         self.lock = threading.Lock()
         self.capture_id = None
         self.frames = self.snapshot = self.scene = self.result = None
         self.directory = None
         self.metadata = None
+        self.annotations = None
+        self.cell_scope = None
+        self.revision = 0
+        self.annotation_path = None
+        self.annotation_filter = None
+        self.annotation_error = None
+
+    def load_latest_annotations(self, project_config):
+        """Restore RGB filtering for the live viewer without loading frozen maps."""
+        if self.camera_names != ("front", "side") or self.coordinate_frame != "left_base":
+            return None
+        path = latest_annotation_path(self.output_dir)
+        if path is None:
+            return None
+        # Lazy import: the replay filter also uses the RGB geometry in this module.
+        from obstacle_validation.manual_annotation_filter import ManualAnnotationFilter
+        with self.lock:
+            self.annotation_path = path
+            try:
+                self.annotation_filter = ManualAnnotationFilter(path, project_config)
+                self.annotation_error = None
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                self.annotation_filter = None
+                self.annotation_error = str(exc)
+            self.revision += 1
+        return path
+
+    def configuration(self):
+        with self.lock:
+            return {"camera_names": list(self.camera_names), "coordinate_frame": self.coordinate_frame,
+                    "fusion_rule": self.fusion_rule, "annotation_image": "recorded_rgb",
+                    "viewer_filter_default": False,
+                    "annotation_path": str(self.annotation_path) if self.annotation_path else None,
+                    "annotation_error": self.annotation_error}
 
     def capture(self, snapshot, scene):
         frames = snapshot.get("_manual_frames")
         if not frames or "occupancy_map" not in snapshot:
-            raise ValueError("Wait for a dual-camera RGB-D frame with --occupancy-map enabled; restart and recapture")
-        if set(frames) != {"front", "side"} or any(frame.depth_m.shape != frame.rgb.shape[:2] for frame in frames.values()):
-            raise ValueError("Manual RGB annotation requires aligned front and side depth")
+            raise ValueError("Wait for a configured RGB-D frame with --occupancy-map enabled; restart and recapture")
+        if set(frames) != set(self.camera_names) or any(frame.depth_m.shape != frame.rgb.shape[:2] for frame in frames.values()):
+            raise ValueError(f"Manual RGB annotation requires aligned depth for {list(self.camera_names)}")
+        if snapshot.get("coordinate_frame", self.coordinate_frame) != self.coordinate_frame:
+            raise ValueError("Manual snapshot coordinate frame differs from the configured scene")
         low_m, high_m = depth_display_range(frames)
-        capture_id = uuid.uuid4().hex
-        directory = self.output_dir / capture_id
-        directory.mkdir(parents=True, exist_ok=False)
+        capture_id, directory = timestamp_capture_directory(self.output_dir)
         metadata = {"capture_id": capture_id, "frame": snapshot["frame"],
-                    "coordinate_frame": "left_base", "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "coordinate_frame": self.coordinate_frame, "saved_at_utc": datetime.now(timezone.utc).isoformat(),
                     "host_timestamp_ns": snapshot["host_timestamp_ns"],
                     "annotation_image": "recorded_rgb",
-                    "fusion_rule": "dual_view_intersection",
+                    "fusion_rule": self.fusion_rule, "camera_names": list(self.camera_names),
                     "depth_display": {"min_m": low_m, "max_m": high_m, "colormap": "turbo",
                                       "invalid_pixels": "black", "mask_overlay": False},
                     "calibration": snapshot.get("calibration"), "cameras": {}}
@@ -301,6 +377,10 @@ class ManualSelectionStore:
             self.capture_id, self.frames, self.snapshot, self.scene = capture_id, frames, snapshot, scene
             self.directory, self.result = directory, None
             self.metadata = metadata
+            self.annotations = None
+            self.cell_scope = None
+            self.annotation_path = self.annotation_filter = self.annotation_error = None
+            self.revision += 1
         return metadata
 
     def capture_payload(self):
@@ -308,16 +388,20 @@ class ManualSelectionStore:
             return self.metadata
 
     def select(self, capture_id, annotations, mode):
+        annotations = json.loads(json.dumps(annotations))
         with self.lock:
             if not capture_id or capture_id != self.capture_id:
                 raise ValueError("Capture changed; recapture and annotate the displayed images")
-            result = select_voxels(self.frames, self.snapshot["occupancy_map"], annotations, mode)
+            result = select_voxels(self.frames, self.snapshot["occupancy_map"], annotations, mode,
+                                   camera_names=self.camera_names)
             result.update(capture_id=capture_id, frame=self.snapshot["frame"],
+                          coordinate_frame=self.coordinate_frame,
                           host_timestamp_ns=self.snapshot["host_timestamp_ns"],
                           output_dir=str(self.directory.resolve()))
             (self.directory / "annotations.json").write_text(
                 json.dumps({"capture_id": capture_id, "mode": mode,
-                            "annotation_image": "recorded_rgb", "fusion_rule": "dual_view_intersection",
+                            "annotation_image": "recorded_rgb", "fusion_rule": self.fusion_rule,
+                            "coordinate_frame": self.coordinate_frame, "camera_names": list(self.camera_names),
                             "annotations": annotations}, indent=2), encoding="utf-8")
             (self.directory / "selection.json").write_text(json.dumps(result), encoding="utf-8")
             np.savez_compressed(self.directory / "selected_voxels.npz",
@@ -325,11 +409,81 @@ class ManualSelectionStore:
                                 centers=np.asarray(result["centers"]).reshape(-1, 3),
                                 axes=np.asarray(result["axes"]), resolution_m=result["resolution_m"])
             self.result = result
+            self.annotations = annotations
+            self.cell_scope = VoxelSelectionScope(ObservationGrid(self.snapshot["occupancy_map"]),
+                                                  result["voxel_ids"])
+            self.revision += 1
             return result
+
+    def viewer_filter(self, snapshot, *, tile_voxels=4):
+        """Display live occupancy within saved RGB boxes or this session's selected cells.
+
+        Do this only on a viewer request, outside the acquisition loop. Saved
+        selections remain frozen; snapshot safety geometry is never replaced.
+        """
+        with self.lock:
+            if self.annotation_path is not None:
+                base = {"obbs": [], "voxel_count": 0, "capture_id": self.annotation_path.parent.name,
+                        "revision": self.revision, "annotation_path": str(self.annotation_path)}
+                if self.annotation_filter is None:
+                    return {**base, "state": "annotation_invalid", "error": self.annotation_error}
+                if "occupancy_map" not in snapshot:
+                    return {**base, "state": "map_unavailable"}
+                try:
+                    selected = self.annotation_filter(snapshot)
+                except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+                    return {**base, "state": "annotation_invalid", "error": str(exc)}
+                signs = np.array([[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
+                                  [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]])
+                boxes = [{**box, "corners": (np.asarray(box["center"]) +
+                          (signs*np.asarray(box["half_sizes"])) @ np.asarray(box["axes"]).T).tolist()}
+                         for box in selected["obbs"]]
+                return {**base, "state": "applied", "frame": snapshot["frame"],
+                        "annotation_frame": self.annotation_path.parent.name,
+                        "scope_policy": self.annotation_filter.scope_policy,
+                        "voxel_count": selected["occupancy_map"]["occupied_voxels"], "obbs": boxes}
+            annotations = self.annotations
+            capture_id = self.capture_id
+            captured = self.snapshot
+            revision = self.revision
+            cell_scope = self.cell_scope
+        base = {"obbs": [], "voxel_count": 0, "capture_id": capture_id, "revision": revision}
+        frames = snapshot.get("_manual_frames")
+        if "occupancy_map" not in snapshot or not frames:
+            return {**base, "state": "map_unavailable"}
+        if annotations is None:
+            return {**base, "state": "missing_annotations"}
+        if (snapshot.get("coordinate_frame") != self.coordinate_frame
+                or set(frames) != set(self.camera_names)
+                or snapshot.get("calibration") != captured.get("calibration")):
+            return {**base, "state": "scene_changed"}
+        for name, frame in frames.items():
+            reference = captured["_manual_frames"][name]
+            if (frame.depth_m.shape != reference.depth_m.shape
+                    or not np.array_equal(frame.calibration.intrinsics, reference.calibration.intrinsics)
+                    or not np.array_equal(frame.calibration.camera_to_world, reference.calibration.camera_to_world)
+                    or frame.calibration.distortion_model != reference.calibration.distortion_model
+                    or not np.array_equal(frame.calibration.distortion, reference.calibration.distortion)):
+                return {**base, "state": "scene_changed"}
+        grid = ObservationGrid(snapshot["occupancy_map"])
+        try:
+            scope = cell_scope.mask_for(grid)
+        except ValueError:
+            return {**base, "state": "scene_changed"}
+        ids = np.flatnonzero((grid.state == OCCUPIED) & scope)
+        packing = LocalOccupancyGrid(grid.origin, grid.axes, grid.shape, grid.resolution_m)
+        boxes = packing.boxes(occupied_ids=ids, tile_voxels=tile_voxels)
+        return {**base, "state": "applied", "frame": snapshot["frame"], "voxel_count": len(ids),
+                "scope_policy": "selected_voxel_cells",
+                "annotation_frame": captured["frame"],
+                "obbs": [{"center": box.center.tolist(), "axes": box.rotation.tolist(),
+                          "half_sizes": (box.extents / 2).tolist(), "corners": box.corners.tolist(),
+                          "voxel_count": box.point_count} for box in boxes]}
 
     def scene_payload(self):
         with self.lock:
             if self.scene is None:
                 raise ValueError("Capture a frame on the manual annotation page first")
             return {**self.scene, "manual_selection": self.result,
+                    "manual_revision": self.revision,
                     "status": f"人工标注冻结帧 {self.snapshot['frame']}（非实时）"}

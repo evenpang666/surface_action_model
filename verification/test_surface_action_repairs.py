@@ -351,6 +351,7 @@ def test_two_view_perception_without_hardware(monkeypatch, refinement, noise, ma
     monkeypatch.setattr(live, "load_calibration", lambda path: (np.eye(4), K, "side", {"parent_frame": "left_base"}))
     class Receiver:
         def __init__(self, ip): self.arm = "left_arm" if ip == "fake-left" else "right_arm"
+        def getTimestamp(self): return 1.
         def getActualQ(self): return np.zeros(6)
         def getActualTCPPose(self):
             from scipy.spatial.transform import Rotation
@@ -451,12 +452,12 @@ def test_two_view_perception_without_hardware(monkeypatch, refinement, noise, ma
     tiny_ids, inside = observation.indices(tiny)
     assert inside.all() and observation.state[tiny_ids[0]] == OCCUPIED
     if noise:
-        from safety_module.occupancy import ObservationGrid, UNKNOWN
+        from safety_module.occupancy import ObservationGrid, FREE
         view = ObservationGrid(snapshot["occupancy_map"])
         points = np.array([[(17-40)/100*.4, (13-30)/100*.4, .4],
                            [(62-40)/100*.4, (43-30)/100*.4, .4]])
         ids, inside = view.indices(points)
-        assert inside.all() and np.all(view.state[ids] == UNKNOWN)
+        assert inside.all() and np.all(view.state[ids] == FREE)
         assert snapshot["diagnostics"]["occupancy"]["uncertain_raw_voxels"] > 0
         assert all(e["isolated_pixels"] == 2 for e in snapshot["diagnostics"]["depth_evidence"].values())
         assert all(e["uncertain_raw_pixels"] == 2 for e in snapshot["diagnostics"]["depth_evidence"].values())

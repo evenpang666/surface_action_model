@@ -1,35 +1,52 @@
-# Quest3 双视角 RGB 障碍物批量标注
+# RGB 障碍标注
 
-`real_scripts/batch_obstacle_annotation.py` 离线逐帧读取任务目录中的 HDF5，人工只在
-front、side **录制的 RGB 图**上画二维旋转框（OBB）。原生深度无需人工标注，也不要求
-与 RGB 同分辨率；后续把框映射到三维时，才使用标定后的 RGB 对齐深度。标注坐标是各自
-RGB 的像素坐标，不是深度像素坐标，也不是直接可用于碰撞计算的 3D OBB。
+在仓库根目录、`surface-runtime` 环境运行。页面默认 <http://127.0.0.1:8770>。
 
-输入必须有 `timestamps_ns [N]` 和两路 `observations/images/{front,side}/rgb`，
-每路 RGB 可以是 `[N,H,W,3] uint8` 或逐帧 JPEG。深度可为原生、已对齐或缺失；
-脚本仅记录其来源以供审计。CoTracker 三维点提取使用已经 RGB 对齐的深度，
-仍需录制时的 front RGB 到基座标定，见 [已对齐深度契约](QUEST3_DEPTH_ALIGNMENT.md)。
+## 捕获当前相机
 
-先检查任务目录，再启动本地页面：
+先退出占用相机的检测进程：
 
 ```bash
-conda run -n safety python real_scripts/batch_obstacle_annotation.py \
-  --task-dir ../quest3_collect/data/dual_vr_episodes/你的任务目录 --inspect
-conda run -n safety python real_scripts/batch_obstacle_annotation.py \
-  --task-dir ../quest3_collect/data/dual_vr_episodes/你的任务目录
+python real_scripts/manual_obstacle_annotation.py
 ```
 
-浏览器打开 `http://127.0.0.1:8770`。每帧分别在 front / side RGB 上画框、旋转，
-同一物体在两路使用相同 `object_id`；无障碍时按“标记无障碍”。可逐帧导航、复制上一帧框、
-断点续标。保存才写回原 HDF5，原图、深度、状态、动作和根属性不变。
+1. 点击「捕获当前相机帧」。采集完成后相机自动释放。
+2. 在 front/side RGB 图中画框、旋转，同一物体使用相同 `object_id`。
+3. 点击保存；新增捕获用再次捕获操作，不复用移动前的框。
 
-标注保存到 `annotations/obstacle_obbs`，schema 为 `dual_rgb_obb_annotation_v2`，
-`annotation_image=recorded_rgb`。其中 `frames_json[i]` 含两路框、原帧索引及时间戳；
-`reviewed[i]=False` 表示尚未人工确认，不能当作无障碍负样本。
-`status=no_obstacles` 且 `reviewed[i]=True` 才是明确的空场景。图像坐标下 `angle_deg`
-顺时针为正。多窗口编辑使用 `revision` 防止旧版本覆盖新标注。
+输出：`outputs/manual_obstacles/YYYYMMDD_HHMMSS_微秒±时区/`，
+包含 RGB、`capture.json`，保存后生成 `annotations.json`。
+默认相机序列号来自项目硬件配置；覆盖用 `--front-serial SERIAL --side-serial SERIAL`。
+`--output-dir PATH` 更换输出根目录，`--no-browser` 关闭自动打开页面。
 
-旧版 `dual_depth_obb_annotation_v1` 的框是深度像素坐标，不能静默改称 RGB 框。
-脚本会拒绝在同一 group 上续标；应保留旧文件，另建新数据副本或显式迁移后重新标注。
+保存后可直接[回放避障](MODEL_FREE_OBSTACLE_VALIDATION.md)；检测可视化需重启后加载最新文件，按 B 开启筛选。
 
-训练 LeRobot 导出见 [Quest3 深度与数据集流程](QUEST3_DEPTH_ALIGNMENT.md#四视角-lerobot-训练数据导出)。
+## 标注 HDF5
+
+单个文件或目录均可：
+
+```bash
+python real_scripts/manual_obstacle_annotation.py --hdf5 /path/to/episode.hdf5
+```
+
+页面内选择文件和帧，画框并保存；无障碍帧点击「标记无障碍」。
+支持 front-only 或 front/side；HDF5 模式不打开相机。
+保存写回原 HDF5 的 `annotations/obstacle_obbs`，按原帧索引与时间戳对齐，可续标。
+
+任务目录的双视角批量入口：
+
+```bash
+python real_scripts/batch_obstacle_annotation.py --task-dir /path/to/task --inspect
+python real_scripts/batch_obstacle_annotation.py --task-dir /path/to/task
+```
+
+## 数据检查
+
+- 双视角输入需 `timestamps_ns` 和 `observations/images/{front,side}/rgb`。
+- 在录制 RGB 上画框；仅做二维标注时不要求深度。
+- 双视角格式为 `dual_rgb_obb_annotation_v2`，单视角为 `single_rgb_obb_annotation_v1`。
+- `reviewed=false` 表示未标注；`reviewed=true` 且 `status=no_obstacles` 才表示确认无障碍。
+- 旧深度像素框 `dual_depth_obb_annotation_v1` 不能当作 RGB 标注续写，需另存数据重新标注。
+
+[训练数据导出](QUEST3_DEPTH_ALIGNMENT.md#四视角-lerobot-训练数据导出) ·
+[生成旧式 selection.json](../real_scripts/README.md#双视角人工-obb--体素验证)。

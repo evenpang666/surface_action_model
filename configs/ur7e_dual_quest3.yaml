@@ -73,9 +73,35 @@ safety:
   max_state_drift_rad: 0.01
   obstacle_url: http://127.0.0.1:8766/snapshot.json
   stale_timeout_s: 2.0
-  collision_margin_m: 0.010
+  collision_margin_m: 0.0  # Envelope ellipsoids already include geometric expansion.
   trigger_margin_m: 0.025
   max_joint_step_rad: 0.015
   cbf_alpha: 1.0
   cbf_iterations: 64
   inter_arm_margin_m: 0.035
+  # Ellipsoid replay: left/environment, right/environment, left/right only.
+  # No same-arm collision avoidance.
+  ellipsoid_mcbf:
+    max_control_step_rad: 0.04
+    alpha_per_s: 20.0
+    collision_slack_weight: 20000.0
+    stagnation_steps: 80
+    obstacle_max_parts: 8
+    obstacle_max_span_m: 0.20
+    # VLSA Eq. (9): two virtual plane-direction coordinates per ellipsoid pair.
+    virtual_direction_step_rad: 0.25
+    virtual_direction_weight: 0.01
+  # Legacy point/box AdaptiveMCBF configuration; ellipsoid replay uses the block above.
+  adaptive_mcbf:
+    geodesic_candidates: 16
+    geodesic_horizon: 96
+    geodesic_step_m: 0.02
+    guidance_speed_m_s: 0.12
+    narrow_width_m: 0.10
+    dynamic_distance_m: 0.35
+    closing_speed_m_s: 0.03
+    narrow_margin_scale: 0.25
+    dynamic_margin_scale: 2.0
+    narrow_alpha_scale: 2.0
+    dynamic_alpha_scale: 0.5
+    max_control_step_rad: 0.04

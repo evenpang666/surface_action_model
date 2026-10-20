@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,7 @@ class DualUR7eSurfacePointSampler:
         if int(points_per_link) < 2:
             raise ValueError("points_per_link must be at least two")
         self.points_per_link = int(points_per_link)
+        self._tool_samples = OrderedDict()
         self.config, self.config_path = load_project_config(project_config)
         robot = self.config["robot"]
         if any(robot["tools"][arm] != "robotiq_2f85" for arm in ("left_arm", "right_arm")):
@@ -123,6 +125,31 @@ class DualUR7eSurfacePointSampler:
             return self.dual_surface_model_hash
         raise ValueError("arm_count must be one or two")
 
+    def tcp_transforms(self, qpos: np.ndarray) -> np.ndarray:
+        """Active TCP poses in left_base, independent of gripper commands."""
+        q = np.asarray(qpos, dtype=np.float64).reshape(-1)
+        count = self.arm_count(q)
+        if not np.isfinite(q).all():
+            raise ValueError("TCP joints must be finite")
+        poses = [flange_transform(q[:6]) @ self.flange_to_tcp["left_arm"]]
+        if count == 2:
+            poses.append(self.right_base_to_left_base @ flange_transform(q[6:])
+                         @ self.flange_to_tcp["right_arm"])
+        return np.asarray(poses)
+
+    def _tool_local_points(self, closing):
+        angle = float(np.clip(closing, 0., 1.)*.8)
+        if angle not in self._tool_samples:
+            points = robotiq_2f85_points_in_active_tcp(
+                finger_angle_rad=angle, samples_per_link=self.points_per_link).reshape(
+                    len(TWO_F85_LINK_NAMES), self.points_per_link, 3)
+            points.setflags(write=False)
+            self._tool_samples[angle] = points
+            if len(self._tool_samples) > 128:
+                self._tool_samples.popitem(last=False)
+        self._tool_samples.move_to_end(angle)
+        return self._tool_samples[angle]
+
     def link_points(self, qpos: np.ndarray, gripper_position: np.ndarray | None = None) -> np.ndarray:
         q = np.asarray(qpos, dtype=np.float64).reshape(-1)
         count = self.arm_count(q)
@@ -131,17 +158,14 @@ class DualUR7eSurfacePointSampler:
             raise ValueError(f"Expected {count} gripper positions, got {grip.size}")
         left_q = q[:6]
         left_ur = self.ur.link_points(left_q)
-        left_tool_local = robotiq_2f85_points_in_active_tcp(
-            finger_angle_rad=float(np.clip(grip[0], 0.0, 1.0) * 0.8),
-            samples_per_link=self.points_per_link,
-        ).reshape(len(TWO_F85_LINK_NAMES), self.points_per_link, 3)
+        left_tool_local = self._tool_local_points(grip[0])
         left_tool = _transform(left_tool_local, flange_transform(left_q) @ self.flange_to_tcp["left_arm"])
         parts = [left_ur, left_tool]
         if count == 2:
             right_q = q[6:12]
             right_ur = _transform(self.ur.link_points(right_q), self.right_base_to_left_base)
             right_tool_tf = self.right_base_to_left_base @ flange_transform(right_q) @ self.flange_to_tcp["right_arm"]
-            right_tool_local = robotiq_2f85_points_in_active_tcp(finger_angle_rad=float(np.clip(grip[1], 0.0, 1.0) * 0.8), samples_per_link=self.points_per_link).reshape(len(TWO_F85_LINK_NAMES), self.points_per_link, 3)
+            right_tool_local = self._tool_local_points(grip[1])
             right_tool = _transform(right_tool_local, right_tool_tf)
             parts.extend((right_ur, right_tool))
         return np.concatenate(parts, axis=0).astype(np.float32, copy=False)

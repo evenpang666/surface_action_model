@@ -66,8 +66,14 @@ def robotiq_2f85_link_points_in_gripper_base(*, finger_angle_rad: float = 0.0, s
     """
     if not TWO_F85_COLLISION.is_dir():
         raise FileNotFoundError(f"Missing vendor 2F-85 description: {TWO_F85_COLLISION}")
+    transforms = robotiq_2f85_link_transforms(finger_angle_rad)
+    return np.stack([_transform(_mesh_points(TWO_F85_COLLISION / name, samples_per_link), transforms[name]) for name in TWO_F85_MESH_NAMES]).astype(np.float32)
+
+
+def robotiq_2f85_link_transforms(finger_angle_rad: float = 0.0) -> dict[str, np.ndarray]:
+    """Mesh-local to gripper-base poses, shared by samples and volume models."""
     q = float(finger_angle_rad)
-    transforms = {
+    return {
         "robotiq_base.stl": np.eye(4),
         "ur_to_robotiq_adapter.stl": _translation(0., 0., -.011),
         "left_knuckle.stl": _translation(.03060114, 0., .05490452) @ _rotation_y(-q),
@@ -79,7 +85,6 @@ def robotiq_2f85_link_points_in_gripper_base(*, finger_angle_rad: float = 0.0, s
         "left_finger_tip.stl": _translation(.03060114, 0., .05490452) @ _rotation_y(-q) @ _translation(.03152616, 0., -.00376347) @ _translation(.00563134, 0., .04718515) @ _rotation_y(q),
         "right_finger_tip.stl": _translation(-.03060114, 0., .05490452) @ _rotation_y(q) @ _translation(-.03152616, 0., -.00376347) @ _translation(-.00563134, 0., .04718515) @ _rotation_y(-q),
     }
-    return np.stack([_transform(_mesh_points(TWO_F85_COLLISION / name, samples_per_link), transforms[name]) for name in TWO_F85_MESH_NAMES]).astype(np.float32)
 
 
 def robotiq_2f85_points_in_active_tcp(*, finger_angle_rad: float = 0.0, samples_per_link: int = 850, base_to_active_tcp_m: float = .1493) -> np.ndarray:

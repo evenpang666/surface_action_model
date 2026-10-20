@@ -9,7 +9,10 @@ arm or either gripper.
 The official UR7e collision meshes are rendered for both arms.  The installed
 Robotiq 2F-85 uses upstream collision meshes driven by a read-only ``GET POS``
 query; both arms use the articulated Robotiq 2F-85 vendor collision mesh.
-Both are rendered at their configured active TCPs.  Verify the physical
+Both are displayed at their configured active TCPs. Robot depth masking is
+disabled by default; --robot-mask enables projection and depth removal.
+Use --no-robot for camera-only point-cloud reconstruction and voxel estimation.
+Verify the physical
 mount/cup dimensions before treating the result as motion-planning geometry.
 """
 
@@ -18,7 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -42,7 +45,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from real_scripts.lingbot_depth import add_lingbot_depth_cli_args, create_lingbot_depth_refiner_from_args
 from real_scripts.camera_geometry import project_pixels
-from real_scripts.real_robot_adapter import CameraCalibration, RGBDFrame, depth_to_world_points, robot_depth_keep_mask
+from real_scripts.rtde_state import read_rtde_tcp_state
+from real_scripts.real_robot_adapter import CameraCalibration, RGBDFrame, robot_depth_keep_mask
 from real_scripts.obstacle_observation import TablePlanePrior, verified_completion_depth, measured_view_support
 from real_scripts.raw_depth_evidence import RawDepthEvidenceFilter, confirm_raw_depth_views
 from real_scripts.probabilistic_obstacle_map import workspace_occupancy_grid, integrate_depth_views
@@ -63,20 +67,34 @@ from real_scripts.preprocess_left_vr_hdf5_cotracker_observations import _lift_me
 
 
 VIEWER_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Dual UR7e obstacle model</title>
-<script src="/plotly.min.js"></script><style>html,body,#scene{margin:0;width:100%;height:100%;overflow:hidden;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000c;padding:10px 13px;border-radius:7px;line-height:1.6;pointer-events:none}#pause,#focus,#robot-toggle{pointer-events:auto;margin-top:6px;padding:4px 9px;border:1px solid #6c7784;border-radius:4px;background:#17212b;color:#e6edf3;cursor:pointer}.robot{color:#ff6b55}.obstacle{color:#45ff9b}.warning{color:#ffd166}</style></head>
-<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（桌面坐标）</b><br><span id="s">等待首帧…</span><br><span id="timing"></span><br><span class="robot">红/橙：双 Robotiq 2F-85 与双臂</span> · <span class="obstacle">绿：双臂工作区障碍物 OBB（含悬空）</span><br><span class="warning">双臂工作区外桌面点仅供显示；仅 RTDE 读取，不会发送运动或夹爪命令。</span><br><button id="focus" type="button" aria-pressed="true">当前：桌面聚焦（F）</button> <button id="robot-toggle" type="button" aria-pressed="true">隐藏机械臂（R）</button> <button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button> <a href="/manual-obstacles" target="_blank" style="pointer-events:auto;color:#69dec3">人工 OBB / 体素验证</a><br><span id="manual-status" class="warning"></span></div><div id="scene"></div>
+<script src="/plotly.min.js"></script><script src="/octomap-viewer.js"></script><script src="/voxblox-viewer.js"></script><script src="/ellipsoid-viewer.js"></script><style>html,body,#scene{margin:0;width:100%;height:100%;overflow:hidden;background:#080a0d;color:#e6edf3;font:14px Arial}#hud{position:fixed;z-index:2;left:12px;top:10px;background:#000c;padding:10px 13px;border-radius:7px;line-height:1.6;pointer-events:none}#pause,#robot-toggle,#voxel-toggle,#voxel-filter{pointer-events:auto;margin-top:6px;padding:4px 9px;border:1px solid #6c7784;border-radius:4px;background:#17212b;color:#e6edf3;cursor:pointer}.robot{color:#ff6b55}.obstacle{color:#45ff9b}.warning{color:#ffd166}</style></head>
+<body><div id="hud"><b>双 UR7e 实时桌面障碍物模型（桌面坐标）</b><br><span id="s">等待首帧…</span><br><span id="timing"></span><br><span id="viewer-timing"></span><br><span class="robot">红/橙：双 Robotiq 2F-85 与双臂</span> · <span class="obstacle">绿：双臂工作区障碍物 OBB（含悬空）</span><br><span class="warning">双臂工作区外桌面点仅供显示；仅 RTDE 读取，不会发送运动或夹爪命令。</span><br><button id="voxel-toggle" type="button" aria-pressed="true">隐藏体素框（V）</button> <button id="voxel-filter" type="button" aria-pressed="false">体素筛选：关（B）</button> <button id="robot-toggle" type="button" aria-pressed="true">隐藏机械臂（R）</button> <button id="pause" type="button" aria-pressed="false">暂停显示（空格）</button> <a href="/manual-obstacles" target="_blank" style="pointer-events:auto;color:#69dec3">人工 OBB / 体素验证</a><br><span id="manual-status" class="warning"></span></div><div id="scene"></div>
 <script>
-const G=document.getElementById('scene'),S=document.getElementById('s'),T=document.getElementById('timing'),P=document.getElementById('pause'),F=document.getElementById('focus'),R=document.getElementById('robot-toggle');
+const G=document.getElementById('scene'),S=document.getElementById('s'),T=document.getElementById('timing'),P=document.getElementById('pause'),R=document.getElementById('robot-toggle'),V=document.getElementById('voxel-toggle'),Q=document.getElementById('voxel-filter');
 const E=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
-let paused=false,focusTable=true,showRobot=true,tableReference=null,lastSnapshot=null;
 const manualMode=new URLSearchParams(location.search).get('manual')==='1';
-function setPaused(value){paused=value;P.textContent=paused?'继续显示（空格）':'暂停显示（空格）';P.setAttribute('aria-pressed',String(paused))}
-function setFocus(value){focusTable=value;F.textContent=value?'当前：桌面聚焦（F）':'当前：全景（F）';F.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot)}
+let paused=false,showRobot=true,showVoxels=true,filterVoxels=false,tableReference=null,lastSnapshot=null,requestId=0;
+let activeRequest=null,lastDrawKey=null,lastPresentedFrame=null,lastPresentedAt=null;
+const octomapViewer=new OctomapLeafViewer(()=>{if(lastSnapshot)draw(lastSnapshot)});
+document.getElementById('hud').append(octomapViewer.element);
+const voxbloxViewer=new VoxbloxViewer(()=>{if(lastSnapshot)draw(lastSnapshot)});
+document.getElementById('hud').append(voxbloxViewer.element);
+const ellipsoidViewer=new EllipsoidViewer(()=>{if(lastSnapshot)draw(lastSnapshot);refresh()});
+document.getElementById('hud').append(ellipsoidViewer.element);
+function nativeView(d){return d.voxblox_view||d.octomap_view}
+function nativeViewer(d){return d.voxblox_view?voxbloxViewer:octomapViewer}
+const viewerTiming={};
+function updateViewerTiming(){document.getElementById('viewer-timing').textContent=['网页新帧间隔 '+(Number.isFinite(viewerTiming.interval)?Math.round(viewerTiming.interval)+' ms':'—'),'取数/解析 '+(Number.isFinite(viewerTiming.fetch)?Math.round(viewerTiming.fetch)+' ms':'—'),'绘制 '+(Number.isFinite(viewerTiming.render)?Math.round(viewerTiming.render)+' ms':'—')].join(' · ')}
+function setPaused(value){paused=value;P.textContent=paused?'继续显示（空格）':'暂停显示（空格）';P.setAttribute('aria-pressed',String(paused));if(!paused)refresh()}
 function setShowRobot(value){showRobot=value;R.textContent=value?'隐藏机械臂（R）':'显示机械臂（R）';R.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot)}
+function setShowVoxels(value){showVoxels=value;V.textContent=value?'隐藏体素框（V）':'显示体素框（V）';V.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot)}
+function setVoxelFilter(value){filterVoxels=value;Q.textContent=value?'体素筛选：开（B）':'体素筛选：关（B）';Q.setAttribute('aria-pressed',String(value));if(lastSnapshot)draw(lastSnapshot);refresh()}
 P.addEventListener('click',()=>setPaused(!paused));
-F.addEventListener('click',()=>setFocus(!focusTable));
 R.addEventListener('click',()=>setShowRobot(!showRobot));
-document.addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='Space'){e.preventDefault();setPaused(!paused)}else if(e.code==='KeyF'){e.preventDefault();setFocus(!focusTable)}else if(e.code==='KeyR'){e.preventDefault();setShowRobot(!showRobot)}});
+V.addEventListener('click',()=>setShowVoxels(!showVoxels));
+Q.addEventListener('click',()=>setVoxelFilter(!filterVoxels));
+Q.textContent=filterVoxels?'体素筛选：开（B）':'体素筛选：关（B）';Q.setAttribute('aria-pressed',String(filterVoxels));
+document.addEventListener('keydown',e=>{if(e.repeat||['INPUT','TEXTAREA','SELECT','BUTTON','A'].includes(e.target?.tagName))return;if(e.code==='Space'){e.preventDefault();setPaused(!paused)}else if(e.code==='KeyR'){e.preventDefault();setShowRobot(!showRobot)}else if(e.code==='KeyV'){e.preventDefault();setShowVoxels(!showVoxels)}else if(e.code==='KeyB'){e.preventDefault();setVoxelFilter(!filterVoxels)}});
 function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]}
 function tableFrame(d){
   const raw=d.diagnostics?.table_normal_left_base, offset=d.diagnostics?.table_offset_m;
@@ -104,13 +122,12 @@ function pts(g,name,size,frame){
   return {type:'scatter3d',mode:'markers',name,x:points.map(p=>p[0]),y:points.map(p=>p[1]),z:points.map(p=>p[2]),marker:{size,opacity:.8,color:g.colors.map(v=>`rgb(${v[0]},${v[1]},${v[2]})`)},hoverinfo:'skip'};
 }
 function boxes(items,frame){
-  const result=[];
+  const x=[],y=[],z=[];
   for(let k=0;k<items.length;k++){
-    const corners=items[k].corners.map(p=>tablePoint(p,frame)),x=[],y=[],z=[];
+    const corners=items[k].corners.map(p=>tablePoint(p,frame));
     for(const [a,b] of E){x.push(corners[a][0],corners[b][0],null);y.push(corners[a][1],corners[b][1],null);z.push(corners[a][2],corners[b][2],null)}
-    result.push({type:'scatter3d',mode:'lines',name:`障碍物 ${k+1}`,x,y,z,line:{color:'#45ff9b',width:6},hoverinfo:'skip'});
   }
-  return result;
+  return items.length?[{type:'scatter3d',mode:'lines',name:'体素框',x,y,z,line:{color:'#45ff9b',width:3},hoverinfo:'skip'}]:[];
 }
 function manualVoxels(selection,frame){
   // Display full voxel cells, not point markers. Keep the exported selection complete.
@@ -122,7 +139,6 @@ function manualVoxels(selection,frame){
     for(const sign of signs){const p=tablePoint(c.map((v,r)=>v+h*(a[r][0]*sign[0]+a[r][1]*sign[1]+a[r][2]*sign[2])),frame);x.push(p[0]);y.push(p[1]);z.push(p[2])}
     for(const t of triangles){i.push(base+t[0]);j.push(base+t[1]);k.push(base+t[2])}
   }
-  document.getElementById('manual-status').textContent=`人工冻结帧 ${selection.frame} · 黄色 ${centers.length} 个选中体素${step>1?'（显示抽样 '+Math.ceil(centers.length/step)+' 个）':''} · 蓝色为 3D 包围框 · 非实时`;
   return {type:'mesh3d',name:'人工筛选体素',x,y,z,i,j,k,color:'#ffd84d',opacity:.85,flatshading:true,hoverinfo:'skip'};
 }
 function quantile(sorted,fraction){const index=(sorted.length-1)*fraction,low=Math.floor(index),high=Math.ceil(index);return sorted[low]+(sorted[high]-sorted[low])*(index-low)}
@@ -149,13 +165,21 @@ function overviewBounds(d,frame){
   for(const point of d.environment.points)include(point);
   if(showRobot)for(const point of d.robot.points)include(point);
   for(const box of d.obbs)for(const corner of box.corners)include(corner);
+  for(const point of ellipsoidViewer.boundsPoints())include(point);
+  if(showVoxels&&nativeViewer(d).useNative(nativeView(d),filterVoxels))for(const p of nativeViewer(d).boundsPoints(nativeView(d)))include(p);
   if(!low.every(Number.isFinite)||!high.every(Number.isFinite))return null;
   const span=Math.max(...high.map((value,i)=>value-low[i]),.6)*1.1;
   const ranges=low.map((value,i)=>[(value+high[i]-span)/2,(value+high[i]+span)/2]);
   return {x:ranges[0],y:ranges[1],z:ranges[2]};
 }
-function draw(d){
+function drawKey(d){return JSON.stringify([d.host_timestamp_ns,d.frame,d.status,d.manual_revision,filterVoxels,d.viewer_filter?.capture_id,octomapViewer.revision,voxbloxViewer.revision,ellipsoidViewer.revision])}
+async function draw(d){
+  const renderBegan=performance.now();
+  const renderKey=drawKey(d);
   lastSnapshot=d;
+  octomapViewer.update(d.octomap_view,filterVoxels,showVoxels);
+  voxbloxViewer.update(d.voxblox_view,filterVoxels,showVoxels);
+  ellipsoidViewer.update(d.ellipsoid_view,filterVoxels,manualMode);
   const frame=tableFrame(d);
   const bounds=tableBounds(d.environment,frame);
   const coverage=bounds?` · 桌面点云覆盖 ${bounds.width.toFixed(2)} × ${bounds.height.toFixed(2)} m`:'';
@@ -164,30 +188,86 @@ function draw(d){
   const left=d.diagnostics?.left_workspace_points,right=d.diagnostics?.right_workspace_points;
   const workspaces=Number.isFinite(left)&&Number.isFinite(right)?` · 左/右工作区 ${left}/${right} 点`:'';
   const unknown=d.unknown_obstacles?.length||0;
-  S.textContent=`帧 ${d.frame} · ${d.status} · 环境 ${d.environment.points.length} 点 · 双臂 ${d.robot.points.length} 点${showRobot?'':'（已隐藏）'} · ${d.obbs.length} 个障碍物 · ${unknown} 个 unknown（无历史框）${workspaces}${coverage}${outsideText}`;
-  const timing=d.diagnostics||{},stages=[['采集','capture_seconds'],['深度','depth_stage_seconds'],['点云','point_cloud_seconds'],['桌面','scene_analysis_seconds'],['地图','box_tracking_seconds']];
+  const maskText=typeof d.diagnostics?.robot_mask_enabled==='boolean'?` · 机器人遮罩 ${d.diagnostics.robot_mask_enabled?'开':'关'}`:'';
+  const robotText=d.diagnostics?.robot_connected===false?' · 无机械臂模式':` · 双臂 ${d.robot.points.length} 点${showRobot?'':'（已隐藏）'}`;
+  if(d.diagnostics?.robot_connected===false){R.hidden=true;document.querySelector('#hud b').textContent='点云重建与体素估计（无机械臂）';document.querySelector('#hud .robot').hidden=true;document.querySelector('#hud .warning').textContent='仅相机感知；使用已有标定和工作区，无机械臂连接或机器人剔除。'}
+  S.textContent=`帧 ${d.frame} · ${d.status} · 环境 ${d.environment.points.length} 点${robotText} · ${d.obbs.length} 个障碍物 · ${unknown} 个 unknown（无历史框）${maskText}${workspaces}${coverage}${outsideText}`;
+  const timing=d.diagnostics||{},stages=[['采集','capture_seconds'],['几何','robot_geometry_seconds'],['深度','depth_stage_seconds'],['点云','point_cloud_seconds'],['桌面','scene_analysis_seconds'],['地图','box_tracking_seconds']];
   const elapsed=Number.isFinite(timing.processing_seconds)?`检测 ${Math.round(timing.processing_seconds*1000)} ms`:'';
+  const publish=Number.isFinite(timing.capture_to_publish_seconds)?` · 采集→发布 ${Math.round(timing.capture_to_publish_seconds*1000)} ms`:'';
   const interval=Number.isFinite(timing.frame_interval_seconds)?` · 帧间隔 ${Math.round(timing.frame_interval_seconds*1000)} ms`:'';
-  T.textContent=elapsed+interval+stages.filter(([,key])=>Number.isFinite(timing[key])).map(([label,key])=>` · ${label} ${Math.round(timing[key]*1000)} ms`).join('');
+  const mapParts=[['空闲射线',timing.occupancy?.free_ray_traversal_seconds],['TSDF融合',timing.occupancy?.tsdf_integration_seconds],['ESDF重建',timing.occupancy?.esdf_update_seconds],['体素打包',timing.occupancy_boxes_seconds],['地图编码',timing.occupancy_encode_seconds]];
+  T.textContent=elapsed+publish+interval+stages.filter(([,key])=>Number.isFinite(timing[key])).map(([label,key])=>` · ${label} ${Math.round(timing[key]*1000)} ms`).join('')+mapParts.filter(([,value])=>Number.isFinite(value)).map(([label,value])=>` · ${label} ${Math.round(value*1000)} ms`).join('');
   const axis=frame?'桌面':'left_base';
-  const focused=focusTable&&bounds, eye=focused?{x:.9,y:-.9,z:1.65}:{x:1.5,y:-1.5,z:1.15};
+  const eye={x:1.5,y:-1.5,z:1.15};
   const scene={bgcolor:'#080a0d',aspectmode:'cube',camera:{eye,up:{x:0,y:0,z:1},projection:{type:'orthographic'}},
     xaxis:{title:`${axis} X (m)`},yaxis:{title:`${axis} Y (m)`},zaxis:{title:`${axis} Z (m)`}};
-  const ranges=focused?bounds:overviewBounds(d,frame);
+  const ranges=overviewBounds(d,frame);
   if(ranges){scene.xaxis.range=ranges.x;scene.yaxis.range=ranges.y;scene.zaxis.range=ranges.z}
-  const traces=[pts(d.environment,'environment',.7,frame)];
+  const showCloud=!nativeView(d)||nativeViewer(d).points.checked;
+  const traces=showCloud?[pts(d.environment,'environment',.7,frame)]:[];
   if(showRobot)traces.push(pts(d.robot,'dual robots',1.1,frame));
-  traces.push(...boxes(d.obbs,frame));
-  if(d.manual_selection){
-    traces.push(manualVoxels(d.manual_selection,frame));
-    const selectedBoxes=d.manual_selection.objects.filter(o=>o.obb).map(o=>o.obb);
-    traces.push(...boxes(selectedBoxes,frame).map(b=>({...b,line:{color:'#63b8ff',width:4}})));
+  traces.push(...ellipsoidViewer.traces(p=>tablePoint(p,frame)));
+  let filterText='';
+  if(!filterVoxels){if(showVoxels){
+    if(nativeViewer(d).useNative(nativeView(d),false))traces.push(...nativeViewer(d).traces(nativeView(d),p=>tablePoint(p,frame)));
+    else traces.push(...boxes(d.obbs,frame));
+  }}
+  else if(manualMode){
+    const selection=d.manual_selection;
+    if(selection){
+      filterText=`人工冻结帧 ${selection.frame} · 选中 ${selection.voxel_count} 个体素 · 非实时`;
+      if(showVoxels){
+        traces.push(manualVoxels(selection,frame));
+        const selectedBoxes=selection.objects.filter(o=>o.obb).map(o=>o.obb);
+        traces.push(...boxes(selectedBoxes,frame).map(b=>({...b,line:{color:'#63b8ff',width:4}})));
+      }
+    }else filterText='尚未筛选：请在标注子页面画框并点击“筛选并显示体素”。';
+  }else{
+    const filtered=d.viewer_filter;
+    if(filtered?.state==='applied'){
+      filterText=filtered.annotation_path?`标注 ${filtered.annotation_path} · 当前帧 ${d.frame} · ${filtered.voxel_count} 个体素`:`仅标注帧 ${filtered.annotation_frame} 选中单元内的当前占据体素 · 帧 ${d.frame} · ${filtered.voxel_count} 个体素`;
+      if(showVoxels)traces.push(...boxes(filtered.obbs,frame));
+    }else{
+      const reasons={missing_annotations:'请在标注子页面画框并点击“筛选并显示体素”。',map_unavailable:'当前没有可筛选的占据地图。',scene_changed:'相机或标定已变化，请重新捕获并标注。'};
+      filterText=filtered?(filtered.error?`标注筛选不可用：${filtered.error}`:reasons[filtered.state]||'筛选结果不可用。'):'正在读取标记框筛选结果…';
+    }
   }
-  return Plotly.react(G,traces,{
-    uirevision:focusTable?'table-focus-v3':'table-overview-v3',showlegend:false,paper_bgcolor:'#080a0d',margin:{l:0,r:0,t:0,b:0},scene
+  document.getElementById('manual-status').textContent=(filterVoxels?filterText:'未筛选：使用全部占据体素。')+(showVoxels?'':'（体素框已隐藏）');
+  await Plotly.react(G,traces,{
+    uirevision:'table-overview-v4',showlegend:false,paper_bgcolor:'#080a0d',margin:{l:0,r:0,t:0,b:0},scene
   },{displaylogo:false,responsive:true,scrollZoom:true});
+  const now=performance.now(),frameKey=JSON.stringify([d.host_timestamp_ns,d.frame]);
+  viewerTiming.render=now-renderBegan;
+  if(lastPresentedFrame!==frameKey){if(lastPresentedAt!==null)viewerTiming.interval=now-lastPresentedAt;lastPresentedAt=now;lastPresentedFrame=frameKey}
+  lastDrawKey=renderKey;
+  updateViewerTiming();
 }
-async function poll(){if(!paused)try{let r=await fetch((manualMode?'/manual-obstacles/scene.json?':'/snapshot.json?viewer=1&')+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();if(!paused)await draw(d)}catch(e){if(!paused)S.textContent='读取快照失败，正在重试：'+e}setTimeout(poll,900)}
+async function refresh(automatic=false){
+  if(automatic&&activeRequest)return;
+  if(activeRequest)activeRequest.abort();
+  const controller=new AbortController();activeRequest=controller;
+  const id=++requestId,requestedFilter=filterVoxels,requestedEllipsoids=ellipsoidViewer.groups(),began=performance.now();
+  try{
+    const path=(manualMode?'/manual-obstacles/scene.json?':'/snapshot.json?viewer=1&render=1&')+(requestedFilter?'manual_filter=1&':'')+(requestedEllipsoids?'ellipsoids='+encodeURIComponent(requestedEllipsoids)+'&':'');
+    const after=automatic&&!manualMode&&lastSnapshot?.viewer_revision?'after='+encodeURIComponent(lastSnapshot.viewer_revision)+'&':'';
+    const r=await fetch(path+after+Date.now(),{cache:'no-store',signal:controller.signal});
+    if(!r.ok)throw Error(r.status);
+    if(r.status===204){if(id===requestId){viewerTiming.fetch=performance.now()-began;updateViewerTiming()}return}
+    const d=await r.json();
+    if(id===requestId&&requestedFilter===filterVoxels&&requestedEllipsoids===ellipsoidViewer.groups()&&(!automatic||!paused)){
+      viewerTiming.fetch=performance.now()-began;
+      if(!automatic||drawKey(d)!==lastDrawKey)await draw(d);else updateViewerTiming();
+    }
+  }catch(e){if(e.name!=='AbortError'&&id===requestId&&(!automatic||!paused))S.textContent='读取快照失败，正在重试：'+e}
+  finally{if(activeRequest===controller)activeRequest=null}
+}
+async function poll(){
+  const began=performance.now();
+  if(!paused&&document.visibilityState!=='hidden')await refresh(true);
+  // Pace from the start of a request, without adding a fixed wait after drawing.
+  setTimeout(poll,Math.max(10,(manualMode?1000:100)-(performance.now()-began)));
+}
 poll();
 </script></body></html>"""
 
@@ -329,19 +409,27 @@ class ReadOnlyRobotiq2FPosition:
         self._disconnect()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-config", type=Path, default=DEFAULT_PROJECT_CONFIG)
+def parse_args(argv=None, *, default_scene="dual") -> argparse.Namespace:
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--scene", choices=("dual", "single-pika"), default=default_scene)
+    selected, _ = selector.parse_known_args(argv)
+    single = selected.scene == "single-pika"
+    parser = argparse.ArgumentParser(description=("Receive-only single UR7e + Pika obstacle detection using only frontcam." if single else __doc__), parents=[selector])
+    parser.add_argument("--project-config", type=Path, default=(REPO_ROOT / "configs/ur7e_single_pika.yaml" if single else DEFAULT_PROJECT_CONFIG))
     parser.add_argument("--front-serial", default=None, help="Override front D455 serial; default is hardware config.")
     parser.add_argument("--side-serial", default=None)
-    parser.add_argument("--width", type=int, default=1280); parser.add_argument("--height", type=int, default=720); parser.add_argument("--fps", type=int, default=15)
+    parser.add_argument("--width", type=int, default=640); parser.add_argument("--height", type=int, default=360); parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--depth-width", type=int, default=None, help="Optional raw depth width; default selects a supported depth profile at --fps.")
     parser.add_argument("--depth-height", type=int, default=None, help="Specify together with --depth-width; depth is aligned to the RGB resolution.")
     parser.add_argument("--warmup-frames", type=int, default=20); parser.add_argument("--point-stride", type=int, default=3)
+    parser.add_argument("--no-robot", action="store_true",
+                        help="Only reconstruct point clouds and estimate voxels using cameras and existing calibration; skip RTDE, grippers and robot geometry (default: connect robots).")
+    parser.add_argument("--robot-mask", action=argparse.BooleanOptionalAction, default=False,
+                        help="Render and remove robot depth (default off for lower latency; robot returns remain environment obstacles).")
     parser.add_argument("--samples-per-face", type=int, default=16); parser.add_argument("--absolute-tolerance-m", type=float, default=.015); parser.add_argument("--relative-tolerance", type=float, default=.015); parser.add_argument("--dilation-pixels", type=int, default=3)
     add_lingbot_depth_cli_args(parser)
     # Two fixed D455 views; wrist D435i cameras belong to policy observations.
-    parser.set_defaults(lingbot_camera_names=("front", "side"), lingbot_depth=True)
+    parser.set_defaults(lingbot_camera_names=("front",) if single else ("front", "side"), lingbot_depth=False)
     parser.add_argument("--workspace-bounds", nargs=6, type=float, default=(-0.85, 0.85, -0.85, 1.20, -0.12, 0.70), metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="Local workspace bounds for each arm; both are included in tabletop detection.")
     parser.add_argument("--right-workspace-bounds", nargs=6, type=float, default=None, metavar=("XMIN","XMAX","YMIN","YMAX","ZMIN","ZMAX"), help="Optional right_base bounds; defaults to --workspace-bounds.")
     parser.add_argument("--plane-threshold-m", type=float, default=.012); parser.add_argument("--min-height-m", type=float, default=.020)
@@ -359,21 +447,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-prior-max-offset-m", type=float, default=.01)
     parser.add_argument("--cluster-eps-m", type=float, default=.010, help="Exact point-to-point DBSCAN radius; unlike voxel adjacency, this is a physical distance.")
     parser.add_argument("--cluster-min-samples", type=int, default=6, help="DBSCAN core-neighbour count, including the point itself.")
-    parser.add_argument("--min-cluster-points", type=int, default=80); parser.add_argument("--attachment-distance-m", type=float, default=.050); parser.add_argument("--box-margin-m", type=float, default=.010)
+    parser.add_argument("--min-cluster-points", type=int, default=80); parser.add_argument("--attachment-distance-m", type=float, default=.050)
+    parser.add_argument("--box-margin-m", type=float, default=.010,
+                        help="Extra OBB margin for --no-occupancy-map only; occupied voxel boxes are not inflated.")
     parser.add_argument("--raw-depth-support-pixels", type=int, default=2, help="LingBot pixels must be within this many pixels of raw, non-robot D455 depth; 0 permits raw pixels only.")
     parser.add_argument("--completion-absolute-tolerance-m", type=float, default=.015)
     parser.add_argument("--completion-relative-tolerance", type=float, default=.015)
     parser.add_argument("--occupancy-map", action=argparse.BooleanOptionalAction, default=True,
                         help="Use the local probabilistic voxel map (default on); --no-occupancy-map uses filtered DBSCAN/temporal OBBs without a map.")
-    parser.add_argument("--manual-output-dir", type=Path, default=REPO_ROOT / "outputs/manual_obstacles",
-                        help="Save frozen dual-view RGB-D captures and manual voxel selections here.")
+    parser.add_argument("--occupancy-backend", choices=("numpy", "octomap", "voxblox"), default="numpy",
+                        help="Voxel generator (default numpy); octomap uses native occupancy octrees, voxblox uses native TSDF/ESDF.")
+    parser.add_argument("--octomap-output", type=Path, default=None,
+                        help="With --occupancy-backend octomap, save .bt/.ot and placement JSON at shutdown or after --once.")
+    parser.add_argument("--octomap-view-max-leaves", type=int, default=6000,
+                        help="Maximum native OctoMap leaves sent to the viewer (default 6000, split between occupied/free); sampling affects display only.")
+    parser.add_argument("--voxblox-truncation-m", type=float, default=None, help="TSDF truncation distance; default 4x voxel size.")
+    parser.add_argument("--voxblox-surface-band-m", type=float, default=None, help="Absolute TSDF distance considered a surface voxel; default one voxel size.")
+    parser.add_argument("--voxblox-min-weight", type=float, default=.1)
+    parser.add_argument("--voxblox-max-weight", type=float, default=32.)
+    parser.add_argument("--voxblox-threads", type=int, default=1)
+    parser.add_argument("--voxblox-esdf", action=argparse.BooleanOptionalAction, default=True,
+                        help="Build native ESDF after each complete Voxblox frame (default on).")
+    parser.add_argument("--voxblox-esdf-max-distance-m", type=float, default=2., help="ESDF distance cap in metres (default 2).")
+    parser.add_argument("--voxblox-esdf-min-distance-m", type=float, default=None,
+                        help="Fixed TSDF seed band for ESDF; default one voxel, at most TSDF truncation.")
+    parser.add_argument("--voxblox-view-max-voxels", type=int, default=6000)
+    parser.add_argument("--voxblox-output", type=Path, default=None, help="Save bounded TSDF/ESDF, observation masks and state to .npz at shutdown or after --once.")
+    parser.add_argument("--manual-output-dir", type=Path, default=REPO_ROOT / ("outputs/single_pika/manual_obstacles" if single else "outputs/manual_obstacles"),
+                        help="Save frozen scene RGB-D captures and manual voxel selections here.")
     parser.add_argument("--occupancy-resolution-m", type=float, default=.02)
     parser.add_argument("--occupancy-ray-stride", type=int, default=6)
     parser.add_argument("--occupancy-free-margin-m", type=float, default=.015)
-    parser.add_argument("--occupancy-free-ttl-s", type=float, default=2.)
+    parser.add_argument("--occupancy-free-ttl-s", type=float, default=2.,
+                        help="Legacy map metadata; free-cell age no longer blocks motion.")
     parser.add_argument("--occupancy-hit-probability", type=float, default=.7)
     parser.add_argument("--occupancy-miss-probability", type=float, default=.4)
-    parser.add_argument("--occupancy-free-probability", type=float, default=.35)
+    parser.add_argument("--occupancy-free-probability", type=float, default=.35,
+                        help="Legacy map metadata; only current occupied cells block motion.")
     parser.add_argument("--occupancy-box-tile-voxels", type=int, default=4)
     parser.add_argument("--temporal-persistence-frames", type=int, default=3, help="Consecutive observations required to confirm a track; uncovered candidate OBBs are published immediately.")
     parser.add_argument("--temporal-track-distance-m", type=float, default=.035, help="Maximum centre displacement when associating an OBB across frames.")
@@ -393,8 +503,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-tool-from-tcp", type=Path, default=None, help="Optional JSON/YAML ^active_tcpT_right_tool_urdf_root; identity for the bundled URDF.")
     parser.add_argument("--left-robotiq-read-port", type=int, default=63352, help="Left 2F-85 URCap port used only for GET POS.")
     parser.add_argument("--left-finger-angle-rad", type=float, default=0.0, help="Fallback 2F-85 finger angle if GET POS is unavailable; 0=open, 0.8=closed.")
-    parser.add_argument("--display-max-points", type=int, default=12000); parser.add_argument("--port", type=int, default=8766); parser.add_argument("--bind-host", default="127.0.0.1"); parser.add_argument("--once", action="store_true"); parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--display-max-points", type=int, default=12000); parser.add_argument("--port", type=int, default=8767 if single else 8766); parser.add_argument("--bind-host", default="127.0.0.1"); parser.add_argument("--once", action="store_true"); parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--pika-gripper-port", default=None, help="Single Pika scene: USB serial device; defaults to scene config.")
+    args = parser.parse_args(argv)
+    if args.no_robot and args.robot_mask:
+        parser.error("--no-robot cannot be combined with --robot-mask; robot masking requires measured robot state")
+    if args.occupancy_backend != "numpy" and not args.occupancy_map:
+        parser.error(f"--occupancy-backend {args.occupancy_backend} requires --occupancy-map")
+    if not 2 <= args.octomap_view_max_leaves <= 50000:
+        parser.error("--octomap-view-max-leaves must be in 2..50000")
+    if args.octomap_output is not None:
+        if args.occupancy_backend != "octomap" or args.octomap_output.suffix.lower() not in (".bt", ".ot"):
+            parser.error("--octomap-output requires --occupancy-backend octomap and a .bt or .ot path")
+    if args.voxblox_output is not None and (args.occupancy_backend != "voxblox" or args.voxblox_output.suffix.lower() != ".npz"):
+        parser.error("--voxblox-output requires --occupancy-backend voxblox and a .npz path")
+    if args.occupancy_backend == "voxblox":
+        truncation = args.voxblox_truncation_m if args.voxblox_truncation_m is not None else 4*args.occupancy_resolution_m
+        band = args.voxblox_surface_band_m if args.voxblox_surface_band_m is not None else args.occupancy_resolution_m
+        if (not np.isfinite([truncation, band, args.voxblox_min_weight, args.voxblox_max_weight]).all()
+                or not args.occupancy_resolution_m <= truncation < 10.
+                or not 0 < band <= truncation or args.voxblox_max_weight < 1
+                or not 0 < args.voxblox_min_weight <= args.voxblox_max_weight
+                or not 1 <= args.voxblox_threads <= 32 or not 2 <= args.voxblox_view_max_voxels <= 50000):
+            parser.error("Invalid Voxblox TSDF settings")
+        fixed = args.voxblox_esdf_min_distance_m if args.voxblox_esdf_min_distance_m is not None else args.occupancy_resolution_m
+        if (not np.isfinite([fixed, args.voxblox_esdf_max_distance_m]).all()
+                or not 0 < fixed <= truncation or args.voxblox_esdf_max_distance_m <= max(fixed, truncation)):
+            parser.error("Invalid Voxblox ESDF settings: 0 < fixed band <= truncation < max distance")
     if (args.obb_point_change_distance_m <= 0 or not 0 < args.obb_point_change_fraction <= 1
             or args.obb_history_frames < 3
             or not 1 <= args.obb_change_confirm_frames <= args.obb_history_frames
@@ -538,12 +673,21 @@ def tool_surface_points(q, closing, base_to_left, flange_to_tcp, *, samples_per_
     return transform_points(local, base_to_left @ flange_transform(q) @ flange_to_tcp)
 
 
-def validate_active_tcp(q, measured_tcp, flange_to_tcp, *, max_position_mm=5., max_rotation_deg=1., arm_name=None):
+def validate_active_tcp(q, measured_tcp, flange_to_tcp, *, max_position_mm=5., max_rotation_deg=1., arm_name=None,
+                        controller_timestamp_s=None):
     expected = flange_transform(q) @ flange_to_tcp
     mm, degrees = transform_error(expected, rotvec_transform(measured_tcp))
     if mm > max_position_mm or degrees > max_rotation_deg:
         prefix = f"{arm_name}: " if arm_name else ""
-        raise RuntimeError(f"{prefix}Active TCP differs from fixed-surface FK: {mm:.3f} mm / {degrees:.3f} deg; recheck flange_to_active_tcp")
+        exc = RuntimeError(f"{prefix}Active TCP differs from fixed-surface FK: {mm:.3f} mm / {degrees:.3f} deg; recheck flange_to_active_tcp")
+        exc.active_tcp_check = {
+            "arm": arm_name, "q_rad": np.asarray(q).tolist(),
+            "measured_tcp_pose": np.asarray(measured_tcp).tolist(),
+            "configured_flange_to_tcp": np.asarray(flange_to_tcp).tolist(),
+            "expected_base_to_tcp": expected.tolist(), "position_error_mm": mm,
+            "rotation_error_deg": degrees, "max_position_mm": max_position_mm,
+            "max_rotation_deg": max_rotation_deg, "controller_timestamp_s": controller_timestamp_s}
+        raise exc
     return mm, degrees
 
 
@@ -1095,9 +1239,15 @@ def materialize_snapshot(snapshot: dict, *, viewer: bool = False,
                          include_viewer_environment: bool = False) -> dict:
     """Convert display arrays only when a client asks for them."""
     display: SnapshotDisplay | None = snapshot.get("_display_data")
+    private = ("_display_data", "_manual_frames", "_octomap_view", "_voxblox_view")
+    result = {key: value for key, value in snapshot.items() if key not in private}
+    if viewer and "_octomap_view" in snapshot:
+        result["octomap_view"] = snapshot["_octomap_view"]
+    if viewer and "_voxblox_view" in snapshot:
+        frozen = snapshot["_voxblox_view"]
+        result["voxblox_view"] = frozen.materialize() if hasattr(frozen, "materialize") else frozen
     if display is None:
-        return {key: value for key, value in snapshot.items() if key != "_manual_frames"}
-    result = {key: value for key, value in snapshot.items() if key not in ("_display_data", "_manual_frames")}
+        return result
     if viewer:
         visible = display.table_band
         environment = cap(display.all_points[visible], display.all_colors[visible], display.max_points)
@@ -1119,11 +1269,12 @@ def materialize_snapshot(snapshot: dict, *, viewer: bool = False,
     return result
 
 
-def snapshot_payload(snapshot: dict, *, compact: bool = False, viewer: bool = False) -> bytes:
+def snapshot_payload(snapshot: dict, *, compact: bool = False, viewer: bool = False,
+                     render_only: bool = False) -> bytes:
     """Keep safety requests small and build display JSON outside the detector."""
     if compact:
         excluded = {"environment", "_viewer_environment", "robot", "current_surface",
-                    "rgb_front_jpeg_base64", "_display_data", "_manual_frames"}
+                    "rgb_front_jpeg_base64", "_display_data", "_manual_frames", "_octomap_view", "octomap_view", "_voxblox_view", "voxblox_view"}
         snapshot = {key: value for key, value in snapshot.items() if key not in excluded}
     else:
         snapshot = materialize_snapshot(snapshot, viewer=viewer)
@@ -1131,64 +1282,155 @@ def snapshot_payload(snapshot: dict, *, compact: bool = False, viewer: bool = Fa
         snapshot = {key: value for key, value in snapshot.items() if key != "_viewer_environment"}
         if viewer and viewer_environment is not None:
             snapshot["environment"] = viewer_environment
+    if viewer and render_only and not compact:
+        # Browser-only wire format. Preserve the existing full/viewer/compact
+        # contracts for safety consumers and manual capture/export.
+        fields = {"frame", "host_timestamp_ns", "coordinate_frame", "status", "environment", "robot",
+                  "obbs", "diagnostics", "unknown_obstacles", "viewer_filter", "manual_revision", "viewer_revision", "octomap_view", "voxblox_view", "ellipsoid_view"}
+        snapshot = {key: value for key, value in snapshot.items() if key in fields}
+        for name in ("environment", "robot"):
+            if name in snapshot:
+                snapshot[name] = {**snapshot[name], "points": np.round(
+                    np.asarray(snapshot[name]["points"], dtype=np.float64), 5).tolist()}
+        def render_boxes(items):
+            return [{"corners": np.round(np.asarray(box["corners"], dtype=np.float64), 5).tolist()}
+                    for box in items]
+        snapshot["obbs"] = render_boxes(snapshot.get("obbs", []))
+        if "viewer_filter" in snapshot:
+            snapshot["viewer_filter"] = {**snapshot["viewer_filter"],
+                                         "obbs": render_boxes(snapshot["viewer_filter"].get("obbs", []))}
     return json.dumps(snapshot, separators=(",", ":"), allow_nan=False).encode()
 
 
-def main() -> None:
-    args = parse_args(); left, right, calibration, report = load_arms(args)
-    right_workspace_bounds = args.right_workspace_bounds or args.workspace_bounds
-    points_in_bounds(np.empty((0, 3)), args.workspace_bounds)
-    points_in_bounds(np.empty((0, 3)), right_workspace_bounds)
-    project, _ = load_project_config(args.project_config)
-    if "camera_to_left_base" in report:
-        side_transform = np.asarray(report["camera_to_left_base"]["side"])
-        side_K = np.asarray(report["camera_intrinsics"]["side"])
-        side_serial = report["camera_serials"]["side"]
+class DualObstacleScene:
+    """Hardware-specific setup for the existing dual-arm runtime."""
+
+    schema = "dual_ur7e_obstacle_snapshot_v2"
+    coordinate_frame = "left_base"
+    viewer_html = VIEWER_HTML
+    manual_selection = True
+    robot_label = "双臂"
+    raw_depth_label = "raw-d455"
+
+    def __init__(self, args):
+        left, right, calibration, report = load_arms(args)
+        right_workspace_bounds = args.right_workspace_bounds or args.workspace_bounds
+        points_in_bounds(np.empty((0, 3)), args.workspace_bounds)
+        points_in_bounds(np.empty((0, 3)), right_workspace_bounds)
+        project, _ = load_project_config(args.project_config)
+        if "camera_to_left_base" in report:
+            side_transform = np.asarray(report["camera_to_left_base"]["side"])
+            side_K = np.asarray(report["camera_intrinsics"]["side"])
+            side_serial = report["camera_serials"]["side"]
+        else:
+            side_transform, side_K, side_serial, side_report = load_calibration(resolve_repo_path(project["safety"]["side_calibration"]))
+            if side_report.get("parent_frame") != "left_base":
+                raise ValueError("side calibration must map the camera into left_base")
+        if args.side_serial and args.side_serial != side_serial:
+            raise ValueError("Side camera serial differs from calibration")
+        side_distortion = (report["camera_distortion"]["side"] if "camera_distortion" in report else
+                           side_report.get("intrinsics", {}).get("distortion"))
+        calibrations = {"front": calibration, "side": CameraCalibration("side", side_K, side_transform, side_distortion)}
+        self.flange_to_tcp = {}
+        if not args.no_robot:
+            geometry = DualUR7eSurfacePointSampler(points_per_link=2, project_config=args.project_config)
+            for arm in (left, right):
+                if not np.allclose(arm.tool_from_tcp, np.eye(4), atol=1e-8):
+                    raise ValueError("Tool overrides would disagree with fixed-point FK; configure the shared robot model instead")
+            if "sha256" in report and geometry.calibration_digest != report["sha256"]:
+                raise RuntimeError("Calibration changed while constructing perception geometry")
+            self.flange_to_tcp = {a.name: geometry.flange_to_tcp[f"{a.name}_arm"] for a in (left, right)}
+        report.setdefault("camera_serials", {"front": report["camera_serial"], "side": side_serial})
+        self.arms = (left, right)
+        self.calibrations, self.report, self.project = calibrations, report, project
+        self.workspace_regions = [(args.workspace_bounds, np.eye(4)),
+                                  (right_workspace_bounds, right.base_to_left)]
+
+    def workspace_masks(self, points):
+        (left_bounds, _), (right_bounds, transform) = self.workspace_regions
+        return dual_arm_workspace_masks(points, left_bounds, right_bounds, transform)
+
+    def open_grippers(self, args):
+        grippers = {}
+        try:
+            for arm in self.arms:
+                grippers[arm.name] = ReadOnlyRobotiq2FPosition(arm.ip, port=args.left_robotiq_read_port)
+        except Exception:
+            for gripper in grippers.values():
+                gripper.close()
+            raise
+        return grippers
+
+    def read_grippers(self, grippers):
+        positions = {name: gripper.closing_fraction() for name, gripper in grippers.items()}
+        closing = positions["left"]
+        return positions, f"2F-85 GET POS={closing:.3f}, q={.8 * closing:.3f} rad"
+
+    def tool_points(self, arm, q, position):
+        return tool_surface_points(q, position, arm.base_to_left, self.flange_to_tcp[arm.name])
+
+
+def main(argv=None, *, default_scene="dual") -> None:
+    args = parse_args(argv, default_scene=default_scene)
+    grid_settings = {}
+    if args.occupancy_backend == "octomap":
+        from real_scripts.octomap_obstacle_map import OctomapOccupancyGrid, require_octomap
+        require_octomap()
+        grid_settings["grid_class"] = OctomapOccupancyGrid
+    elif args.occupancy_backend == "voxblox":
+        from real_scripts.voxblox_obstacle_map import VoxbloxOccupancyGrid, require_voxblox
+        require_voxblox()
+        grid_settings.update(grid_class=VoxbloxOccupancyGrid, truncation_m=args.voxblox_truncation_m,
+                             surface_band_m=args.voxblox_surface_band_m, min_weight=args.voxblox_min_weight,
+                             max_weight=args.voxblox_max_weight, threads=args.voxblox_threads,
+                             esdf=args.voxblox_esdf, esdf_max_distance_m=args.voxblox_esdf_max_distance_m,
+                             esdf_min_distance_m=args.voxblox_esdf_min_distance_m)
+    if args.scene == "single-pika":
+        from real_scripts.single_ur7e_pika_scene import SinglePikaObstacleScene
+        scene = SinglePikaObstacleScene(args)
     else:
-        side_transform, side_K, side_serial, side_report = load_calibration(resolve_repo_path(project["safety"]["side_calibration"]))
-        if side_report.get("parent_frame") != "left_base":
-            raise ValueError("side calibration must map the camera into left_base")
-    if args.side_serial and args.side_serial != side_serial:
-        raise ValueError("Side camera serial differs from calibration")
-    side_distortion = (report["camera_distortion"]["side"] if "camera_distortion" in report else
-                       side_report.get("intrinsics", {}).get("distortion"))
-    calibrations = {"front": calibration, "side": CameraCalibration("side", side_K, side_transform, side_distortion)}
-    geometry = DualUR7eSurfacePointSampler(points_per_link=2, project_config=args.project_config)
-    for arm in (left, right):
-        if not np.allclose(arm.tool_from_tcp, np.eye(4), atol=1e-8):
-            raise ValueError("Tool overrides would disagree with fixed-point FK; configure the shared robot model instead")
-    if "sha256" in report and geometry.calibration_digest != report["sha256"]:
-        raise RuntimeError("Calibration changed while constructing perception geometry")
-    print(json.dumps({"mode": "read-only", "calibration": report, "left_ip": left.ip, "right_ip": right.ip}, indent=2))
-    from rtde_receive import RTDEReceiveInterface
+        scene = DualObstacleScene(args)
+    arms = () if args.no_robot else scene.arms
+    calibrations, report, project = scene.calibrations, scene.report, scene.project
+    calibration = calibrations["front"]
+    schema, coordinate_frame = scene.schema, scene.coordinate_frame
+    mode = "reconstruction-only" if args.no_robot else "read-only"
+    print(json.dumps({"mode": mode, "calibration": report,
+                      **{f"{a.name}_ip": a.ip for a in arms}}, indent=2))
+    if not args.no_robot:
+        from rtde_receive import RTDEReceiveInterface
     # --no-lingbot-depth bypasses model loading/inference. Verified completion
     # from both views supplements raw measurements but never replaces them.
     refiner = create_lingbot_depth_refiner_from_args(args)
     if refiner is not None:
         print(json.dumps({"depth_refinement": "LingBot-Depth", "model": refiner.model_id, "device": str(refiner.device), "fp16": refiner.use_fp16, "views": refiner.camera_names}, indent=2))
     else:
-        print(json.dumps({"depth_refinement": "raw D455 depth (--no-lingbot-depth selected)"}, indent=2))
-    samples = collision_surface_samples(samples_per_face=args.samples_per_face)
-    latest: dict = {"schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
+        print(json.dumps({"depth_refinement": f"{scene.raw_depth_label} (LingBot-Depth disabled)"}, indent=2))
+    samples = {} if args.no_robot else collision_surface_samples(samples_per_face=args.samples_per_face)
+    latest: dict = {"schema": schema, "coordinate_frame": coordinate_frame,
                     "frame": 0, "status": "initializing", "environment": {"points": [], "colors": []},
                     "robot": {"points": [], "colors": []}, "obbs": []}; lock = threading.Lock(); stop = threading.Event()
-    manual_store = ManualSelectionStore(args.manual_output_dir)
+    manual_store = ManualSelectionStore(args.manual_output_dir, camera_names=tuple(calibrations),
+                                        coordinate_frame=coordinate_frame)
+    annotation_path = manual_store.load_latest_annotations(args.project_config)
+    if annotation_path is not None:
+        print(json.dumps({"viewer_annotations": str(annotation_path),
+                          "error": manual_store.annotation_error}, ensure_ascii=False), flush=True)
+    from real_scripts.ellipsoid_overlay import EllipsoidOverlay
+    ellipsoid_overlay = EllipsoidOverlay(scene)
 
     def process() -> None:
         nonlocal latest
-        source = RealSenseD435iSource(cameras=(D435iCameraConfig("front", args.front_serial or report["camera_serial"]), D435iCameraConfig("side", args.side_serial or side_serial)), width=args.width, height=args.height, fps=args.fps,
+        source = RealSenseD435iSource(cameras=tuple(D435iCameraConfig(name, report["camera_serials"][name]) for name in calibrations), width=args.width, height=args.height, fps=args.fps,
                                     depth_width=args.depth_width, depth_height=args.depth_height,
                                     retain_native_depth=True)
         receivers = {}
         try:
-            for arm in (left, right):
+            for arm in arms:
                 receivers[arm.name] = RTDEReceiveInterface(arm.ip)
         except Exception:
             for receiver in receivers.values(): receiver.disconnect()
             raise
-        left_gripper: ReadOnlyRobotiq2FPosition | None = None; right_gripper: ReadOnlyRobotiq2FPosition | None = None
-        finger_angle = float(np.clip(args.left_finger_angle_rad, 0., .8)); right_finger_angle = finger_angle
-        gripper_status = f"2F-85 fixed angle {finger_angle:.3f} rad"
         occupancy_grid = None
         obstacle_gate = (None if args.occupancy_map else TemporalOBBGate(
             required_hits=args.temporal_persistence_frames, match_distance_m=args.temporal_track_distance_m,
@@ -1209,31 +1451,30 @@ def main() -> None:
             max_offset_m=args.table_prior_max_offset_m,
         )
         try:
-            left_gripper = ReadOnlyRobotiq2FPosition(left.ip, port=args.left_robotiq_read_port)
-            right_gripper = ReadOnlyRobotiq2FPosition(right.ip, port=args.left_robotiq_read_port)
-            gripper_status = "2F-85 GET POS connected (read-only)"
-        except Exception as exc:
-            if left_gripper is not None: left_gripper.close()
+            grippers = {} if args.no_robot else scene.open_grippers(args)
+        except Exception:
             for receiver in receivers.values(): receiver.disconnect()
-            failed_arm = "right" if left_gripper is not None else "left"
-            raise RuntimeError(
-                f"{failed_arm} 2F-85 GET POS {right.ip if failed_arm == 'right' else left.ip}:"
-                f"{args.left_robotiq_read_port} connection failed: {type(exc).__name__}: {exc}"
-            ) from exc
+            raise
         frame_no = 0
         previous_capture_ns = None
         try:
             source.start()
             stream_info = source.get_stream_info()
             print(json.dumps({"camera_streams": stream_info}, ensure_ascii=False), flush=True)
-            for name, info in source.get_color_calibrations().items():
+            color_info = source.get_color_calibrations()
+            for name, info in color_info.items():
                 # Use actual color-stream intrinsics for the requested resolution.
                 calibrations[name] = CameraCalibration(name, np.asarray(info["intrinsics"]), calibrations[name].camera_to_world,
                                                         info.get("distortion", calibrations[name].distortion),
                                                         info.get("distortion_model", "brown_conrady"))
             for _ in range(max(1, args.warmup_frames)): source.read()
             while not stop.is_set():
-                began = time.perf_counter(); q0 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}; frames = source.read(); captured = frames["front"]; q1 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in (left, right)}
+                began = time.perf_counter()
+                q0 = {a.name: np.asarray(receivers[a.name].getActualQ(), dtype=np.float64) for a in arms}
+                frames = source.read()
+                captured = frames["front"]
+                tcp_states = {a.name: read_rtde_tcp_state(receivers[a.name]) for a in arms}
+                q1 = {name: state.q for name, state in tcp_states.items()}
                 capture_done = time.perf_counter()
                 stamps = [frame.host_timestamp_ns for frame in frames.values()]
                 capture_timestamp_ns = min(stamps)
@@ -1244,17 +1485,15 @@ def main() -> None:
                     raise RuntimeError("Front/side capture skew exceeded the configured limit")
                 robots, robot_col, depths = [], [], []
                 try:
-                    failed_arm = "left"
-                    closing = left_gripper.closing_fraction()
-                    failed_arm = "right"
-                    right_closing = right_gripper.closing_fraction()
+                    gripper_positions, gripper_status = (({}, "无机械臂：仅点云/体素") if args.no_robot
+                                                         else scene.read_grippers(grippers))
                 except Exception as exc:
-                    message = f"error: {failed_arm} gripper GET POS unavailable: {type(exc).__name__}: {exc}"
+                    message = f"error: gripper readback unavailable: {type(exc).__name__}: {exc}"
                     # A partial frame cannot be used for robot masking or
                     # collision checks. Keep polling so a restored read-only
                     # connection can publish a completely new scene.
                     with lock:
-                        latest = {"schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
+                        latest = {"schema": schema, "coordinate_frame": coordinate_frame,
                                   "frame": frame_no, "status": message,
                                   "environment": {"points": [], "colors": []},
                                   "robot": {"points": [], "colors": []}, "obbs": []}
@@ -1262,24 +1501,29 @@ def main() -> None:
                         raise RuntimeError(message) from exc
                     print(f"[model] {message}", file=sys.stderr, flush=True)
                     continue
-                finger_angle, right_finger_angle = .8 * closing, .8 * right_closing
-                gripper_status = f"2F-85 GET POS={closing:.3f}, q={finger_angle:.3f} rad"
-                for arm, color in ((left, np.array((255, 70, 45), np.uint8)), (right, np.array((255, 165, 45), np.uint8))):
+                active_tcp_checks = {}
+                for index, arm in enumerate(arms):
+                    color = np.array((255, 70, 45) if index == 0 else (255, 165, 45), np.uint8)
                     q = (q0[arm.name] + q1[arm.name]) * .5
                     if q.shape != (6,) or not np.isfinite(q).all(): raise RuntimeError(f"{arm.name} invalid RTDE joint state: {q}")
                     arm_points = arm_surface_points(q, arm.base_to_left, samples)
                     # Cross-check the controller TCP against the configured FK
                     # chain; rendering uses the same chain as fixed-point FK.
-                    tcp = np.asarray(receivers[arm.name].getActualTCPPose(), dtype=np.float64)
-                    if tcp.shape != (6,) or not np.isfinite(tcp).all(): raise RuntimeError(f"{arm.name} invalid RTDE TCP pose: {tcp}")
-                    flange_to_tcp = geometry.flange_to_tcp[f"{arm.name}_arm"]
-                    # q1 is closest in time to the TCP read; q is the frame's
-                    # midpoint state used consistently for both mesh surfaces.
-                    validate_active_tcp(q1[arm.name], tcp, flange_to_tcp, arm_name=f"{arm.name}_arm")
-                    closing = (finger_angle if arm.name == left.name else right_finger_angle)/.8
-                    tool_points = tool_surface_points(q, closing, arm.base_to_left, flange_to_tcp)
+                    state = tcp_states[arm.name]
+                    flange_to_tcp = scene.flange_to_tcp[arm.name]
+                    # The validation pair was captured from one RTDE packet,
+                    # before gripper queries and either arm's mesh calculations.
+                    mm, degrees = validate_active_tcp(
+                        state.q, state.tcp, flange_to_tcp, arm_name=f"{arm.name}_arm",
+                        controller_timestamp_s=state.timestamp_s)
+                    active_tcp_checks[f"{arm.name}_arm"] = {
+                        "position_error_mm": mm, "rotation_error_deg": degrees,
+                        "controller_timestamp_s": state.timestamp_s,
+                        "read_seconds": state.read_seconds}
+                    tool_points = scene.tool_points(arm, q, gripper_positions[arm.name])
                     points = np.concatenate((arm_points, tool_points)); robots.append(points); robot_col.append(np.tile(color, (len(points), 1)))
-                robot = np.concatenate(robots); rcol = np.concatenate(robot_col)
+                robot = np.concatenate(robots) if robots else np.empty((0, 3), np.float32)
+                rcol = np.concatenate(robot_col) if robot_col else np.empty((0, 3), np.uint8)
                 geometry_done = time.perf_counter()
                 refined_frames = frames if refiner is None else {f.camera_name: f for f in refiner.refine(tuple(frames.values()), calibrations)}
                 refinement_done = time.perf_counter()
@@ -1291,10 +1535,14 @@ def main() -> None:
                 raw_filter_seconds = 0.
                 for name, raw in frames.items():
                     view = calibrations[name]
-                    rendered = render_surface_points_depth(robot, view.camera_to_world, view.intrinsics,
-                                                           width=raw.rgb.shape[1], height=raw.rgb.shape[0], splat_radius_pixels=3,
-                                                           distortion=view.distortion, distortion_model=view.distortion_model)
-                    raw_keep = robot_depth_keep_mask(raw.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                    if args.robot_mask:
+                        rendered = render_surface_points_depth(robot, view.camera_to_world, view.intrinsics,
+                                                               width=raw.rgb.shape[1], height=raw.rgb.shape[0], splat_radius_pixels=3,
+                                                               distortion=view.distortion, distortion_model=view.distortion_model)
+                        raw_keep = robot_depth_keep_mask(raw.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                    else:
+                        rendered = np.zeros_like(raw.depth_m, dtype=np.float32)
+                        raw_keep = np.ones(raw.depth_m.shape, dtype=bool)
                     raw_keeps[name], rendered_views[name] = raw_keep, rendered
                     filter_began = time.perf_counter()
                     raw_evidence[name] = raw_filters[name].update(
@@ -1309,7 +1557,7 @@ def main() -> None:
                     relative_tolerance=args.raw_depth_relative_tolerance)
                 raw_filter_seconds += time.perf_counter() - filter_began
                 # Rejected returns cannot confirm completion or establish free
-                # rays. Keep their endpoints unknown, even after a free history.
+                # rays. Their endpoints do not create blocking voxels.
                 measured_views = {name: np.where(raw_evidence[name].accepted, frame.depth_m, 0.)
                                   for name, frame in frames.items()}
                 depth_evidence = {}
@@ -1317,44 +1565,46 @@ def main() -> None:
                     view, raw_keep, rendered = calibrations[name], raw_keeps[name], rendered_views[name]
                     evidence = raw_evidence[name]
                     completion_keep = raw_keep & ~evidence.uncertain
-                    raw_support = raw_depth_support_mask(raw.depth_m, completion_keep, args.raw_depth_support_pixels)
                     # Preserve accepted raw values when the model disagrees;
                     # completion must never restore a rejected measured return.
-                    cloud, color = depth_to_world_points(raw, view, stride=args.point_stride, max_depth=2.5, keep_mask=evidence.accepted)
+                    stride = max(1, args.point_stride)
+                    cloud = raw_filters[name].world_points(raw.depth_m, evidence.accepted, view, stride=stride)
+                    color = raw.rgb[::stride, ::stride][evidence.accepted[::stride, ::stride]]
                     if args.occupancy_map:
                         uncertain = raw_filters[name].world_points(raw.depth_m, evidence.uncertain, view)
                         uncertain_clouds.append(uncertain)
                         mapped_raw_clouds.append(raw_filters[name].world_points(raw.depth_m, evidence.accepted, view))
                     measured_clouds.append(cloud)
-                    clouds.append(cloud); colors.append(color); support_pixels += int(raw_support.sum())
+                    clouds.append(cloud); colors.append(color)
                     depth_evidence[name] = {**evidence.diagnostics, "measured_points": len(cloud), "accepted_completion_pixels": 0}
                     if refiner is not None:
+                        raw_support = raw_depth_support_mask(raw.depth_m, completion_keep, args.raw_depth_support_pixels)
+                        support_pixels += int(raw_support.sum())
                         refined = refined_frames[name]
                         refined_keep = robot_depth_keep_mask(
                             refined.depth_m, rendered, absolute_tolerance_m=args.absolute_tolerance_m,
-                            relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels)
+                            relative_tolerance=args.relative_tolerance, dilation_pixels=args.dilation_pixels) if args.robot_mask else raw_keep
                         completion, completion_evidence = verified_completion_depth(
                             raw.depth_m, refined.depth_m, completion_keep, refined_keep, view,
                             [(calibrations[other], depth) for other, depth in measured_views.items() if other != name],
                             support_pixels=args.raw_depth_support_pixels,
                             absolute_tolerance_m=args.completion_absolute_tolerance_m,
                             relative_tolerance=args.completion_relative_tolerance)
-                        extra, extra_color = depth_to_world_points(
-                            replace(raw, depth_m=completion), view, stride=args.point_stride,
-                            max_depth=2.5, keep_mask=completion > 0)
+                        extra_keep = (completion > 0) & (completion <= 2.5) & np.isfinite(completion)
+                        extra = raw_filters[name].world_points(completion, extra_keep, view, stride=stride)
+                        extra_color = raw.rgb[::stride, ::stride][extra_keep[::stride, ::stride]]
                         clouds.append(extra); colors.append(extra_color)
                         completion_clouds.append(extra)
                         depth_evidence[name].update(completion_evidence, completion_points=len(extra))
-                    v, u = np.nonzero(~raw_keep & (raw.depth_m > 0))
-                    pixels = np.c_[u, v][::max(1, args.point_stride)]
-                    observed, visible = _lift_measured_tracks(raw.depth_m, rendered, pixels, np.ones(len(pixels), bool), view, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance)
-                    measured_surface.append(observed[visible])
+                    if args.robot_mask:
+                        v, u = np.nonzero(~raw_keep & (raw.depth_m > 0))
+                        pixels = np.c_[u, v][::stride]
+                        observed, visible = _lift_measured_tracks(raw.depth_m, rendered, pixels, np.ones(len(pixels), bool), view, absolute_tolerance_m=args.absolute_tolerance_m, relative_tolerance=args.relative_tolerance)
+                        measured_surface.append(observed[visible])
                 full_env, full_ecol = np.concatenate(clouds), np.concatenate(colors)
-                surface_points = np.concatenate(measured_surface)
+                surface_points = np.concatenate(measured_surface) if measured_surface else np.empty((0, 3), np.float32)
                 point_cloud_done = time.perf_counter()
-                left_mask, right_mask, arm_workspace_mask = dual_arm_workspace_masks(
-                    full_env, args.workspace_bounds, right_workspace_bounds, right.base_to_left,
-                )
+                left_mask, right_mask, arm_workspace_mask = scene.workspace_masks(full_env)
                 raw_env = np.concatenate(measured_clouds)
                 local = raw_env[points_in_bounds(raw_env, args.workspace_bounds)]
                 normal, offset = table_prior.update(local, calibration.camera_to_world[:3, 3])
@@ -1369,20 +1619,21 @@ def main() -> None:
                 viewer_extra_count = int((~arm_workspace_mask & table_band).sum())
                 scene_analysis_done = time.perf_counter()
                 map_snapshot = None
+                native_view = None
+                voxblox_view = None
                 backend_diagnostics = {}
                 if args.occupancy_map:
-                    backend = "probabilistic_voxels"
+                    backend = {"numpy":"probabilistic_voxels", "octomap":"octomap", "voxblox":"voxblox"}[args.occupancy_backend]
                     if occupancy_grid is None:
                         occupancy_grid = workspace_occupancy_grid(
-                            normal, offset, [(args.workspace_bounds, np.eye(4)),
-                                             (right_workspace_bounds, right.base_to_left)],
+                            normal, offset, scene.workspace_regions,
                             resolution_m=args.occupancy_resolution_m,
                             min_height_m=args.min_height_m, max_height_m=args.max_height_m,
                             hit_probability=args.occupancy_hit_probability,
                             miss_probability=args.occupancy_miss_probability,
                             free_probability=args.occupancy_free_probability,
-                            clear_frames=args.obb_removal_confirm_frames,
-                            free_ttl_s=args.occupancy_free_ttl_s)
+                            free_ttl_s=args.occupancy_free_ttl_s, **grid_settings)
+                        occupancy_grid.coordinate_frame = coordinate_frame
                     integrate_depth_views(
                         occupancy_grid,
                         [(calibrations[name], raw.depth_m, raw_evidence[name].accepted, rendered_views[name])
@@ -1392,20 +1643,28 @@ def main() -> None:
                         free_margin_m=args.occupancy_free_margin_m,
                         uncertain_hits=np.concatenate(uncertain_clouds))
                     map_update_done = time.perf_counter()
-                    # Do not remerge inflated tiles across empty gaps.
-                    map_boxes = occupancy_grid.boxes(tile_voxels=args.occupancy_box_tile_voxels)
-                    boxes = [expanded_obb(box, args.box_margin_m) for box in map_boxes]
+                    # Preserve occupied-cell boundaries without dilation or
+                    # merging across empty cells.
+                    boxes = occupancy_grid.boxes(tile_voxels=args.occupancy_box_tile_voxels)
                     map_boxes_done = time.perf_counter()
                     map_snapshot = occupancy_grid.snapshot()
-                    unknown_obstacles = occupancy_grid.unknown_obstacles
+                    map_encoded_done = time.perf_counter()
+                    if args.occupancy_backend == "octomap":
+                        native_view = occupancy_grid.viewer_payload(max_leaves=args.octomap_view_max_leaves)
+                    elif args.occupancy_backend == "voxblox":
+                        voxblox_view = occupancy_grid.freeze_view(max_voxels=args.voxblox_view_max_voxels)
+                    map_view_done = time.perf_counter()
+                    unknown_obstacles = []
                     unstable_reasons = []
                     backend_diagnostics = {
                         "mapped_occupied_voxels": len(occupancy_grid.current_hits),
                         "occupancy": {**occupancy_grid.diagnostics, **{key: map_snapshot[key] for key in
-                                      ("unknown_voxels", "free_voxels", "occupied_voxels", "historical_unknown_voxels")}},
+                                      ("free_voxels", "occupied_voxels")}},
                         "occupancy_update_seconds": map_update_done - scene_analysis_done,
                         "occupancy_boxes_seconds": map_boxes_done - map_update_done,
-                        "occupancy_encode_seconds": time.perf_counter() - map_boxes_done,
+                        "occupancy_encode_seconds": map_encoded_done - map_boxes_done,
+                        "octomap_view_seconds": map_view_done - map_encoded_done if native_view is not None else 0.,
+                        "voxblox_view_seconds": map_view_done - map_encoded_done if voxblox_view is not None else 0.,
                         "expired_obbs": 0, "large_overlap_merges": 0,
                     }
                 else:
@@ -1432,24 +1691,28 @@ def main() -> None:
                                            "supplemental_obbs": supplemental, "expired_obbs": obstacle_gate.expired_tracks,
                                            "large_overlap_merges": before_merge-len(boxes)}
                 box_tracking_done = time.perf_counter()
-                _, _, measured_workspace = dual_arm_workspace_masks(
-                    raw_env, args.workspace_bounds, right_workspace_bounds, right.base_to_left)
+                _, _, measured_workspace = scene.workspace_masks(raw_env)
                 if int(measured_workspace.sum()) < 80:
                     unknown_obstacles.append({"state": "unknown", "reason": "insufficient_measured_workspace_depth"})
                 frame_no += 1
-                qdelta = max(float(np.max(np.abs(q1[a.name]-q0[a.name]))) for a in (left,right))
-                diagnostics = {**backend_diagnostics, "occupancy_map_enabled": args.occupancy_map, "environment_points": int(len(env)), "left_workspace_points": int((left_mask & table_band).sum()), "right_workspace_points": int((right_mask & table_band).sum()), "viewer_outside_workspace_points": viewer_extra_count, "published_obbs": len(boxes), "safety_obbs_cover_candidates": True, "obb_unstable_reasons": unstable_reasons, "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": support_pixels, "table_normal_left_base": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else "raw-d455", "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
+                qdelta = max((float(np.max(np.abs(q1[a.name]-q0[a.name]))) for a in arms), default=0.)
+                diagnostics = {**backend_diagnostics, "occupancy_map_enabled": args.occupancy_map, "environment_points": int(len(env)), "left_workspace_points": int((left_mask & table_band).sum()), "right_workspace_points": int((right_mask & table_band).sum()), "viewer_outside_workspace_points": viewer_extra_count, "published_obbs": len(boxes), "safety_obbs_cover_candidates": True, "obb_unstable_reasons": unstable_reasons, "raw_depth_support_pixels": args.raw_depth_support_pixels, "raw_depth_supported_pixels": support_pixels, f"table_normal_{coordinate_frame}": normal.astype(float).tolist(), "table_offset_m": float(offset), "depth_refinement": "lingbot-depth" if refiner is not None else scene.raw_depth_label, "depth_refinement_seconds": float(refiner.last_inference_seconds) if refiner is not None else 0.0}
                 diagnostics["obb_point_change_distance_m"] = args.obb_point_change_distance_m
                 diagnostics["table_prior"] = table_prior.diagnostics
                 diagnostics["depth_evidence"] = depth_evidence
                 diagnostics["raw_depth_filter_seconds"] = raw_filter_seconds
+                diagnostics["robot_mask_enabled"] = args.robot_mask
+                diagnostics["robot_connected"] = not args.no_robot
+                diagnostics["active_tcp_checks"] = active_tcp_checks
+                diagnostics["acquisition_worker_state"] = "running"
+                diagnostics["occupancy_backend"] = args.occupancy_backend if args.occupancy_map else None
                 diagnostics["unknown_obstacles"] = len(unknown_obstacles)
                 diagnostics["obb_point_change_fraction"] = args.obb_point_change_fraction
                 diagnostics["obb_change_confirm_frames"] = args.obb_change_confirm_frames
                 diagnostics["obb_history_frames"] = args.obb_history_frames
                 diagnostics["obb_removal_confirm_frames"] = args.obb_removal_confirm_frames
                 diagnostics["obb_merge_overlap_ratio"] = args.obb_merge_overlap_ratio
-                diagnostics["box_margin_m"] = args.box_margin_m
+                diagnostics["box_margin_m"] = 0. if args.occupancy_map else args.box_margin_m
                 diagnostics["capture_seconds"] = capture_done - began
                 diagnostics["frame_interval_seconds"] = frame_interval_seconds
                 diagnostics["robot_geometry_seconds"] = geometry_done - capture_done
@@ -1458,9 +1721,10 @@ def main() -> None:
                 diagnostics["scene_analysis_seconds"] = scene_analysis_done - point_cloud_done
                 diagnostics["box_tracking_seconds"] = box_tracking_done - scene_analysis_done
                 refinement = f" · LingBot {refiner.last_inference_seconds:.2f}s" if refiner is not None else ""
+                robot_status = "" if args.no_robot else f" · {scene.robot_label} qΔ {qdelta:.4f} rad"
                 snapshot_build_began = time.perf_counter()
                 snapshot = {
-                    "schema": "dual_ur7e_obstacle_snapshot_v2", "coordinate_frame": "left_base",
+                    "schema": schema, "coordinate_frame": coordinate_frame, "mode": mode,
                     "frame": frame_no, "host_timestamp_ns": int(min(stamps)),
                     "scene_observation_state": "unknown" if unknown_obstacles else "observed",
                     "unknown_obstacles": unknown_obstacles,
@@ -1468,11 +1732,11 @@ def main() -> None:
                     "obstacle_backend": backend,
                     "status": ("error: unknown obstacle space" if unknown_obstacles else
                                f"error: unstable obstacle point clusters ({', '.join(unstable_reasons)})" if unstable_reasons else
-                               f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status} · 双臂 qΔ {qdelta:.4f} rad · {len(boxes)} 个障碍框"),
-                    "qpos": {a.name: ((q0[a.name] + q1[a.name]) * .5).astype(float).tolist() for a in (left, right)},
-                    "gripper_position": {"left": float(finger_angle / .8), "right": float(right_finger_angle / .8)},
-                    "surface_source": "measured_depth_fk_gated",
-                    "camera_names": ["front", "side"],
+                               f"{time.perf_counter()-began:.2f}s{refinement} · {gripper_status}{robot_status} · {len(boxes)} 个障碍框"),
+                    "qpos": {a.name: ((q0[a.name] + q1[a.name]) * .5).astype(float).tolist() for a in arms},
+                    "gripper_position": gripper_positions,
+                    "surface_source": "unavailable" if args.no_robot else "measured_depth_fk_gated",
+                    "camera_names": list(calibrations),
                     "_display_data": SnapshotDisplay(env, ecol, full_env, full_ecol, table_band,
                                                      robot, rcol, surface_points, captured.rgb.copy(),
                                                      args.display_max_points),
@@ -1481,13 +1745,19 @@ def main() -> None:
                         "half_sizes": (b.extents * .5).astype(float).tolist(), "corners":b.corners.astype(float).tolist(),
                         ("voxel_count" if args.occupancy_map else "point_count"): int(b.point_count), "geometry_source": backend,
                     } for b in boxes],
-                    "calibration": report, "camera_streams": stream_info, "diagnostics": diagnostics,
+                    "calibration": report, "camera_streams": stream_info,
+                    "camera_color_calibrations": color_info, "diagnostics": diagnostics,
                 }
                 if map_snapshot is not None:
                     snapshot["occupancy_map"] = map_snapshot
-                    snapshot["_manual_frames"] = {
-                        name: rgb_manual_frame(raw, calibrations[name], raw_evidence[name].accepted)
-                        for name, raw in frames.items()}
+                    if native_view is not None:
+                        snapshot["_octomap_view"] = native_view
+                    if voxblox_view is not None:
+                        snapshot["_voxblox_view"] = voxblox_view
+                    if scene.manual_selection:
+                        snapshot["_manual_frames"] = {
+                            name: rgb_manual_frame(raw, calibrations[name], raw_evidence[name].accepted)
+                            for name, raw in frames.items()}
                 # Capture age is the safety boundary; publication must never
                 # replace it with a new timestamp for already processed data.
                 snapshot["published_timestamp_ns"] = time.monotonic_ns()
@@ -1503,7 +1773,11 @@ def main() -> None:
                     break
         finally:
             cleanup = [source.stop, *(receiver.disconnect for receiver in receivers.values())]
-            cleanup.extend(gripper.close for gripper in (left_gripper, right_gripper) if gripper is not None)
+            cleanup.extend(gripper.close for gripper in grippers.values())
+            if args.octomap_output is not None and occupancy_grid is not None and occupancy_grid.frame:
+                cleanup.append(lambda: occupancy_grid.export(args.octomap_output, coordinate_frame=coordinate_frame))
+            if args.voxblox_output is not None and occupancy_grid is not None and occupancy_grid.frame:
+                cleanup.append(lambda: occupancy_grid.export(args.voxblox_output, coordinate_frame=coordinate_frame))
             errors = []
             for close in cleanup:
                 try: close()
@@ -1519,14 +1793,21 @@ def main() -> None:
             process()
         except Exception as exc:
             message = f"error: {type(exc).__name__}: {exc}"
+            failure_diagnostics = {"acquisition_worker_state": "failed"}
+            check = getattr(exc, "active_tcp_check", None)
+            if check is not None:
+                failure_diagnostics["active_tcp_checks"] = {check["arm"]: check}
             # Also catch receiver/gripper initialization failures. Never leave
             # a dead worker reporting initializing or old obstacle geometry.
             with lock:
-                latest = {"schema": "dual_ur7e_obstacle_snapshot_v2",
-                          "coordinate_frame": "left_base", "frame": latest.get("frame", 0),
+                latest = {"schema": schema,
+                          "coordinate_frame": coordinate_frame, "frame": latest.get("frame", 0),
                           "status": message, "environment": {"points": [], "colors": []},
-                          "robot": {"points": [], "colors": []}, "obbs": []}
+                          "robot": {"points": [], "colors": []}, "obbs": [],
+                          "failed_timestamp_ns": time.monotonic_ns(), "diagnostics": failure_diagnostics}
             print(f"[model] {message}", file=sys.stderr, flush=True)
+            if check is not None:
+                print(json.dumps({"active_tcp_failure": check}), file=sys.stderr, flush=True)
 
     worker = threading.Thread(target=guarded_process, daemon=True)
     if args.once:
@@ -1551,6 +1832,9 @@ def main() -> None:
             path = urlsplit(self.path).path
             if path not in ("/manual-obstacles/capture", "/manual-obstacles/select"):
                 self.send_json({"error": "Unknown endpoint"}, 404)
+                return
+            if not scene.manual_selection:
+                self.send_json({"error": "Manual selection is unavailable for this scene"}, 400)
                 return
             # Reject cross-origin browser writes to a local annotation service.
             origin = self.headers.get("Origin")
@@ -1578,6 +1862,9 @@ def main() -> None:
 
         def do_GET(self):
             path = urlsplit(self.path).path
+            if path == "/manual-obstacles/config.json":
+                self.send_json(manual_store.configuration())
+                return
             if path in ("/manual-obstacles", "/manual-obstacles/"):
                 payload = (REPO_ROOT / "real_scripts/manual_obstacle_annotation.html").read_bytes()
                 self.send_response(200)
@@ -1588,7 +1875,13 @@ def main() -> None:
                 return
             if path == "/manual-obstacles/scene.json":
                 try:
-                    self.send_json(manual_store.scene_payload())
+                    snapshot = manual_store.scene_payload()
+                    query = parse_qs(urlsplit(self.path).query)
+                    groups = query.get("ellipsoids", [""])[0].split(",")
+                    if any(g in groups for g in ("robot", "obstacles")):
+                        snapshot = ellipsoid_overlay.attach(snapshot, groups=groups, frozen=True,
+                                                            filtered=query.get("manual_filter") == ["1"])
+                    self.send_json(snapshot)
                 except ValueError as exc:
                     self.send_json({"error": str(exc)}, 400)
                 return
@@ -1602,8 +1895,34 @@ def main() -> None:
                 query = parse_qs(urlsplit(self.path).query)
                 compact = query.get("compact") == ["1"]
                 viewer = query.get("viewer") == ["1"]
+                render_only = viewer and not compact and query.get("render") == ["1"]
+                ellipsoid_groups = query.get("ellipsoids", [""])[0].split(",") if viewer and not compact else []
+                filtered = viewer and not compact and query.get("manual_filter") == ["1"]
                 response_began = time.perf_counter()
-                data = snapshot_payload(snapshot, compact=compact, viewer=viewer)
+                def revision_token(annotation_revision):
+                    return json.dumps([snapshot.get("frame"), snapshot.get("host_timestamp_ns"),
+                                       snapshot.get("status"), filtered, annotation_revision, ellipsoid_groups], separators=(",", ":"))
+                if render_only:
+                    with manual_store.lock:
+                        annotation_revision = manual_store.revision if filtered else None
+                    token = revision_token(annotation_revision)
+                    if query.get("after") == [token]:
+                        self.send_response(204)
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        return
+                if filtered:
+                    snapshot = {**snapshot, "viewer_filter": manual_store.viewer_filter(
+                        snapshot, tile_voxels=args.occupancy_box_tile_voxels)}
+                    snapshot["manual_revision"] = snapshot["viewer_filter"]["revision"]
+                    if render_only:
+                        token = revision_token(snapshot["manual_revision"])
+                if render_only:
+                    snapshot = {**snapshot, "viewer_revision": token}
+                if any(g in ellipsoid_groups for g in ("robot", "obstacles")):
+                    snapshot = ellipsoid_overlay.attach(snapshot, groups=ellipsoid_groups, filtered=filtered)
+                data = snapshot_payload(snapshot, compact=compact, viewer=viewer,
+                                        render_only=render_only)
                 if "gzip" in self.headers.get("Accept-Encoding", ""):
                     data = gzip.compress(data, compresslevel=1); compressed = True
                 else: compressed = False
@@ -1614,7 +1933,24 @@ def main() -> None:
             if self.path.startswith("/plotly.min.js"):
                 import plotly
                 payload = (Path(plotly.__file__).resolve().parent / "package_data" / "plotly.min.js").read_bytes(); self.send_response(200); self.send_header("Content-Type", "application/javascript"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload); return
-            payload = VIEWER_HTML.encode(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+            if path == "/octomap-viewer.js":
+                payload = (REPO_ROOT / "real_scripts/octomap_viewer.js").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if path in ("/voxblox-viewer.js", "/ellipsoid-viewer.js"):
+                script = "ellipsoid_viewer.js" if path == "/ellipsoid-viewer.js" else "voxblox_viewer.js"
+                payload = (REPO_ROOT / "real_scripts" / script).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            payload = scene.viewer_html.encode(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
         def log_message(self, *_): pass
     server = ThreadingHTTPServer((args.bind_host, args.port), Handler); url = f"http://127.0.0.1:{args.port}"; print(f"[model] {url}  (Ctrl+C to stop)")
     try:

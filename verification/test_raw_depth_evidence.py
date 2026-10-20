@@ -7,7 +7,7 @@ from real_scripts.obstacle_observation import verified_completion_depth
 from real_scripts.probabilistic_obstacle_map import integrate_depth_views
 from real_scripts.raw_depth_evidence import RawDepthEvidenceFilter, confirm_raw_depth_views
 from real_scripts.real_robot_adapter import CameraCalibration
-from safety_module.occupancy import FREE, OCCUPIED, UNKNOWN, LocalOccupancyGrid, ObservationGrid
+from safety_module.occupancy import FREE, OCCUPIED, LocalOccupancyGrid, ObservationGrid
 
 
 def camera(name="front", focal=500., transform=None):
@@ -76,7 +76,8 @@ def test_three_pixel_object_is_accepted_without_a_cluster_size_gate():
     assert filtered(depth).accepted.sum() == 3
 
 
-def test_full_pixel_endpoint_lifting_preserves_a_tiny_surface_with_distortion_and_extrinsics():
+@pytest.mark.parametrize("stride", [1, 2, 3])
+def test_full_pixel_endpoint_lifting_preserves_a_tiny_surface_with_distortion_and_extrinsics(stride):
     from real_scripts.real_robot_adapter import RGBDFrame, depth_to_world_points
     depth = np.zeros((21, 21), np.float32)
     depth[10, 10:12], depth[11, 10] = .7, .7
@@ -85,10 +86,11 @@ def test_full_pixel_endpoint_lifting_preserves_a_tiny_surface_with_distortion_an
     view = CameraCalibration("front", camera().intrinsics, transform, [.1, -.05, .002, -.001, .01])
     processor = RawDepthEvidenceFilter()
     evidence = filtered(depth, processor=processor, view=view)
-    actual = processor.world_points(depth, evidence.accepted, view)
+    actual = processor.world_points(depth, evidence.accepted, view, stride=stride)
     frame = RGBDFrame("front", np.zeros((21, 21, 3), np.uint8), depth, host_timestamp_ns=1)
-    expected, _ = depth_to_world_points(frame, view, stride=1, keep_mask=evidence.accepted)
-    assert len(actual) == 3
+    expected, _ = depth_to_world_points(frame, view, stride=stride, keep_mask=evidence.accepted)
+    if stride == 1:
+        assert len(actual) == 3
     np.testing.assert_allclose(actual, expected, atol=1e-7)
 
 
@@ -194,13 +196,12 @@ def test_noise_only_frame_supplies_neither_obbs_nor_free_rays():
     integrate_depth_views(target, [(camera(), depth, evidence.accepted, np.zeros_like(depth))], [], [],
                           uncertain_hits=[[0., 0., .7]], timestamp_ns=1, ray_stride=1)
     assert not target.boxes()
-    assert np.all(target.states() == UNKNOWN)
+    assert np.all(target.states() == FREE)
     assert target.diagnostics["raw_free_voxels"] == 0
     assert target.diagnostics["uncertain_raw_voxels"] == 1
-    assert not target.unknown_obstacles  # Never confirmed as an obstacle.
 
 
-def test_uncertain_endpoint_revokes_free_belief_and_vetoes_free_rays_and_completion():
+def test_uncertain_endpoint_vetoes_free_evidence_and_completion_without_blocking():
     target = LocalOccupancyGrid([0., 0., 0.], np.eye(3), [4, 4, 4], .1)
     point = [[.15, .15, .15]]
     ids = target.point_ids(point)
@@ -208,24 +209,22 @@ def test_uncertain_endpoint_revokes_free_belief_and_vetoes_free_rays_and_complet
         target.update(timestamp_ns=stamp, raw_hits=[], free_ids=ids)
     assert target.states()[ids[0]] == FREE
     target.update(timestamp_ns=8, raw_hits=[], free_ids=ids, completion_hits=point, uncertain_hits=point)
-    assert target.states()[ids[0]] == UNKNOWN
+    assert target.states()[ids[0]] == FREE
     assert target.sources[ids[0]] == 8
-    assert target.free_streak[ids[0]] == 0
-    assert not target.boxes() and not target.unknown_obstacles
+    assert not target.boxes()
     observation = ObservationGrid(target.snapshot())
-    assert not observation.segments_observed([[.12, .15, .15]], [[.18, .15, .15]], now_ns=8)
+    assert observation.segments_observed([[.12, .15, .15]], [[.18, .15, .15]], now_ns=8)
     # A new valid raw hit is immediately authoritative over uncertainty.
     target.update(timestamp_ns=9, raw_hits=point, free_ids=ids, uncertain_hits=point)
     assert target.states()[ids[0]] == OCCUPIED
     assert len(target.boxes()) == 1
-    # A confirmed obstacle that now has insufficient evidence keeps its hazard,
-    # but never its geometry. Further speckles cannot clear the historical hazard.
+    # Rejected returns do not preserve a disappeared obstacle or its geometry.
     for stamp in range(10, 15):
         target.update(timestamp_ns=stamp, raw_hits=[], free_ids=ids, uncertain_hits=point)
-        assert target.unknown_obstacles and not target.boxes()
+        assert target.states()[ids[0]] == FREE and not target.boxes()
     for stamp in range(15, 18):
         target.update(timestamp_ns=stamp, raw_hits=[], free_ids=ids)
-    assert target.states()[ids[0]] == FREE and not target.unknown_obstacles
+    assert target.states()[ids[0]] == FREE
 
 
 @pytest.mark.parametrize("kwargs", [{"neighbor_distance_m": 0.}, {"max_gap_s": np.nan},

@@ -1,0 +1,43 @@
+schema_version: 1
+scene: ur7e_single_pika
+coordinate_frame: ur_base
+
+robot:
+  ip: 192.168.124.73
+  tool: pika_gripper
+  active_tcp_calibration: configs/hardware/single_pika/active_tcp.json
+  pika_geometry: configs/hardware/single_pika/pika_geometry.json
+  # This installation reuses the historical single-arm Pika mount and finger model.
+  pika_geometry_mode: legacy_inherited
+  pika_collision_dir: assets/robot_models/pika_gripper/collision
+  # Identified as Gripper from motor telemetry; use "auto" to rediscover after hardware changes.
+  gripper_port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+  gripper_max_state_age_s: 0.25
+
+cameras:
+  front:
+    serial: '405622074939'
+    calibration: configs/hardware/single_pika/front_camera.json
+  wrist:
+    serial: '260522276066'
+    # Wrist is attached to the moving tool; never use a fixed base extrinsic.
+    use_for_reconstruction: false
+reconstruction_cameras: [front]
+
+# Same physical board as the installed dual-arm calibration.
+calibration_board:
+  squares_x: 11
+  squares_y: 8
+  square_length_m: 0.07
+  marker_length_m: 0.052
+  dictionary: DICT_5X5_100
+  # Matches the board printed for the OpenCV 4.5 dual-arm workflow.
+  legacy_pattern: true
+  max_reprojection_rms_px: 0.8
+  max_probe_rms_m: 0.005
+  max_camera_spread_mm: 3.0
+  max_board_motion_mm: 5.0
+  max_board_motion_deg: 2.0
+
+safety:
+  max_camera_skew_s: 0.10

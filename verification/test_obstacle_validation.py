@@ -55,7 +55,7 @@ def test_rrt_finds_checked_detour_instead_of_stop():
     np.testing.assert_allclose(route[-1], path.q[-1])
 
 
-def test_planning_freezes_observation_time_but_execution_rechecks_expiry():
+def test_planning_and_execution_allow_aged_free_voxels():
     captured = time.monotonic_ns() - 3_000_000_000
     grid = LocalOccupancyGrid([-.5, -.5, -.5], np.eye(3), [20, 20, 20], .05)
     free = np.arange(grid.size)
@@ -68,7 +68,7 @@ def test_planning_freezes_observation_time_but_execution_rechecks_expiry():
                                observation_now_ns=captured+500_000_000)
     execution = CollisionChecker(TwoPointSampler(), np.zeros(2), boxes)
     assert planner.edge_safe(start, end)
-    assert not execution.edge_safe(start, end)
+    assert execution.edge_safe(start, end)
 
 
 def test_segment_margin_matches_euclidean_clearance_at_box_corners():
@@ -195,7 +195,7 @@ def test_startup_wait_reads_new_capture_and_requests_compact_payload(monkeypatch
     assert parse_qs(urlsplit(requests[0]).query) == {"session": ["7"], "compact": ["1"]}
 
 
-def test_expired_free_wait_requires_a_new_capture_even_if_old_snapshot_is_fresh(monkeypatch):
+def test_requested_new_capture_wait_does_not_reuse_old_fresh_snapshot(monkeypatch):
     import io
     import json
     import obstacle_validation.runtime as runtime

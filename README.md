@@ -1,69 +1,121 @@
 # Surface Action Model
 
-基于 OpenPI PI0.5 的双臂动作与表面点联合预测项目。模型由 RGB、任务文本和机器人状态生成动作及未来表面点；在线运行时结合双视角深度、障碍物地图、CBF-QP 和 FK 轨迹复核。方法类为 `SurfaceActionModelPytorch`。
+双 UR7e + Robotiq 2F-85：PI0.5 预测动作与机器人表面点，RGB-D 感知提供障碍物地图。
+所有命令在仓库根目录执行，示例中的数据路径按实际文件替换。
 
-## 安装
+## 1. 环境配置
 
-使用 Python 3.11，在仓库根目录创建独立的策略和感知环境：
+Python 3.11，策略与感知分别安装：
 
 ```bash
 conda create -n surface-policy python=3.11 -y
 conda run -n surface-policy bash -c 'cd requirements && python -m pip install -r policy.txt'
 conda create -n surface-runtime python=3.11 -y
-conda run -n surface-runtime bash -c 'cd requirements && python -m pip install -r runtime.txt'
 conda run -n surface-runtime bash -c 'cd requirements && python -m pip install -r preprocess.txt'
-conda run -n surface-runtime python -m pip install --no-deps -e ./lingbot-depth
 ```
 
-原始 HDF5 预处理还需准备 CoTracker 源码与权重。在线感知需要 RealSense 驱动与 USB 权限；连接机械臂需要 UR 网络。依赖、标定和硬件说明见[实现与运行细节](docs/IMPLEMENTATION_GUIDE.md)。
+回放还需 LeRobot、OSQP 和原生 Voxblox；安装命令见[环境与数据准备](docs/IMPLEMENTATION_GUIDE.md#环境)。
+后文训练/策略服务使用 `surface-policy`；感知、预处理、回放使用 `surface-runtime`。
+标定环境与采集入口见[标定说明](docs/CALIBRATION.md)。
 
-## 快速使用
+## 2. 训练
 
-以下命令从仓库根目录执行。先按[数据预处理流程](docs/IMPLEMENTATION_GUIDE.md#数据预处理)将录制数据生成到 `outputs/surface_action/`，并准备 PI0.5 基础权重。HDF5 深度必须符合[已对齐深度契约](docs/QUEST3_DEPTH_ALIGNMENT.md)。
-如需包含四路 RGB、CoTracker 点及后续 front/side RGB OBB 标注的标准 LeRobot 数据集，
-使用[单独导出流程](docs/QUEST3_DEPTH_ALIGNMENT.md#四视角-lerobot-训练数据导出)；下方 PI0.5 训练命令仍直接读取 shard。
+先按[数据预处理](docs/IMPLEMENTATION_GUIDE.md#数据预处理)生成 `outputs/surface_action/`，
+准备 `outputs/pretrained/pi05_base_pytorch/model.safetensors`。
 
-1. 验证数据并训练模型：
+```bash
+conda activate surface-policy
+python scripts/train_pi05_ur7e_surface_pytorch.py \
+  --dataset outputs/surface_action --output outputs/models/surface_action.pt
+```
 
-   ```bash
-   conda run -n surface-policy python scripts/train_pi05_ur7e_surface_pytorch.py \
-     --dataset outputs/surface_action --output outputs/models/surface_action.pt --validate-only
+默认读取项目配置中的 PI0.5 权重，batch size 为 1、bfloat16、每帧最多 128 个点。
+只检查数据加 `--validate-only`；[三头模型训练](docs/PI05_DETECTION_EXPERT.md)。
 
-   conda run -n surface-policy python scripts/train_pi05_ur7e_surface_pytorch.py \
-     --dataset outputs/surface_action --output outputs/models/surface_action.pt \
-     --pretrained outputs/pretrained/pi05_base_pytorch/model.safetensors \
-     --max-points 128 --batch-size 1 --precision bfloat16
-   ```
+## 3. 推理
 
-2. 启动策略服务：
+策略机启动服务：
 
-   ```bash
-   conda run -n surface-policy python scripts/serve_quest3_pi05_safety.py \
-     --checkpoint outputs/models/surface_action.pt --device cuda --port 8000
-   ```
+```bash
+conda activate surface-policy
+python scripts/serve_quest3_pi05_safety.py --checkpoint outputs/models/surface_action.pt
+```
 
-3. 完成[双臂双视角标定](docs/CALIBRATION.md)并核对硬件后，在测试端分别启动感知、可视化和一次默认 dry-run 执行：
+控制机分别在两个终端运行：
 
-   ```bash
-   conda run -n surface-runtime python real_scripts/live_obstacle_detection.py --no-browser
-   conda run -n surface-runtime python real_scripts/live_obstacle_detection_viewer.py
-   conda run -n surface-runtime python real_scripts/run_ur7e_vla_safety_executor.py \
-     --prompt "manipulate the tabletop instruments safely" --once
-   ```
+```bash
+conda activate surface-runtime
+# 终端 A：为默认 visual-point 模型提供实测表面点
+python real_scripts/live_obstacle_detection.py --robot-mask --no-browser
+# 终端 B：推理一次，默认不发送运动
+python real_scripts/run_ur7e_vla_safety_executor.py --prompt "抓取器械并放入托盘" --once
+```
 
-   三条命令分别占用终端。物理执行需额外的 `--execute` 和精确确认串；当前标定接入已完成离线校验，受控实机验收尚未进行。操作细节见[实现与运行细节](docs/IMPLEMENTATION_GUIDE.md#在线运行)。
+服务默认端口 `8000`，策略机地址在 `configs/ur7e_dual_quest3.yaml` 的 `safety.policy_host` 配置；
+也可给执行器传 `--policy-host IP`。连续运行去掉 `--once`。
+实机执行参数及夹爪开关见[在线运行](docs/IMPLEMENTATION_GUIDE.md#在线运行)。
 
-## 常见问题
+## 4. 标定
 
-- **安装或依赖冲突**：策略与感知使用独立环境；ChArUco 需用同版本 `opencv-contrib-python` 替代普通 OpenCV wheel。见[环境说明](docs/IMPLEMENTATION_GUIDE.md#环境)。
-- **HDF5 深度被拒绝**：确认采集端保存的是 RGB 对齐深度，尺寸及 topic/属性与录制 RGB 一致；原生深度不能交给该预处理入口。见[Quest3 已对齐深度契约](docs/QUEST3_DEPTH_ALIGNMENT.md)。
-- **感知启动失败或 TCP 校验报错**：核对相机实际流配置、USB 连接、双臂 active TCP 与固定表面 FK 配置。见[在线运行与诊断](docs/IMPLEMENTATION_GUIDE.md#在线运行)。
-- **快照过期或检测帧率低**：查看 `snapshot.json?compact=1` 的 `diagnostics` 和采集到发布耗时，再按[实时感知说明](real_scripts/README.md)排查。
-- **默认没有物理动作**：执行器默认 dry-run；验收与执行条件见[在线运行](docs/IMPLEMENTATION_GUIDE.md#在线运行)。
+在 `surface-runtime` 环境中核验现有标定及当前活动 TCP：
 
-## 详细文档
+```bash
+python scripts/validate_project_pipeline.py
+python real_scripts/read_dual_active_tcp_calibration.py
+```
 
-- [实现与运行细节](docs/IMPLEMENTATION_GUIDE.md)：硬件、环境、预处理、训练、在线运行与诊断。
-- [标定](docs/CALIBRATION.md) · [原生深度对齐](docs/QUEST3_DEPTH_ALIGNMENT.md) · [批量障碍物标注](docs/BATCH_OBSTACLE_ANNOTATION.md)
-- [实时感知](real_scripts/README.md) · [无模型障碍物验证](docs/MODEL_FREE_OBSTACLE_VALIDATION.md)
-- [代码审查状态](VLAsafe_CODE_REVIEW.md) · [历史入口](docs/legacy/INDEX.md)
+项目配置：`configs/ur7e_dual_quest3.yaml`；标定目录：`configs/hardware/calibration/`。
+[重新采集双臂双视角标定](docs/CALIBRATION.md) · [单臂 Pika 标定](docs/SINGLE_UR7E_PIKA.md)。
+
+## 5. 障碍可视化
+
+```bash
+conda activate surface-runtime
+python real_scripts/live_obstacle_detection.py
+```
+
+自动打开 <http://127.0.0.1:8766>。只看重建、不连接机器人加 `--no-robot`；
+Voxblox 地图加 `--occupancy-backend voxblox`。
+
+| 按键 | 操作 |
+| --- | --- |
+| B | 体素筛选，默认关闭 |
+| O / L | 障碍椭球 / 连杆椭球，默认关闭 |
+| V / R | 体素框 / 机械臂显示 |
+| 空格 | 暂停 / 继续显示 |
+
+B 关闭时，障碍椭球使用全部当前占据体素；B 开启时，仅使用筛选体素。
+双臂启动时加载 `outputs/manual_obstacles/` 下目录修改时间最新的 `annotations.json`，供 B 开启时使用。
+默认关闭机器人深度遮罩，需要剔除机器人时加 `--robot-mask`。
+[地图后端、参数与排错](real_scripts/README.md)。
+
+## 6. 回放避障
+
+无需模型权重。在 `surface-runtime` 环境中先转换数据并保存障碍标注：
+
+```bash
+python -m obstacle_validation.lerobot_replay convert \
+  --hdf5 /path/to/episode.hdf5 --output outputs/obstacle_validation/my_episode_lerobot
+python real_scripts/manual_obstacle_annotation.py
+```
+
+标注页点击捕获，在 front/side 为同一物体画同编号框，保存。退出其他占用相机的进程后回放：
+
+```bash
+python -m obstacle_validation.lerobot_replay replay \
+  --dataset outputs/obstacle_validation/my_episode_lerobot --mode avoid
+```
+
+**此命令默认实机执行。** 自动使用最新 `annotations.json`，输出至
+`outputs/obstacle_validation/annotation_replay_时间戳/`。
+虚拟回放加 `--no-execute`；不筛选、不避障改用 `--mode baseline`。
+复位阶段不避障；避障阶段允许距离约束松弛。
+[回放参数与双终端方式](docs/MODEL_FREE_OBSTACLE_VALIDATION.md)。
+
+## 文档
+
+- [环境、数据预处理、权重、训练与部署](docs/IMPLEMENTATION_GUIDE.md)
+- [标定](docs/CALIBRATION.md) · [单臂 UR7e + Pika](docs/SINGLE_UR7E_PIKA.md)
+- [RGB 障碍标注](docs/BATCH_OBSTACLE_ANNOTATION.md) · [深度与 LeRobot 导出](docs/QUEST3_DEPTH_ALIGNMENT.md)
+- [实时感知](real_scripts/README.md) · [回放避障](docs/MODEL_FREE_OBSTACLE_VALIDATION.md)
+- [实验记录与评估](docs/EXPERIMENT_TABLE_DESIGN.md) · [历史入口](docs/legacy/INDEX.md)

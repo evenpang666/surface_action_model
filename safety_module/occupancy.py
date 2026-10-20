@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+from functools import lru_cache
 import time
 import zlib
 
@@ -17,9 +18,30 @@ import numpy as np
 from safety_module.geometry import segments_within_aabb_margin
 
 
+# Code 0 is accepted only when reading older saved maps.
 UNKNOWN, FREE, OCCUPIED, OUTSIDE = 0, 1, 2, 3
 MAP_SCHEMA = "local_probabilistic_occupancy_v1"
 MAX_VOXELS = 2_000_000
+
+
+@lru_cache(maxsize=4096)
+def _tile_cuboids(tile_voxels, pattern):
+    """Pack a local occupancy pattern once; reuse it across tiles and frames."""
+    mask = np.frombuffer(pattern, dtype=np.uint8).reshape((tile_voxels,) * 3).astype(bool)
+    cuboids = []
+    while mask.any():
+        low = np.array(np.unravel_index(np.flatnonzero(mask)[0], mask.shape))
+        high = low + 1
+        for axis in range(3):
+            while high[axis] < tile_voxels:
+                candidate = high.copy()
+                candidate[axis] += 1
+                if not mask[tuple(slice(a, b) for a, b in zip(low, candidate))].all():
+                    break
+                high = candidate
+        mask[tuple(slice(a, b) for a, b in zip(low, high))] = False
+        cuboids.append((tuple(low), tuple(high)))
+    return tuple(cuboids)
 
 
 def _pack(array):
@@ -93,6 +115,14 @@ class GridGeometry:
         valid &= np.linalg.norm(direction, axis=1) > 1e-12
         ray_ids = np.flatnonzero(valid)
         if not len(ray_ids):
+            # A stationary robot point is still a collision query. It is
+            # only empty for free-ray evidence, which excludes endpoints.
+            if not exclude_endpoint:
+                endpoint_ids, inside = self.indices(end)
+                ids = endpoint_ids[inside]
+                if unique_only:
+                    return np.unique(ids), np.empty(0, np.int64)
+                return ids, np.flatnonzero(inside)
             return np.empty(0, np.int64), np.empty(0, np.int64)
         direction, a = direction[valid], a[valid]
         entry, exit = entry[valid], exit[valid]
@@ -111,28 +141,32 @@ class GridGeometry:
             if not len(cell):
                 break
             include = np.ones(len(cell), bool)
+            crossing = np.minimum(np.minimum(next_crossing[:, 0], next_crossing[:, 1]), next_crossing[:, 2])
             if exclude_endpoint:
-                include &= np.any(cell != endpoint, axis=1)
+                include &= ((cell[:, 0] != endpoint[:, 0]) | (cell[:, 1] != endpoint[:, 1])
+                            | (cell[:, 2] != endpoint[:, 2]))
                 # A truncated endpoint inside this voxel does not prove it free.
-                include &= next_crossing.min(axis=1) <= exit + 1e-10
+                include &= crossing <= exit + 1e-10
             ids = (cell[include] @ self.strides).astype(np.int64)
             if unique_only:
                 visited[ids] = True
             else:
                 output.append(ids)
                 identities.append(ray_ids[include])
-            crossing = next_crossing.min(axis=1)
             alive = crossing < exit - 1e-10
             if not alive.any():
                 break
-            cell, ray_ids = cell[alive], ray_ids[alive]
-            next_crossing, increments = next_crossing[alive], increments[alive]
-            sign, endpoint, exit = sign[alive], endpoint[alive], exit[alive]
-            tied = next_crossing <= crossing[alive, None] + 1e-10
+            tied = next_crossing <= crossing[:, None] + 1e-10
             cell += tied * sign
             next_crossing += np.where(tied, increments, 0.)
-            inside = np.all((cell >= 0) & (cell < self.shape), axis=1)
-            cell, ray_ids, next_crossing = cell[inside], ray_ids[inside], next_crossing[inside]
+            # Compact once per crossing, rather than once for ray length and
+            # again for grid bounds. Unique-only callers do not need ray IDs.
+            inside = (alive & (cell[:, 0] >= 0) & (cell[:, 0] < self.shape[0])
+                      & (cell[:, 1] >= 0) & (cell[:, 1] < self.shape[1])
+                      & (cell[:, 2] >= 0) & (cell[:, 2] < self.shape[2]))
+            cell, next_crossing = cell[inside], next_crossing[inside]
+            if not unique_only:
+                ray_ids = ray_ids[inside]
             increments, sign, endpoint, exit = increments[inside], sign[inside], endpoint[inside], exit[inside]
         else:
             raise RuntimeError("Occupancy ray traversal exceeded its grid bound")
@@ -160,9 +194,8 @@ class OccupancyBox:
 class LocalOccupancyGrid(GridGeometry):
     """One hit/miss update per voxel per complete multi-camera frame.
 
-    Occupancy wins conflicts. A current hit is blocked immediately even after
-    strong free history. Lost occupied voxels become unknown without retaining
-    an OBB. Only consecutive raw misses can clear their hazard record.
+    Occupancy wins conflicts. Only current hits are obstacles; all other active
+    cells are free. Probability and source history are retained for diagnostics.
     """
 
     def __init__(self, origin, axes, shape, resolution_m, *, active=None,
@@ -180,14 +213,13 @@ class LocalOccupancyGrid(GridGeometry):
         self.hit_log = float(np.log(hit_probability / (1 - hit_probability)))
         self.miss_log = float(np.log(miss_probability / (1 - miss_probability)))
         self.free_log = float(np.log(free_probability / (1 - free_probability)))
-        self.clear_frames, self.free_ttl_s = int(clear_frames), float(free_ttl_s)
+        # Retain legacy settings/wire metadata for existing callers and captures.
+        # Free thresholds, TTL and clear_frames no longer classify motion space.
+        self.free_ttl_s = float(free_ttl_s)
         self.decay_half_life_s = float(decay_half_life_s)
         self.log_odds = np.zeros(self.size, np.float32)
         self.last_observed_ns = np.zeros(self.size, np.int64)
         self.sources = np.zeros(self.size, np.uint8)  # hit=1, miss=2, completion=4, uncertain raw=8
-        self.free_streak = np.zeros(self.size, np.uint16)
-        self.confirmed_free = np.zeros(self.size, bool)
-        self.hazard = np.zeros(self.size, bool)
         self.current_hits = np.empty(0, np.int64)
         self.timestamp_ns = self.frame = 0
         self.diagnostics = {}
@@ -197,12 +229,11 @@ class LocalOccupancyGrid(GridGeometry):
         ids = np.unique(ids[inside])
         return ids[self.active[ids]]
 
-    def update(self, *, timestamp_ns, raw_hits, free_ids, completion_hits=(), uncertain_hits=()):
-        if (not isinstance(timestamp_ns, (int, np.integer)) or timestamp_ns <= self.timestamp_ns):
-            raise ValueError("Occupancy frames require strictly increasing capture timestamps")
+    def _frame_evidence(self, raw_hits, free_ids, completion_hits, uncertain_hits):
+        """Deduplicate a whole multi-view frame; hits and rejected returns veto clearing."""
         hit_ids = self.point_ids(np.asarray(raw_hits).reshape(-1, 3))
-        # A rejected raw endpoint invalidates earlier free belief immediately.
-        # Accepted raw occupancy can override it; inferred geometry cannot.
+        # Rejected raw endpoints veto inferred geometry and same-frame free
+        # evidence, but never create blocking cells of their own.
         uncertain_ids = np.setdiff1d(self.point_ids(np.asarray(uncertain_hits).reshape(-1, 3)), hit_ids)
         completion_ids = self.point_ids(np.asarray(completion_hits).reshape(-1, 3))
         completion_ids = np.setdiff1d(completion_ids, uncertain_ids)
@@ -217,31 +248,28 @@ class LocalOccupancyGrid(GridGeometry):
         free_ids = free_ids[self.active[free_ids]]
         conflicts = np.intersect1d(blocked, free_ids)
         free_ids = np.setdiff1d(free_ids, blocked)
+        return hit_ids, completion_ids, uncertain_ids, occupied, free_ids, conflicts
+
+    def update(self, *, timestamp_ns, raw_hits, free_ids, completion_hits=(), uncertain_hits=()):
+        if (not isinstance(timestamp_ns, (int, np.integer)) or timestamp_ns <= self.timestamp_ns):
+            raise ValueError("Occupancy frames require strictly increasing capture timestamps")
+        hit_ids, completion_ids, uncertain_ids, occupied, free_ids, conflicts = self._frame_evidence(
+            raw_hits, free_ids, completion_hits, uncertain_hits)
+        blocked = np.union1d(occupied, uncertain_ids)
         seen = np.union1d(blocked, free_ids)
         if self.timestamp_ns:
-            # Forget confidence toward p=.5, never toward free. The separate
-            # historical hazard flag survives decay and cannot expire silently.
+            # Decay probability history for diagnostics only.
             unobserved = self.active.copy()
             unobserved[seen] = False
             elapsed = (timestamp_ns - self.timestamp_ns) / 1e9
             self.log_odds[unobserved] *= 2 ** (-elapsed / self.decay_half_life_s)
-        self.free_streak[np.setdiff1d(np.flatnonzero(self.free_streak), free_ids)] = 0
-        self.free_streak[free_ids] = np.minimum(self.free_streak[free_ids].astype(np.uint32) + 1, 65535)
         self.log_odds[free_ids] = np.maximum(-2., self.log_odds[free_ids] + self.miss_log)
         # Measured occupancy is immediately authoritative. Verified completion is
         # weaker evidence, but still a current obstacle, never clearing evidence.
         completed_only = np.setdiff1d(completion_ids, hit_ids)
         self.log_odds[completed_only] = np.minimum(3.5, np.maximum(0., self.log_odds[completed_only]) + .405465)
         self.log_odds[hit_ids] = np.minimum(3.5, np.maximum(0., self.log_odds[hit_ids]) + self.hit_log)
-        self.hazard[occupied] = True
-        self.confirmed_free[occupied] = False
         self.log_odds[uncertain_ids] = 0.
-        self.confirmed_free[uncertain_ids] = False
-        # Never confirmed speckles do not create historical obstacle records.
-        # If this was a confirmed obstacle, its hazard survives as unknown.
-        cleared = (self.log_odds[free_ids] <= self.free_log) & (self.free_streak[free_ids] >= self.clear_frames)
-        self.hazard[free_ids[cleared]] = False
-        self.confirmed_free[free_ids[cleared]] = True
         self.last_observed_ns[seen] = timestamp_ns
         self.sources[free_ids], self.sources[completion_ids], self.sources[hit_ids] = 2, 4, 1
         self.sources[uncertain_ids] = 8
@@ -255,22 +283,10 @@ class LocalOccupancyGrid(GridGeometry):
         now = self.timestamp_ns if now_ns is None else int(now_ns)
         if now < self.timestamp_ns:
             raise ValueError("Occupancy query precedes the last captured frame")
-        states = np.full(self.size, UNKNOWN, np.uint8)
+        states = np.full(self.size, FREE, np.uint8)
         states[~self.active] = OUTSIDE
-        factor = 2 ** (-(now - self.timestamp_ns) / 1e9 / self.decay_half_life_s)
-        free = (self.active & ~self.hazard & (self.log_odds * factor <= self.free_log)
-                & self.confirmed_free
-                & (self.last_observed_ns > 0)
-                & ((now - self.last_observed_ns) <= self.free_ttl_s * 1e9))
-        states[free] = FREE
         states[self.current_hits] = OCCUPIED
         return states
-
-    @property
-    def unknown_obstacles(self):
-        count = int((self.hazard & (self.states() == UNKNOWN)).sum())
-        return ([] if not count else [{"state": "unknown", "reason": "unobserved_occupied_voxels",
-                                       "voxel_count": count}])
 
     def snapshot(self):
         states = self.states()
@@ -286,7 +302,7 @@ class LocalOccupancyGrid(GridGeometry):
                 "source_data": _pack(self.sources), "source_codes": {"raw_hit": 1, "raw_free": 2, "verified_completion": 4, "uncertain_raw": 8},
                 "unknown_voxels": int(counts[UNKNOWN]), "free_voxels": int(counts[FREE]),
                 "occupied_voxels": int(counts[OCCUPIED]), "outside_voxels": int(counts[OUTSIDE]),
-                "historical_unknown_voxels": sum(x["voxel_count"] for x in self.unknown_obstacles)}
+                "historical_unknown_voxels": 0}
 
     def boxes(self, *, tile_voxels=4, occupied_ids=None):
         """Pack solid cuboids within bounded tiles; never span an empty gap."""
@@ -298,39 +314,36 @@ class LocalOccupancyGrid(GridGeometry):
         cells = np.column_stack(np.unravel_index(occupied_ids, tuple(self.shape)))
         if not len(cells):
             return []
-        groups = {}
-        for cell in cells:
-            tile = tuple((cell // tile_voxels).tolist())
-            groups.setdefault(tile, []).append(cell % tile_voxels)
-        boxes = []
+        tiles, local = cells // tile_voxels, cells % tile_voxels
+        tile_shape = (self.shape + tile_voxels - 1) // tile_voxels
+        tile_ids = np.ravel_multi_index(tiles.T, tuple(tile_shape))
+        order = np.argsort(tile_ids, kind="stable")
+        boundaries = np.r_[0, np.flatnonzero(np.diff(tile_ids[order])) + 1, len(order)]
+        lows, highs = [], []
         signs = np.array([[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],
                           [-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]])
-        for tile, items in sorted(groups.items()):
-            mask = np.zeros((tile_voxels,) * 3, bool)
-            mask[tuple(np.asarray(items).T)] = True
-            while mask.any():
-                low = np.argwhere(mask)[0]
-                high = low + 1
-                for axis in range(3):
-                    while high[axis] < tile_voxels:
-                        candidate = high.copy()
-                        candidate[axis] += 1
-                        if not mask[tuple(slice(a, b) for a, b in zip(low, candidate))].all():
-                            break
-                        high = candidate
-                mask[tuple(slice(a, b) for a, b in zip(low, high))] = False
-                base = np.asarray(tile) * tile_voxels
-                center = self.origin + ((base + (low + high) / 2) * self.resolution_m) @ self.axes.T
-                extents = (high - low) * self.resolution_m
-                corners = center + (signs * extents / 2) @ self.axes.T
-                boxes.append(OccupancyBox(center, self.axes.copy(), extents, corners, int(np.prod(high-low))))
-                if len(boxes) > 8192:
-                    raise RuntimeError("Occupancy map exceeds the 8192-box safety geometry budget")
-        return boxes
+        for begin, end in zip(boundaries[:-1], boundaries[1:]):
+            rows = order[begin:end]
+            mask = np.zeros((tile_voxels,) * 3, np.uint8)
+            mask[tuple(local[rows].T)] = 1
+            pattern = _tile_cuboids(tile_voxels, mask.tobytes())
+            base = tiles[rows[0]] * tile_voxels
+            for low, high in pattern:
+                lows.append(base + low)
+                highs.append(base + high)
+            if len(lows) > 8192:
+                raise RuntimeError("Occupancy map exceeds the 8192-box safety geometry budget")
+        lows, highs = np.asarray(lows), np.asarray(highs)
+        centers = self.origin + ((lows + highs) * (.5 * self.resolution_m)) @ self.axes.T
+        extents = (highs - lows) * self.resolution_m
+        corners = centers[:, None, :] + (signs[None, :, :] * extents[:, None, :] / 2) @ self.axes.T
+        counts = np.prod(highs - lows, axis=1)
+        return [OccupancyBox(center, self.axes.copy(), extent, corner, int(count))
+                for center, extent, corner, count in zip(centers, extents, corners, counts)]
 
 
 class ObservationGrid(GridGeometry):
-    """Read-only snapshot map. Unknown stays unknown as a snapshot gets older."""
+    """Read-only snapshot map whose motion checks block occupied cells only."""
 
     def __init__(self, payload):
         if (payload.get("schema") != MAP_SCHEMA or payload.get("coordinate_frame") != "left_base"
@@ -355,9 +368,48 @@ class ObservationGrid(GridGeometry):
                (("unknown_voxels", UNKNOWN), ("free_voxels", FREE),
                 ("occupied_voxels", OCCUPIED), ("outside_voxels", OUTSIDE))):
             raise ValueError("Occupancy state counts disagree with its grid")
+        # Preserve the v1 wire format and accept archived maps, interpreting
+        # their legacy unknown cells under the current occupied-only policy.
+        self.state = np.where(self.state == UNKNOWN, FREE, self.state).astype(np.uint8)
+        self._esdf_payload = ((payload.get("voxblox") or {}).get("esdf")
+                              if payload.get("backend") == "voxblox" else None)
+        self._esdf_arrays = None
         self.last_blockage = None
 
-    def segments_observed(self, start, end, *, margin_m=0., now_ns=None):
+    def query_esdf(self, points, *, interpolate=True):
+        """Read native ESDF guidance from this captured map, if usable.
+
+        Return None for old maps, disabled ESDF, or a manually scoped map
+        whose global field has not been recomputed for the selected obstacles.
+        Decode once on demand; hard collision checks still use occupied cells.
+        """
+        field = self._esdf_payload
+        if not field or not field.get("enabled") or not field.get("guidance_usable", True):
+            return None
+        if self._esdf_arrays is None:
+            if field.get("distance_dtype") != "float32-le" or field.get("observed_dtype") != "uint8":
+                raise ValueError("Invalid snapshot ESDF encoding")
+            maximum = float(field["max_distance_m"])
+            distances = _unpack(field["distance_m_data"], "<f4", self.size)
+            observed = _unpack(field["observed_data"], np.uint8, self.size)
+            valid = observed != 0
+            if (not np.isfinite(maximum) or maximum <= 0 or np.any(observed > 1)
+                    or not np.isfinite(distances[valid]).all()
+                    or np.any(np.abs(distances[valid]) > maximum+1e-5)):
+                raise ValueError("Invalid snapshot ESDF observations/distances")
+            self._esdf_arrays = distances, valid, maximum
+        from safety_module.distance_field import query_esdf_grid
+        distances, observed, maximum = self._esdf_arrays
+        return query_esdf_grid(self, distances, observed, self.state != OUTSIDE,
+                               maximum, points, interpolate=interpolate)
+
+    def segments_observed(self, start, end, *, margin_m=0., now_ns=None,
+                          allow_margin_recovery=False):
+        """Check occupied cells, optionally allowing outward margin recovery.
+
+        Recovery cannot begin on or inside an occupied cell. Every affected
+        point must keep or increase its distance throughout the segment.
+        """
         self.last_blockage = None
         if not np.isfinite(margin_m) or margin_m < 0:
             raise ValueError("Invalid occupancy motion margin")
@@ -368,7 +420,7 @@ class ObservationGrid(GridGeometry):
         if radius > 10:
             raise ValueError("Occupancy motion margin exceeds the supported local stencil")
         # Traverse a virtual halo too: a point centre just outside the map can
-        # still sweep its safety margin through active unknown boundary cells.
+        # still sweep its safety margin through occupied boundary cells.
         shape = self.shape + 2 * radius
         traversal = GridGeometry(self.origin - np.full(3, radius * self.resolution_m) @ self.axes.T,
                                  self.axes, shape, self.resolution_m,
@@ -379,7 +431,6 @@ class ObservationGrid(GridGeometry):
         now = time.monotonic_ns() if now_ns is None else int(now_ns)
         if now < self.timestamp_ns:
             raise ValueError("Occupancy clock differs from the motion clock")
-        decay = 2 ** (-(now - self.timestamp_ns) / 1e9 / self.decay_half_life_s)
         cells = np.column_stack(np.unravel_index(ids, tuple(shape))) - radius
         local_start, local_end = (self.coordinates(p)*self.resolution_m for p in (start, end))
         for dx in range(-radius, radius + 1):
@@ -387,15 +438,10 @@ class ObservationGrid(GridGeometry):
                 for dz in range(-radius, radius + 1):
                     queried = cells + [dx, dy, dz]
                     inside = np.all((queried >= 0) & (queried < self.shape), axis=1)
-                    # Do not exempt a moving point's start voxel: resetting that
-                    # exemption each control tick would allow creeping into unknown.
+                    # Include the start voxel in occupied-cell collision checks.
                     selected = queried[inside] @ self.strides
                     state = self.state[selected]
-                    fresh_free = (state == FREE) & (
-                        (now - self.timestamp_ns) / 1e9 + self.age_ms[selected] / 1000 <= self.free_ttl_s)
-                    fresh_free &= self.log_odds[selected] * decay <= self.free_log
-                    # Outside is explicitly out of this local detector's scope.
-                    blocked = (state != OUTSIDE) & ~fresh_free
+                    blocked = state == OCCUPIED
                     if not blocked.any():
                         continue
                     # The stencil is only a broad phase. Treating an entire
@@ -403,17 +449,25 @@ class ObservationGrid(GridGeometry):
                     # up to whole 20 mm cells and can block every RRT edge.
                     rows = np.flatnonzero(inside)[blocked]
                     centres = (queried[rows]+.5)*self.resolution_m
-                    hit = segments_within_aabb_margin(
-                        local_start[ray_ids[rows]]-centres,
-                        local_end[ray_ids[rows]]-centres,
-                        np.full(3, self.resolution_m/2), margin_m)
+                    first = local_start[ray_ids[rows]]-centres
+                    last = local_end[ray_ids[rows]]-centres
+                    half = np.full(3, self.resolution_m/2)
+                    hit = segments_within_aabb_margin(first, last, half, margin_m)
+                    if allow_margin_recovery and margin_m > 0 and hit.any():
+                        # Distance to a convex AABB is nondecreasing along a
+                        # segment when its initial directional derivative is
+                        # nonnegative. Permit escape from the margin only;
+                        # actual occupied-cell contact remains forbidden.
+                        offset = first-np.clip(first, -half, half)
+                        distance = np.linalg.norm(offset, axis=-1)
+                        outward = np.sum(offset*(last-first), axis=-1) >= 0.
+                        recoverable = (distance > 1e-12) & (distance <= margin_m) & outward
+                        hit &= ~recoverable
                     if hit.any():
                         index = int(np.flatnonzero(hit)[0])
                         voxel = int(selected[blocked][index])
-                        voxel_state = int(self.state[voxel])
                         self.last_blockage = {
-                            "reason": ("expired_free" if voxel_state == FREE else
-                                       "occupied" if voxel_state == OCCUPIED else "unknown"),
+                            "reason": "occupied",
                             "voxel_id": voxel, "point_id": int(ray_ids[rows[index]]),
                             "capture_age_s": (now-self.timestamp_ns)/1e9,
                             "observation_age_s": (now-self.timestamp_ns)/1e9+self.age_ms[voxel]/1000}
@@ -428,8 +482,9 @@ class ObservedBoxes(list):
 
 
 def observation_rollout_safe(sampler, qpos, gripper, joint_chunk, boxes,
-                             *, gripper_chunk=None, substeps=4, margin_m=0., now_ns=None):
-    """Unknown-space guard shared by recovery and rounded-OBB fallback paths."""
+                             *, gripper_chunk=None, substeps=4, margin_m=0., now_ns=None,
+                             allow_margin_recovery=False):
+    """Occupied-voxel sweep; margin recovery requires an explicit opt-in."""
     observation = getattr(boxes, "observation", None)
     if observation is None:
         return True
@@ -441,7 +496,9 @@ def observation_rollout_safe(sampler, qpos, gripper, joint_chunk, boxes,
         for step in range(1, substeps + 1):
             q, grip = origin + delta * step / substeps, opening + (target - opening) * step / substeps
             current = np.asarray(sampler.link_points(q, grip)).reshape(-1, 3)
-            if not observation.segments_observed(previous, current, margin_m=margin_m, now_ns=now_ns):
+            recovery = {"allow_margin_recovery": True} if allow_margin_recovery else {}
+            if not observation.segments_observed(previous, current, margin_m=margin_m,
+                                                  now_ns=now_ns, **recovery):
                 return False
             previous = current
     return True

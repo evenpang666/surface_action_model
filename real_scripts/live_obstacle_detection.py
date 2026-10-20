@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical front+side obstacle detection entry point (receive-only)."""
+"""Obstacle detection: dual (default), --scene single-pika, or --no-robot reconstruction."""
 from pathlib import Path
 import sys
 

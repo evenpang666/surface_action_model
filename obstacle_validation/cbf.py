@@ -95,7 +95,7 @@ def _first_step_barrier(item, predicted, boxes, obstacle_margin, arm_margin):
 
 class RecordedPathCBF:
     def __init__(self, sampler, gripper, *, collision_margin_m, inter_arm_margin_m,
-                 trigger_margin_m, alpha, iterations):
+                 trigger_margin_m, alpha, iterations, modulation=False, optimization_space="joint"):
         self.sampler = sampler
         self.gripper = np.asarray(gripper, dtype=float)
         self.collision_margin_m = float(collision_margin_m)
@@ -103,17 +103,31 @@ class RecordedPathCBF:
         self.trigger_margin_m = float(trigger_margin_m)
         self.alpha = float(alpha)
         self.iterations = int(iterations)
+        self.modulation = bool(modulation)
+        if optimization_space not in ("joint", "ee"):
+            raise ValueError("Optimization space must be joint or ee")
+        self.optimization_space = optimization_space
         self.left_count = len(sampler.left_link_names) * sampler.points_per_link
         self.before_solve = None
+        self.detour_direction = np.zeros(12)
         self.runtime_stats = {"project_calls": 0, "qp_solve_calls": 0, "stage_s": {}}
 
     def project_chunk(self, q, gripper, actions, checker, *, lower, upper, max_step,
-                      previous_delta, acceleration_step, swept_safe, fk_sampler=None):
-        """Optimize every action in order, rolling out corrected predecessors.
+                      previous_delta, acceleration_step, swept_safe=None, fk_sampler=None):
+        """Jointly optimize targets; only explicitly supplied callbacks check sweeps."""
+        from obstacle_validation.joint_chunk import optimize_joint_chunk
+        return optimize_joint_chunk(
+            self, q, gripper, actions, checker, lower=lower, upper=upper, max_step=max_step,
+            previous_delta=previous_delta, acceleration_step=acceleration_step,
+            swept_safe=swept_safe, fk_sampler=fk_sampler)
 
-        Each risky action has its own 12-variable CBF-QP at its own pose. This
-        is sequential chunk optimization, not a coupled horizon-wide QP. A
-        failed tail invalidates the whole plan; callers must not send its prefix.
+    def _seed_chunk(self, q, gripper, actions, checker, *, lower, upper, max_step,
+                    previous_delta, acceleration_step, swept_safe, fk_sampler=None):
+        """Build a sequential CBF route for the joint solver.
+
+        A failed tail discards this initializer. The joint solver may instead
+        start from bounded dataset goals; this method never authorizes sending
+        a prefix without the subsequent coupled solve.
         """
         from obstacle_validation.core import CollisionChecker
         q, grip, actions = (np.asarray(value, float).copy() for value in (q, gripper, actions))
@@ -124,42 +138,74 @@ class RecordedPathCBF:
                 or not np.isfinite(max_step) or max_step <= 0):
             raise ValueError("Invalid absolute action chunk")
         previous = np.asarray(previous_delta, float).copy()
+        joint_lower = np.broadcast_to(np.asarray(lower, float), (len(actions), 12))
+        joint_upper = np.broadcast_to(np.asarray(upper, float), (len(actions), 12))
+        if (not np.isfinite(joint_lower).all() or not np.isfinite(joint_upper).all()
+                or np.any(joint_lower > joint_upper)):
+            raise ValueError("Invalid action chunk joint bounds")
         original_sampler, original_gripper = self.sampler, self.gripper
+        original_detour = self.detour_direction.copy()
         self.sampler = original_sampler if fk_sampler is None else fk_sampler
         optimized, steps, waypoints, waypoint_steps, waypoint_sources = [], [], [], [], []
-        info = {"mode": "optimize_all_actions", "success": True, "horizon": len(actions),
+        info = {"mode": "sequential_seed", "success": True, "horizon": len(actions),
+                "controller": "mcbf" if self.modulation else "cbf", "target_repairs": [],
                 "steps": steps, "triggered_action_indices": [], "modified_action_indices": [],
                 "waypoints": waypoints, "waypoint_steps": waypoint_steps,
                 "waypoint_action_indices": waypoint_sources}
         self.runtime_stats["chunk_calls"] = self.runtime_stats.get("chunk_calls", 0)+1
+        completed = False
         try:
             for index, action in enumerate(actions):
+                goal = action
+                repair = None
+                if self.modulation:
+                    from obstacle_validation.mcbf import evacuate_action_target
+                    goal, repair = evacuate_action_target(
+                        self.sampler, action, checker.boxes, lower=joint_lower[index],
+                        upper=joint_upper[index], margin=self.collision_margin_m)
+                    info["target_repairs"].append(repair)
+                    if not repair["success"]:
+                        step = {"success": False, "triggered": True, "qp_solve_calls": 0,
+                                "reason": repair["reason"], "target_repair": repair}
+                        info.update(success=False, failed_action_index=index, failed_step=step,
+                                    failed_qpos=q.tolist(), failed_gripper=grip.tolist(),
+                                    failed_joint_lower=joint_lower[index].tolist(),
+                                    failed_joint_upper=joint_upper[index].tolist(),
+                                    failed_nominal_delta=np.clip(action[:12]-q, -max_step, max_step).tolist(),
+                                    reason=repair["reason"])
+                        return None, info
                 # Preserve safe absolute goals even when reaching one requires
                 # multiple speed-bounded servo steps.
-                count = max(1, int(np.ceil(np.max(np.abs(action[:12]-q))/max_step)))
+                count = max(1, int(np.ceil(np.max(np.abs(goal[:12]-q))/max_step)))
                 action_steps = []
                 for substep in range(count):
                     self.gripper = grip.copy()
                     scene = CollisionChecker(self.sampler, grip, checker.boxes, margin=checker.margin,
                                              inter_arm_margin=checker.inter_arm_margin, resolution=checker.resolution,
                                              observation_now_ns=checker.observation_now_ns)
-                    nominal = np.clip(action[:12]-q, -max_step, max_step)
+                    nominal = np.clip(goal[:12]-q, -max_step, max_step)
                     delta, step = self.project(
-                        q, nominal, scene, lower=lower, upper=upper, max_step=max_step,
+                        q, nominal, scene, lower=joint_lower[index], upper=joint_upper[index], max_step=max_step,
                         previous_delta=previous, acceleration_step=acceleration_step,
                         target_gripper=action[12:],
-                        swept_safe=lambda value: swept_safe(q, grip, value, action[12:]))
+                        validate_sweeps=swept_safe is not None,
+                        swept_safe=(lambda value: swept_safe(q, grip, value, action[12:]))
+                        if swept_safe is not None else None)
                     step.update(chunk_step=index, chunk_horizon=len(actions), control_substep=substep,
-                                preview_horizon=len(actions)-index, preview_qp_mode="optimize_all_actions")
+                                preview_horizon=len(actions)-index, preview_qp_mode="sequential_seed")
+                    if repair is not None:
+                        step["target_repair"] = repair
+                        step["triggered"] = step["triggered"] or repair["modified"]
                     action_steps.append(step)
                     observation = getattr(checker.boxes, "observation", None)
                     blockage = step.get("sweep_blockage") or getattr(observation, "last_blockage", None)
-                    if not step["success"] or (blockage and blockage["reason"] == "expired_free"):
+                    if not step["success"]:
                         info.update(success=False, failed_action_index=index, failed_step=step,
                                     failed_qpos=q.tolist(), failed_gripper=grip.tolist(),
+                                    failed_joint_lower=joint_lower[index].tolist(),
+                                    failed_joint_upper=joint_upper[index].tolist(),
                                     failed_nominal_delta=nominal.tolist(),
-                                    reason=step.get("reason", "expired_free" if blockage and
-                                                    blockage["reason"] == "expired_free" else "cbf_projection_failed"))
+                                    reason=step.get("reason", "cbf_projection_failed"))
                         if blockage:
                             info["sweep_blockage"] = dict(blockage)
                         return None, info
@@ -168,25 +214,38 @@ class RecordedPathCBF:
                     waypoints.append(np.concatenate((q, grip)).tolist())
                     waypoint_steps.append(step)
                     waypoint_sources.append(index)
-                summary = {**action_steps[-1], "triggered": any(item["triggered"] for item in action_steps),
+                    # A detour replaces this dataset action's target. Do not
+                    # spend the remaining nominal subdivision count chasing
+                    # the same obstructed goal again inside the preview.
+                    if step["triggered"] and not np.allclose(delta, nominal, atol=1e-7, rtol=0):
+                        break
+                summary = {**action_steps[-1], "triggered": (any(item["triggered"] for item in action_steps)
+                                                           or bool(repair and repair["modified"])),
                            "qp_solve_calls": sum(item["qp_solve_calls"] for item in action_steps),
-                           "control_substeps": count}
+                           "control_substeps": len(action_steps)}
                 steps.append(summary)
                 if summary["triggered"]:
                     info["triggered_action_indices"].append(index)
                 optimized.append(np.concatenate((q, grip)))
                 if not np.allclose(q, action[:12], atol=1e-7, rtol=0):
                     info["modified_action_indices"].append(index)
+            completed = True
             return np.asarray(optimized), info
         finally:
             self.sampler, self.gripper = original_sampler, original_gripper
+            # Commit guidance across execution prefixes only for a fully
+            # validated MCBF plan. Failed speculative tails must not leak it.
+            if not self.modulation or not completed:
+                self.detour_direction = original_detour
 
     def project(self, q, nominal, checker, *, lower, upper, max_step, previous_delta,
-                acceleration_step, target_gripper=None, swept_safe=None, action_preview=None):
-        """Project joints against the commanded future surface, then check the sweep.
+                acceleration_step, target_gripper=None, swept_safe=None, action_preview=None,
+                validate_sweeps=True):
+        """Project joint direction without shortening a moving nominal step.
 
         ``swept_safe`` may check the coupled joint/gripper motion. Existing
         fixed-gripper callers retain the joint-only edge check by default.
+        Replay disables these checks with ``validate_sweeps=False``.
         ``action_preview`` activates identities across the full dataset chunk;
         the QP optimizes only the current joint step, re-evaluating each active
         barrier at its actual first-step surface and Jacobian.
@@ -213,7 +272,8 @@ class RecordedPathCBF:
             raise ValueError("Invalid target gripper for CBF projection")
         raw_sweep = (swept_safe if swept_safe is not None
                      else lambda step: checker.edge_safe(q, q + step))
-        edge_is_safe = lambda step: measured("sweep_validation", raw_sweep, step)
+        edge_is_safe = ((lambda step: measured("sweep_validation", raw_sweep, step))
+                        if validate_sweeps else lambda _step: True)
         current = np.asarray(measured("current_fk", self.sampler.link_points, q, self.gripper))
         predicted = (np.asarray(measured("current_fk", self.sampler.link_points, q + nominal, target_gripper))
                      if action_preview is None else action_preview.surface_points[0])
@@ -271,6 +331,13 @@ class RecordedPathCBF:
                 "preview_first_obstacle_risk_step": int(risk[0]) if len(risk) else None,
                 "preview_first_obstacle_intrusion_step": int(intrusion[0]) if len(intrusion) else None}
         constraints = [*obstacles, *pairs]
+        if not validate_sweeps:
+            # Without a nonlinear sweep fallback, seed the QP from the
+            # current side of an obstacle. A penetrated target's far-face
+            # normal can otherwise select an incompatible initial route.
+            constraints = [replace(item, normal=_first_step_barrier(
+                item, current, checker.boxes, self.collision_margin_m,
+                self.inter_arm_margin_m).normal) for item in constraints]
         record("constraint_selection", time.perf_counter()-selection_started)
         info = {"triggered": bool(constraints), "success": True,
                 "timing_s": timing, "qp_solve_calls": 0,
@@ -294,10 +361,24 @@ class RecordedPathCBF:
         if np.any(hard_low > hard_high):
             info.update(success=False, reason="empty_joint_delta_bounds")
             return np.zeros(12), info
+        guidance = None
+        if self.modulation:
+            from obstacle_validation.mcbf import tangent_guidance
+            guided = measured(
+                "tangent_guidance", tangent_guidance, self.sampler, q, self.gripper, nominal,
+                obstacles, checker.boxes, self.detour_direction, lower=hard_low, upper=hard_high,
+                required_step=min(float(max_step), float(np.max(np.abs(nominal)))))
+            if guided is not None:
+                guidance, guidance_info = guided
+                info["modulation"] = guidance_info
+                self.detour_direction = guidance[0].copy()
+        info["controller"] = "mcbf" if self.modulation else "cbf"
         jacobian = None
         def solve_qp(*args, **kwargs):
             self.runtime_stats["qp_solve_calls"] += 1
             info["qp_solve_calls"] += 1
+            if guidance is not None:
+                kwargs["guidance"] = guidance
             return measured("qp_solver", project_joint_delta_qp, *args, **kwargs)
         # Keep the QP a few micrometres inside the requested safe set. Finite
         # difference/solver roundoff must not place a tangential step exactly
@@ -337,126 +418,220 @@ class RecordedPathCBF:
             info.update(result)
         if not np.isfinite(safe).all() or np.any(safe < hard_low-1e-6) or np.any(safe > hard_high+1e-6):
             info.update(success=False, reason="corrected_joint_delta_bounds")
-        if current_below_clearance:
-            if info["success"] and edge_is_safe(safe):
+        required_step = min(float(max_step), float(np.max(np.abs(nominal))))
+        info["nominal_step_rad"] = required_step
+        if guidance is None and np.any(self.detour_direction) and edge_is_safe(np.clip(nominal, hard_low, hard_high)):
+            self.detour_direction[:] = 0.
+        direction = self.detour_direction.copy()
+
+        def complete_step(candidate):
+            return (np.isfinite(candidate).all()
+                    and np.all(candidate >= hard_low-1e-7)
+                    and np.all(candidate <= hard_high+1e-7)
+                    and np.max(np.abs(candidate)) >= required_step-1e-7
+                    and (guidance is None or float(guidance[0] @ candidate) >= guidance[1]-1e-7)
+                    and (not np.any(direction) or float(candidate @ direction) > 1e-9))
+
+        if info["success"] and complete_step(safe) and edge_is_safe(safe):
+            info["joint_step_rad"] = float(np.max(np.abs(safe)))
+            info["detour_direction"] = self.detour_direction.tolist()
+            if current_below_clearance:
                 info["recovery_step"] = True
-                return np.asarray(safe, dtype=float), info
-            # Reaching the full margin in one tick can be impossible under
-            # joint-speed bounds. Relax only the recovery rate, then validate
-            # actual FK progress before accepting another joint action.
-            attempts = []
-            for recovery_alpha in (.5, .25, .1):
-                if jacobian is None or recovery_alpha >= self.alpha:
-                    continue
-                candidate, result = solve_qp(
-                    nominal, jacobian, qp_constraints, lower_delta=hard_low,
-                    upper_delta=hard_high, alpha=recovery_alpha,
-                    iterations=self.iterations, use_predicted_linearization=True)
-                candidate_ok = (result["success"] and np.isfinite(candidate).all()
-                                and np.all(candidate >= hard_low-1e-6)
-                                and np.all(candidate <= hard_high+1e-6))
-                if candidate_ok:
-                    candidate_ok = edge_is_safe(candidate)
-                attempts.append({"alpha": recovery_alpha, "qp_success": bool(result["success"]),
-                                 "verified": bool(candidate_ok)})
-                if candidate_ok:
-                    info.pop("reason", None)
-                    info.update(result, recovery_alpha=recovery_alpha,
-                                recovery_step=True, recovery_attempts=attempts)
-                    return np.asarray(candidate, dtype=float), info
-            nominal_prefix = np.clip(nominal, hard_low, hard_high)
-            if edge_is_safe(nominal_prefix):
-                info.pop("reason", None)
-                info.update(success=True, projection_method="verified_nominal_recovery",
-                            recovery_step=True, recovery_attempts=attempts)
-                return np.asarray(nominal_prefix, dtype=float), info
-            info.update(success=False, reason="recovery_future_or_sweep_unsafe",
-                        recovery_attempts=attempts)
             return np.asarray(safe, dtype=float), info
-        if constraints and not info["success"]:
-            # A future-point linearization can be infeasible after the nominal
-            # endpoint crosses an OBB face. Recover the longest verified prefix
-            # of the original action, without treating the QP failure as safe.
-            info["qp_failure"] = {key: value for key, value in info.items()
-                                  if key in ("reason", "max_violation", "solver", "solver_iterations")}
-            safe = np.clip(nominal, hard_low, hard_high)
-            info.update(success=True, max_violation=0., projection_method="verified_nominal_prefix")
-        if info["success"] and not edge_is_safe(safe):
-            # The CBF is a local linearization; validate the full nonlinear
-            # joint edge and retain only a geometrically safe action prefix.
-            lower_fraction, upper_fraction = 0., 1.
-            for _ in range(8):
-                middle = (lower_fraction + upper_fraction) / 2.
-                if edge_is_safe(middle * safe):
-                    lower_fraction = middle
+
+        # A short projected step or a failed nonlinear sweep needs a different
+        # direction, never a scaled prefix. Constrain at least one influential
+        # joint to a full step, then verify the entire coupled FK sweep.
+        if not constraints and self.before_solve is not None:
+            self.before_solve()
+        candidate, redirect = measured(
+            "full_step_projection", self._redirect_full_step, q, nominal, checker,
+            current=current, target_gripper=target_gripper, constraints=constraints,
+            lower=hard_low, upper=hard_high, required_step=required_step,
+            previous_delta=np.asarray(previous_delta), edge_is_safe=edge_is_safe,
+            measured=measured, qp_buffer=qp_buffer, guidance=guidance)
+        if not redirect["success"] and np.any(self.detour_direction):
+            # A changed scene or a joint/tracking limit can close the chosen
+            # side. Select another full-step direction instead of shrinking.
+            if guidance is None:
+                self.detour_direction[:] = 0.
+            else:
+                # Keep a hard tangent constraint while trying the other side.
+                # A guide made infeasible by another obstacle must not force
+                # retries of the same closed route forever.
+                guidance = (-guidance[0], guidance[1])
+                self.detour_direction = guidance[0].copy()
+                info["modulation"] = {**info["modulation"],
+                                      "joint_direction": guidance[0].tolist(),
+                                      "tangent": (-np.asarray(info["modulation"]["tangent"])).tolist()}
+            candidate, retry = measured(
+                "full_step_projection", self._redirect_full_step, q, nominal, checker,
+                current=current, target_gripper=target_gripper, constraints=constraints,
+                lower=hard_low, upper=hard_high, required_step=required_step,
+                previous_delta=np.asarray(previous_delta), edge_is_safe=edge_is_safe,
+                measured=measured, qp_buffer=qp_buffer, guidance=guidance)
+            retry["qp_solve_calls"] += redirect["qp_solve_calls"]
+            retry["full_step_qp_attempts"] += redirect["full_step_qp_attempts"]
+            redirect = retry
+            info["detour_reselected"] = True
+        if "reason" in info:
+            info["initial_solver_failure"] = {key: info[key] for key in
+                                              ("reason", "max_violation", "solver") if key in info}
+        redirect["qp_solve_calls"] += info["qp_solve_calls"]
+        info.pop("reason", None)
+        info.update(redirect, acceleration_relaxed=True,
+                    linearization="current_and_swept_surface_points",
+                    projection_method="full_step_cbf_qp",
+                    joint_step_rad=float(np.max(np.abs(candidate))))
+        if not redirect["success"]:
+            blockage = getattr(getattr(checker.boxes, "observation", None), "last_blockage", None)
+            if blockage:
+                info["sweep_blockage"] = dict(blockage)
+        if redirect["success"] and not np.any(self.detour_direction):
+            tangent = candidate-nominal*float(candidate @ nominal)/max(float(nominal @ nominal), 1e-15)
+            if np.max(np.abs(tangent)) > 1e-7:
+                self.detour_direction = tangent/np.max(np.abs(tangent))
+        info["detour_direction"] = self.detour_direction.tolist()
+        if current_below_clearance:
+            info["recovery_step"] = True
+        return candidate, info
+
+    def _redirect_full_step(self, q, nominal, checker, *, current, target_gripper,
+                            constraints, lower, upper, required_step, previous_delta,
+                            edge_is_safe, measured, qp_buffer, guidance=None):
+        """Change direction at the nominal step size, with bounded SQP attempts.
+
+        Bounding one influential joint beyond +/- required_step is a union of
+        convex QPs, rather than normalizing a projected vector after solving.
+        Every candidate must pass the original nonlinear collision checks.
+        """
+        from scipy.optimize import Bounds, LinearConstraint, minimize
+
+        jacobian = measured("jacobian", point_jacobian_fd, self.sampler, q,
+                            gripper_position=self.gripper)
+        flat_jacobian = jacobian.reshape(-1, 3, len(q))
+        shape_flow = (np.asarray(measured("gripper_fk", self.sampler.link_points, q, target_gripper))-current
+                      if not np.array_equal(target_gripper, self.gripper) else np.zeros_like(current))
+
+        def gradient(item, jac):
+            flat = jac.reshape(-1, 3, len(q))
+            if isinstance(item, PointPairFlowConstraint):
+                return item.normal @ (flat[item.first_point_id]-flat[item.second_point_id])
+            return item.normal @ jac[item.link_id, item.point_id]
+
+        def threshold(h):
+            # A currently deficient margin must improve; safe points retain
+            # their clearance constraint, with a small numerical buffer.
+            return h+qp_buffer if h < 0. else (1.-self.alpha)*h+qp_buffer
+
+        # Start with current outward normals. A normal on the far side of an
+        # intruding endpoint can otherwise send the chord through the obstacle.
+        rows, rhs = [], []
+        if guidance is not None:
+            rows.append(guidance[0])
+            rhs.append(guidance[1])
+        for item in constraints:
+            barrier = _first_step_barrier(item, current, checker.boxes,
+                                          self.collision_margin_m, self.inter_arm_margin_m)
+            if isinstance(barrier, PointPairFlowConstraint):
+                flow = shape_flow.reshape(-1, 3)
+                shape = flow[barrier.first_point_id]-flow[barrier.second_point_id]
+            else:
+                shape = shape_flow[barrier.link_id, barrier.point_id]
+            rows.append(gradient(barrier, jacobian))
+            rhs.append(threshold(barrier.predicted_h)-barrier.predicted_h-float(barrier.normal @ shape))
+
+        direction = self.detour_direction
+        objective = nominal.copy()
+        if np.any(direction) and required_step > 1e-8:
+            # Keep the chosen side while the recorded direction is blocked.
+            # Otherwise a full tangent can immediately be undone by the next
+            # target projection, merely replacing tiny steps with oscillation.
+            objective += 2.*required_step*direction
+            rows.append(direction)
+            rhs.append(.1*required_step)
+
+        moving_arms = np.repeat(np.max(np.abs(nominal).reshape(2, 6), axis=1)
+                                >= max(required_step*.01, 1e-9), 6)
+        flat_flow = shape_flow.reshape(-1, 3)
+        moving_arms[:6] |= np.any(np.abs(flat_flow[:self.left_count]) > 1e-8)
+        moving_arms[6:] |= np.any(np.abs(flat_flow[self.left_count:]) > 1e-8)
+        influential = np.linalg.norm(flat_jacobian, axis=(0, 1)) > 1e-8
+        anchors = []
+        if required_step <= 1e-8:
+            anchors.append(None)
+        else:
+            for joint in np.flatnonzero(influential & moving_arms):
+                for sign in (1., -1.):
+                    value = sign*required_step
+                    if lower[joint] <= value <= upper[joint]:
+                        # Prefer the recorded direction, retaining the side of
+                        # an already chosen tangent when costs are tied.
+                        cost = (value-objective[joint])**2 - .1*value*previous_delta[joint]
+                        anchors.append((int(joint), value, cost))
+            anchors.sort(key=lambda item: item[2])
+        left_mask = np.arange(current.reshape(-1, 3).shape[0]) < self.left_count
+        attempts = 0
+        for anchor in anchors:
+            low, high = lower.copy(), upper.copy()
+            if anchor is not None:
+                if anchor[1] > 0:
+                    low[anchor[0]] = max(low[anchor[0]], anchor[1])
                 else:
-                    upper_fraction = middle
-            safe = lower_fraction * safe
-            info["fk_backtrack_fraction"] = lower_fraction
-            if lower_fraction == 0.:
-                observation = getattr(checker.boxes, "observation", None)
-                blockage = getattr(observation, "last_blockage", None)
-                if blockage:
-                    info["sweep_blockage"] = dict(blockage)
-                if constraints and not (blockage and blockage["reason"] == "expired_free"):
-                    # A future normal can admit an endpoint whose chord first
-                    # cuts inside a rounded corner. Re-solve a standard CBF at
-                    # the current surface/Jacobian, then verify the full sweep.
-                    current_jacobian = measured("jacobian", point_jacobian_fd, self.sampler, q,
-                                                gripper_position=self.gripper)
-                    gripper_flow = (np.asarray(measured("gripper_fk", self.sampler.link_points, q, target_gripper))
-                                    -current if not np.array_equal(target_gripper, self.gripper)
-                                    else np.zeros_like(current))
-                    current_constraints = []
-                    for item in constraints:
-                        barrier = _first_step_barrier(item, current, checker.boxes,
-                                                      self.collision_margin_m, self.inter_arm_margin_m)
-                        h = barrier.predicted_h-qp_buffer
-                        if isinstance(barrier, PointPairFlowConstraint):
-                            jac = current_jacobian.reshape(-1, 3, len(q))
-                            flow = gripper_flow.reshape(-1, 3)
-                            joint_flow = (jac[barrier.first_point_id]-jac[barrier.second_point_id]) @ nominal
-                            shape_flow = flow[barrier.first_point_id]-flow[barrier.second_point_id]
-                        else:
-                            joint_flow = current_jacobian[barrier.link_id, barrier.point_id] @ nominal
-                            shape_flow = gripper_flow[barrier.link_id, barrier.point_id]
-                        # Use the current outward normal, including the known
-                        # gripper motion which joints must compensate for.
-                        # Without this term the fallback may hold joints while
-                        # the commanded fingers move into the obstacle.
-                        future_h = h+float(barrier.normal @ (joint_flow+shape_flow))
-                        current_constraints.append(replace(barrier, current_h=h, predicted_h=future_h))
-                    candidate, result = solve_qp(
-                        nominal, current_jacobian, current_constraints, lower_delta=hard_low,
-                        upper_delta=hard_high, alpha=self.alpha, iterations=self.iterations,
-                        use_predicted_linearization=True)
-                    info["current_barrier_solver"] = dict(result)
-                    if (result["success"] and np.isfinite(candidate).all()
-                            and np.all(candidate >= hard_low-1e-6) and np.all(candidate <= hard_high+1e-6)):
-                        fraction = 1.
-                        if not edge_is_safe(candidate):
-                            low, high = 0., 1.
-                            for _ in range(8):
-                                middle = (low+high)/2
-                                if edge_is_safe(candidate*middle):
-                                    low = middle
-                                else:
-                                    high = middle
-                            fraction = low
-                        if fraction > 0. and np.max(np.abs(candidate*fraction)) > 1e-8:
-                            info.pop("reason", None)
-                            info.update(result, projection_method="current_barrier_qp",
-                                        linearization="current_surface_points", acceleration_relaxed=True,
-                                        fk_backtrack_fraction=fraction)
-                            return np.asarray(candidate*fraction, float), info
-                blockage = getattr(observation, "last_blockage", None)
-                if blockage:
-                    info["sweep_blockage"] = dict(blockage)
-                if edge_is_safe(np.zeros_like(safe)):
-                    info.update(success=True, projection_method="verified_safe_hold")
-                else:
-                    info.update(success=False, reason="no_safe_joint_step_for_gripper_target")
-        return np.asarray(safe, dtype=float), info
+                    high[anchor[0]] = min(high[anchor[0]], anchor[1])
+            local_rows, local_rhs = list(rows), list(rhs)
+            seed = np.clip(objective, low, high)
+            for _ in range(3):
+                def solve():
+                    matrix = np.asarray(local_rows, float).reshape(-1, len(q))
+                    linear_constraints = (() if not len(matrix) else
+                                          (LinearConstraint(matrix, local_rhs, np.full(len(matrix), np.inf)),))
+                    return minimize(lambda value: .5*float((value-objective) @ (value-objective)),
+                                    seed, jac=lambda value: value-objective, method="SLSQP",
+                                    bounds=Bounds(low, high), constraints=linear_constraints,
+                                    options={"maxiter": self.iterations, "ftol": 1e-10, "disp": False})
+                attempts += 1
+                self.runtime_stats["qp_solve_calls"] += 1
+                result = measured("qp_solver", solve)
+                candidate = np.asarray(result.x, float)
+                if (not result.success or not np.isfinite(candidate).all()
+                        or np.any(candidate < low-1e-7) or np.any(candidate > high+1e-7)):
+                    break
+                if edge_is_safe(candidate):
+                    return candidate, {"success": True, "max_violation": 0.,
+                                       "full_step_qp_attempts": attempts,
+                                       "qp_solve_calls": attempts,
+                                       "solver": "scipy_slsqp_qp",
+                                       "solver_iterations": int(getattr(result, "nit", 0))}
+                # Add local linear constraints at the failed candidate's swept
+                # surfaces. Re-solve at full length, including FK curvature and
+                # moving-finger geometry, rather than bisecting the step.
+                previous_count = len(local_rows)
+                for fraction in (.25, .5, .75, 1.):
+                    grip = self.gripper+(target_gripper-self.gripper)*fraction
+                    points = np.asarray(measured("current_fk", self.sampler.link_points,
+                                                 q+candidate*fraction, grip))
+                    barriers = [*select_point_flow_constraints(
+                        current, points[None], checker.boxes,
+                        collision_margin_m=self.collision_margin_m,
+                        trigger_margin_m=self.trigger_margin_m, rounded_margin=True,
+                        normal_at_prediction=True), *select_inter_arm_constraints(
+                        current, points[None], left_mask,
+                        minimum_distance_m=self.inter_arm_margin_m,
+                        trigger_margin_m=self.trigger_margin_m, normal_at_prediction=True)]
+                    if not barriers:
+                        continue
+                    sample_jacobian = measured("jacobian", point_jacobian_fd, self.sampler,
+                                               q+candidate*fraction, gripper_position=grip)
+                    for item in barriers:
+                        row = fraction*gradient(item, sample_jacobian)
+                        local_rows.append(row)
+                        local_rhs.append(threshold(item.current_h)-item.predicted_h+float(row @ candidate))
+                if len(local_rows) == previous_count:
+                    break
+                seed = candidate
+        return np.zeros_like(nominal), {"success": False, "reason": "no_safe_full_joint_step",
+                                       "full_step_qp_attempts": attempts, "qp_solve_calls": attempts}
 
 
 class CBFGoalFollower:
@@ -497,24 +672,15 @@ class CBFGoalFollower:
             previous_delta=self.last_delta, acceleration_step=self.acceleration_step)
         self.last_step_duration_s = time.monotonic()-started
         self.last_cbf_info = info
-        blockage = checker.last_observation_blockage
-        if (np.max(np.abs(corrected)) <= 1e-8 and blockage
-                and blockage["reason"] == "expired_free"):
-            self.last_delta[:] = 0
-            return np.zeros(12), "scene_expired"
         if info["success"] and info["triggered"] and np.max(np.abs(corrected-nominal)) > 1e-7:
             self.cbf_interventions += 1
         if not info["success"]:
             self.cbf_failures += 1
             self.last_delta[:] = 0
-            blockage = checker.last_observation_blockage
-            return np.zeros(12), ("scene_expired" if blockage and blockage["reason"] == "expired_free"
-                                  else "cbf_infeasible")
+            return np.zeros(12), "cbf_infeasible"
         if not checker.edge_safe(q, q+corrected):
             self.last_delta[:] = 0
-            blockage = checker.last_observation_blockage
-            return np.zeros(12), ("scene_expired" if blockage and blockage["reason"] == "expired_free"
-                                  else "step_blocked")
+            return np.zeros(12), "step_blocked"
         # A valid QP correction may be lateral or temporarily away from the
         # target. Accept verified motion without an along-goal progress test.
         self.last_delta = np.asarray(corrected, float).copy()

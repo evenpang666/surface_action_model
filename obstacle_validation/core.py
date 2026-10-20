@@ -99,7 +99,7 @@ class CollisionChecker:
         # Physical execution must use a separate checker with the current time.
         self.observation_now_ns = observation_now_ns
         self.edge_rejections = {"unobserved": 0, "obstacle": 0, "inter_arm": 0}
-        self.observation_rejections = {"unknown": 0, "expired_free": 0, "occupied": 0}
+        self.observation_rejections = {"occupied": 0}
         self.last_observation_blockage = None
         self.left_count = len(sampler.left_link_names) * sampler.points_per_link
 

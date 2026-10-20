@@ -1,90 +1,74 @@
 # 双臂双视角标定
 
-## 当前接入
+检查与部署在仓库根目录、`surface-runtime` 环境执行。先停止占用 front/side 的进程，
+并在 PolyScope 完成探针/工具 TCP 标定；脚本只读取活动 TCP，不会自动标定工具或移动机器人。
 
-项目使用 2026-10-17 的双臂双视角标定，文件已复制到项目内：
-
-```text
-configs/hardware/calibration/dual_arm_camera_transforms.yaml
-```
-
-入口为 `configs/ur7e_dual_quest3.yaml` 的 `safety.dual_arm_camera_calibration`。
-四份源文件及标定观测记录均在同目录。汇总文件通过相对路径引用四份源文件，
-并保留源文件的 SHA256 校验。
-
-| 源标定 | camera serial | touch RMS |
-| --- | --- | --- |
-| left/front | 260922305390 | 2.206 mm |
-| left/side | 260922303231 | 2.206 mm |
-| right/front | 260922305390 | 1.955 mm |
-| right/side | 260922303231 | 1.955 mm |
-
-touch RMS 限值为 2.5 mm；相机质量、板运动、平移 spread 检查均通过。
-重新计算的基座闭环误差为 7.077 mm / 0.1852°，相机闭环误差为
-5.650 mm / 0.1852°，低于汇总的 10 mm / 3° 限值。
-`camera_calibration_valid=true` 表示这组文件已经校验接入，不代替实机验收。
-
-## 共用坐标图
-
-`safety_module/dual_camera_calibration.py` 是统一读取入口；检测、双臂固定点
-和独立随机路径验证都使用它。所有矩阵遵守 `parent_T_child`，把 child 点
-转换到 parent。`left_base_to_right_base` 的 parent 是 left_base、child 是
-right_base，因此用于把右臂点变换到左臂，**不需要取逆**。
-
-```text
-left_base_T_front = left/front 源标定矩阵
-left_base_T_side  = left_base_T_front @ front_camera_to_side_camera.matrix
-left_base_T_right = left_base_to_right_base.matrix
-
-left_arm_point  = left_arm_FK(q_left) @ link_local_point
-right_arm_point = left_base_T_right @ right_arm_FK(q_right) @ link_local_point
-obstacle_point  = left_base_T_camera @ depth_unproject(pixel, depth)
-```
-
-使用汇总的相对矩阵并以 left/front 为锚点，保证运行时坐标图严格闭合。
-合成 side 外参与独立 left/side 测量相差约 2.825 mm / 0.0926°，在质量限值内。
-加载器重算四份源标定的闭环，不仅信任 `passed=true`；源文件 SHA256 不一致、
-旋转不合法、相机序列号不匹配或质量超限时拒绝加载。
-
-检测以实际请求流的内参、畸变参数和模型为准，避免不同分辨率下套用旧内参。
-深度反投影、机器人深度渲染、实测表面点 lifting 使用一致的镜头畸变处理。
-Inverse Brown 投影/反投影按
-[RealSense SDK 实现](https://github.com/realsenseai/librealsense/blob/master/src/rs.cpp)
-处理，并有与已安装 SDK 的数值对比测试。
-
-机器人剔除与固定点计算使用同一 `flange_to_active_tcp` 和 Robotiq 模型。
-实测 active TCP 与 FK 相差超过 5 mm / 1° 时检测停止，防止探针 TCP 或
-其他工具设置与部署几何不一致。`real_scripts/read_dual_active_tcp_calibration.py`
-可以只读核验；实际 TCP 改变时应核验后更新共享机器人配置。
-
-## 验证与启动
-
-先做文件和几何校验，不连接机械臂或相机：
+## 检查现有标定
 
 ```bash
 python scripts/validate_project_pipeline.py
-python -m pytest -q
+python real_scripts/read_dual_active_tcp_calibration.py
 ```
 
-再启动只读检测，检查双视角点云、机器人剔除和障碍物坐标：
+部署配置：`configs/ur7e_dual_quest3.yaml`。
+汇总文件：`configs/hardware/calibration/dual_arm_camera_transforms.yaml`；四份源标定在同目录。
+TCP 测量默认写入 `outputs/calibration/dual_flange_to_active_tcp.json`，
+核验后手动更新项目配置的 `robot.flange_to_active_tcp`，不会自动安装。
+
+## 重新采集
+
+采集入口位于相邻的 `../quest3_collect` 仓库，需切换到该项目原标定环境，
+要求 `cv2.aruco.CharucoBoard_create` 可用；新版 OpenCV 的运行环境不能直接运行此旧采集入口。
+实体板参数：11×8 格、格边长 70 mm、
+marker 52 mm、`DICT_5X5_100`；必须与实际印刷板一致。
+
+先新建会话，避免已通过的旧结果被自动跳过：
 
 ```bash
-python real_scripts/live_obstacle_detection.py --no-browser
-python real_scripts/live_obstacle_detection_viewer.py
+mkdir -p outputs/calibration/dual_session
+cp configs/hardware/hardware_dual_teleop.yaml outputs/calibration/dual_session/hardware.yaml
+PYTHONPATH=../quest3_collect python -m quest3_robot_data.calibrate_dual_camera_charuco \
+  --config outputs/calibration/dual_session/hardware.yaml \
+  --squares-x 11 --squares-y 8 --square-size-m 0.070 --marker-size-m 0.052 \
+  --dictionary DICT_5X5_100 --max-touch-rms-mm 2.5
 ```
 
-快照 `calibration.sha256` 为汇总文件 SHA256。随机路径验证和 VLA 执行器
-拒绝与固定点采样器标定哈希不同、或缺少哈希的实时快照。
-修改标定配置后需重启检测服务，并重新生成路径。
+每次新标定换一个会话目录。开始前核对 hardware YAML 中的机器人 IP 和相机序列号。
 
-相对基座变换改变会改变双臂 surface_model_hash；旧路径、旧双臂 shard 和
-checkpoint 需要按新几何重建，不能放宽 hash 检查。相机移动后需重新标定。
+1. 固定两台相机；把板放到左臂可达且两路可见的位置。
+2. 按窗口/终端提示锁定板观测，用已校准 TCP 依次触碰指定内角，回车记录。
+3. 移开机械臂，复核板未移动。
+4. 按提示对右臂重复；左右臂可使用不同板位置和触点，但相机保持固定。
 
-## 保留的旧安装流程
+板仍固定时，可在原命令后加 `--arm left --resume` 或 `--arm right --resume` 续做。
+板移动后不要复用旧触点。输出位于会话目录的 `calibration/`，包含四份相机 YAML、观测、触点和汇总 YAML。
 
-`scripts/install_surface_calibration.py` 仍支持两份旧 `camera_calibration.json`
-会话：touch RMS <=3 mm、重投影 RMS <=0.8 px，并拒绝覆盖已有外参文件。
-该流程需要会话声明的固定板和相机条件，不是当前四份 YAML 的安装入口。
-它会移除之前的汇总文件引用，避免混用不同会话。
+## 接入新结果
 
-本次仅完成文件、几何、模拟感知和离线回归验证，未发送运动或夹爪命令。
+切回 `surface-runtime`，把项目 YAML 的下列路径指向新会话：
+
+```yaml
+quest3:
+  hardware_config: outputs/calibration/dual_session/hardware.yaml
+safety:
+  dual_arm_camera_calibration: outputs/calibration/dual_session/calibration/dual_arm_camera_transforms.yaml
+  front_calibration: outputs/calibration/dual_session/calibration/left_base_to_front_camera.yaml
+  side_calibration: outputs/calibration/dual_session/calibration/left_base_to_side_camera.yaml
+  right_front_calibration: outputs/calibration/dual_session/calibration/right_base_to_front_camera.yaml
+  right_side_calibration: outputs/calibration/dual_session/calibration/right_base_to_side_camera.yaml
+  camera_calibration_valid: true
+```
+
+这是现有配置的字段更新示例，保留其余字段。保留汇总引用的源文件，勿手改矩阵或 SHA256。
+
+```bash
+python scripts/validate_project_pipeline.py
+python real_scripts/live_obstacle_detection.py --robot-mask
+```
+
+检查双视角点云重合、机械臂模型与深度位置一致。TCP 检查阈值为 5 mm / 1°；
+出现 `Active TCP differs` 时核对工具配置，修正后重启检测。
+基座变换改变后重新生成相关 shard、路径和 checkpoint；相机移动后重新标定并重做障碍标注。
+
+单臂标定见 [UR7e + Pika](SINGLE_UR7E_PIKA.md)。旧 JSON 会话的安装工具为
+`scripts/install_surface_calibration.py`，不能用它安装当前四份 YAML。

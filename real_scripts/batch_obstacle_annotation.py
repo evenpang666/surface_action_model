@@ -33,6 +33,38 @@ SCHEMA = "dual_rgb_obb_annotation_v2"
 CAMERAS = ("front", "side")
 
 
+def annotation_schema(camera_names):
+    return SCHEMA if tuple(camera_names) == CAMERAS else "single_rgb_obb_annotation_v1"
+
+
+def validate_boxes(boxes, status, cameras):
+    """Validate and canonicalize RGB OBBs for both recorded and live frames."""
+    if not isinstance(boxes, dict) or set(boxes) != set(cameras):
+        raise ValueError(f"Boxes must contain {', '.join(cameras)}")
+    canonical = {}
+    for name, camera in cameras.items():
+        entries = boxes[name]
+        if not isinstance(entries, list) or len(entries) > 32:
+            raise ValueError("At most 32 OBBs per view")
+        canonical[name] = []
+        for box in entries:
+            if not isinstance(box, dict):
+                raise ValueError("Each OBB must be an object")
+            object_id = box.get("object_id")
+            if not isinstance(object_id, str) or not object_id.strip() or len(object_id) > 64:
+                raise ValueError("Each OBB needs a short object_id")
+            obb_mask((camera["rgb_height"], camera["rgb_width"]), box)
+            canonical[name].append({"object_id": object_id.strip(), **{
+                key: float(box[key]) for key in ("cx", "cy", "width", "height", "angle_deg")}})
+    ids = [set(box["object_id"] for box in entries) for entries in canonical.values()]
+    if status == "no_obstacles":
+        if any(ids):
+            raise ValueError("No-obstacle frames must have empty boxes in all views")
+    elif status != "objects" or not ids[0] or any(view != ids[0] for view in ids):
+        raise ValueError("Use the same obstacle IDs in all views, or explicitly mark no_obstacles")
+    return canonical
+
+
 def decode_text(value):
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
@@ -53,7 +85,10 @@ def inspect_episode(path, depth_paths=None):
         if not isinstance(config, dict):
             raise ValueError(f"{path.name}: config_yaml must describe a mapping")
         cameras = {}
-        for name in CAMERAS:
+        camera_names = tuple(name for name in CAMERAS if f"observations/images/{name}/rgb" in source)
+        if "front" not in camera_names:
+            raise ValueError(f"{path.name}: observations/images/front/rgb is required")
+        for name in camera_names:
             rgb_path = f"observations/images/{name}/rgb"
             if rgb_path not in source or len(source[rgb_path]) != count:
                 raise ValueError(f"{path.name}: {rgb_path} is required and must match timestamps_ns")
@@ -103,7 +138,7 @@ def inspect_episode(path, depth_paths=None):
         reviewed = np.zeros(count, bool)
         if GROUP in source:
             group = source[GROUP]
-            if group.attrs.get("schema") != SCHEMA:
+            if group.attrs.get("schema") != annotation_schema(camera_names):
                 raise ValueError(f"{path.name}: incompatible existing annotation schema; RGB coordinates require a new annotation group")
             for key in ("frames_json", "reviewed", "revision", "updated_at_utc", "frame_index", "timestamps_ns"):
                 if key not in group or group[key].shape != (count,):
@@ -141,10 +176,14 @@ def rgb_image(dataset, index):
 
 class BatchAnnotations:
     def __init__(self, task_dir, *, depth_unit_m=.001, depth_paths=None):
-        self.task_dir = Path(task_dir).resolve()
-        if not self.task_dir.is_dir():
-            raise ValueError(f"Task directory does not exist: {self.task_dir}")
-        self.paths = sorted({p.resolve() for suffix in ("*.hdf5", "*.h5") for p in self.task_dir.rglob(suffix)})
+        source = Path(task_dir).expanduser().resolve()
+        if not source.exists():
+            raise ValueError(f"HDF5 path does not exist: {source}")
+        if source.is_file() and source.suffix.lower() not in (".hdf5", ".h5"):
+            raise ValueError(f"Expected an HDF5 file: {source}")
+        self.task_dir = source if source.is_dir() else source.parent
+        self.paths = ([source] if source.is_file() else
+                      sorted({p.resolve() for suffix in ("*.hdf5", "*.h5") for p in source.rglob(suffix)}))
         if not self.paths:
             raise ValueError(f"No HDF5 episodes under {self.task_dir}")
         for path in self.paths:
@@ -182,7 +221,7 @@ class BatchAnnotations:
             path, info = self.indices(episode_id, frame_index)
             with h5py.File(path, "r") as source:
                 references, timestamps, sources = {}, {}, {}
-                for name in CAMERAS:
+                for name in info["cameras"]:
                     camera = info["cameras"][name]
                     reference = rgb_image(source[camera["rgb_path"]], frame_index)
                     if reference.shape[:2] != (camera["rgb_height"], camera["rgb_width"]):
@@ -192,7 +231,7 @@ class BatchAnnotations:
                                         if camera["timestamp_path"] else None)
                     sources[name] = {**camera, "effective_depth_scale_m":
                                      (camera["depth_scale_m"] or self.depth_unit_m) if camera["depth_path"] else None}
-                reviewed, revision, boxes, status = False, 0, {name: [] for name in CAMERAS}, None
+                reviewed, revision, boxes, status = False, 0, {name: [] for name in info["cameras"]}, None
                 if GROUP in source:
                     group = source[GROUP]
                     reviewed, revision = bool(group["reviewed"][frame_index]), int(group["revision"][frame_index])
@@ -213,38 +252,15 @@ class BatchAnnotations:
             if type(revision) is not int or revision < 0:
                 raise ValueError("Frame revision is required")
             status = body.get("status", "objects")
-            boxes = body.get("boxes")
-            if not isinstance(boxes, dict) or set(boxes) != set(CAMERAS):
-                raise ValueError("Boxes must contain front and side")
-            canonical = {}
-            for name in CAMERAS:
-                entries = boxes[name]
-                if not isinstance(entries, list) or len(entries) > 32:
-                    raise ValueError("At most 32 OBBs per view")
-                canonical[name] = []
-                for box in entries:
-                    if not isinstance(box, dict):
-                        raise ValueError("Each OBB must be an object")
-                    object_id = box.get("object_id")
-                    if not isinstance(object_id, str) or not object_id.strip() or len(object_id) > 64:
-                        raise ValueError("Each OBB needs a short object_id")
-                    camera = info["cameras"][name]
-                    obb_mask((camera["rgb_height"], camera["rgb_width"]), box)
-                    canonical[name].append({"object_id": object_id.strip(), **{
-                        key: float(box[key]) for key in ("cx", "cy", "width", "height", "angle_deg")}})
-            ids = {name: {box["object_id"] for box in canonical[name]} for name in CAMERAS}
-            if status == "no_obstacles":
-                if any(ids.values()):
-                    raise ValueError("No-obstacle frames must have empty boxes in both views")
-            elif status != "objects" or not ids["front"] or ids["front"] != ids["side"]:
-                raise ValueError("Use the same obstacle IDs in both views, or explicitly mark no_obstacles")
+            canonical = validate_boxes(body.get("boxes"), status, info["cameras"])
+            schema = annotation_schema(info["cameras"])
             with h5py.File(path, "r+") as source:
                 current = int(source[GROUP+"/revision"][index]) if GROUP in source else 0
                 if current != revision:
                     raise ValueError("Frame changed in another window; reload before saving")
                 if GROUP not in source:
                     group = source.require_group(GROUP)
-                    group.attrs.update(schema=SCHEMA, angle_unit="degrees_clockwise", coordinate_unit="pixels",
+                    group.attrs.update(schema=schema, angle_unit="degrees_clockwise", coordinate_unit="pixels",
                                        annotation_image="recorded_rgb",
                                        obb_fields="cx,cy,width,height,angle_deg,object_id",
                                        camera_sources_json=json.dumps(info["cameras"]),
@@ -258,13 +274,13 @@ class BatchAnnotations:
                     group.create_dataset("updated_at_utc", shape=(n,), dtype=strings)
                     group.create_dataset("frame_index", data=np.arange(n, dtype=np.int64))
                     group.create_dataset("timestamps_ns", data=source["timestamps_ns"][:])
-                    for name in CAMERAS:
+                    for name in info["cameras"]:
                         camera = info["cameras"][name]
                         if camera["timestamp_path"]:
                             group.create_dataset(f"source_timestamps_ns/{name}_depth", data=source[camera["timestamp_path"]][:])
                 group = source[GROUP]
                 timestamp = str(int(source["timestamps_ns"][index]))
-                saved = {"schema": SCHEMA, "frame_index": index, "timestamp_ns": timestamp,
+                saved = {"schema": schema, "frame_index": index, "timestamp_ns": timestamp,
                          "source_timestamps_ns": {name: (str(int(source[camera["timestamp_path"]][index]))
                                                            if camera["timestamp_path"] else None)
                                                   for name, camera in info["cameras"].items()},
@@ -321,7 +337,8 @@ def handler_for(dataset):
                 self.respond({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
         def do_POST(self):
-            if urlsplit(self.path).path != "/api/save":
+            route = urlsplit(self.path).path
+            if route not in ("/api/save", "/api/capture") or (route == "/api/capture" and not hasattr(dataset, "capture")):
                 self.respond({"error": "Unknown endpoint"}, 404)
                 return
             origin = self.headers.get("Origin")
@@ -335,7 +352,7 @@ def handler_for(dataset):
                 body = json.loads(self.rfile.read(size))
                 if not isinstance(body, dict):
                     raise ValueError("Expected a JSON object")
-                self.respond(dataset.save(body))
+                self.respond(dataset.capture() if route == "/api/capture" else dataset.save(body))
             except (ValueError, KeyError, TypeError) as exc:
                 self.respond({"error": str(exc)}, 400)
             except Exception as exc:

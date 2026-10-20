@@ -90,8 +90,13 @@ class RawDepthEvidenceFilter:
                 b = (slice(max(0, dy), min(height, height+dy)),
                      slice(max(0, dx), min(width, width+dx)))
                 tolerance = self.absolute_tolerance_m + self.relative_tolerance * np.minimum(clean[a], clean[b])
+                # Component-wise distances avoid an HxWx3 difference and square
+                # allocation (and a strided reduction) for every neighbour pair.
+                distance2 = np.square(points[a][..., 0] - points[b][..., 0])
+                distance2 += np.square(points[a][..., 1] - points[b][..., 1])
+                distance2 += np.square(points[a][..., 2] - points[b][..., 2])
                 supported = (usable[a] & usable[b] & (np.abs(clean[a]-clean[b]) <= tolerance)
-                             & (np.sum((points[a]-points[b]) ** 2, axis=-1) <= self.neighbor_distance_m ** 2))
+                             & (distance2 <= self.neighbor_distance_m ** 2))
                 neighbors[a] += supported
                 neighbors[b] += supported
         strong = usable & (neighbors >= self.min_neighbors)
@@ -113,16 +118,19 @@ class RawDepthEvidenceFilter:
              "robot_occluded_pixels": int(occluded.sum()), "isolated_pixels": int((usable & (neighbors == 0)).sum()),
              "accepted_raw_pixels": int(accepted.sum()), "uncertain_raw_pixels": int((valid & ~accepted).sum())})
 
-    def world_points(self, depth, mask, camera):
-        """Lift all selected endpoints using the cached distortion-aware rays.
+    def world_points(self, depth, mask, camera, *, stride=1):
+        """Lift selected endpoints using cached distortion-aware rays.
 
         Evidence must not depend on the viewer's point-stride lattice: even a
         small confirmed surface between sampled pixels must reach the map.
+        Keep the default stride=1 for mapping; display clouds may subsample.
         """
         depth, mask = np.asarray(depth, np.float32), np.asarray(mask, bool)
         if self._rays is None or depth.shape != self._rays.shape[:2] or mask.shape != depth.shape:
             raise ValueError("Depth evidence must be updated before lifting endpoints")
-        points = self._rays[mask] * depth[mask, None]
+        stride = max(1, int(stride))
+        depth, mask = depth[::stride, ::stride], mask[::stride, ::stride]
+        points = self._rays[::stride, ::stride][mask] * depth[mask, None]
         transform = np.asarray(camera.camera_to_world, np.float32)
         return points @ transform[:3, :3].T + transform[:3, 3]
 
@@ -135,6 +143,8 @@ def confirm_raw_depth_views(views, *, absolute_tolerance_m=.008, relative_tolera
     confirmation between two unsupported speckles. Robot-occluded pixels are
     ineligible. Neither inferred depth nor rejected raw returns can support it.
     """
+    if len(views) < 2:
+        return
     trusted = {name: np.where(evidence.accepted, depth, 0.)
                for name, (_, depth, evidence) in views.items()}
     for name, (camera, depth, evidence) in views.items():

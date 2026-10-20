@@ -13,3 +13,5 @@
 已清理的确定冗余：训练/服务 tokenizer 合并；主感知未使用 tool_proxy_points/box_surface 和相关未用导入移除；失效工具 URDF/margin 参数移除；重复 workspace 筛选移除。
 
 原 README 快照为 README_2026-09-22.md，其中命令/工具类型可能已经过时，不用作当前部署说明。
+
+论文对照和完整大表模板：[实验设计原稿](EXPERIMENT_TABLE_DESIGN_2026-10-18.md)。当前执行与记录说明见[实验操作](../EXPERIMENT_TABLE_DESIGN.md)。

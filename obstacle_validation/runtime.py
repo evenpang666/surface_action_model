@@ -105,7 +105,7 @@ class CapturedFrameObservation:
     """Reuse a frame's published occupancy belief without elapsed-time decay.
 
     Only replay's explicit latest-frame policy uses this adapter. The original
-    capture time and cell ages remain intact; unknown/occupied cells still block.
+    capture time and cell ages remain intact; occupied cells still block.
     """
 
     def __init__(self, observation):
@@ -114,9 +114,11 @@ class CapturedFrameObservation:
     def __getattr__(self, name):
         return getattr(self.observation, name)
 
-    def segments_observed(self, start, end, *, margin_m=0., now_ns=None):
+    def segments_observed(self, start, end, *, margin_m=0., now_ns=None,
+                          allow_margin_recovery=False):
+        recovery = {"allow_margin_recovery": True} if allow_margin_recovery else {}
         return self.observation.segments_observed(start, end, margin_m=margin_m,
-                                                 now_ns=self.observation.timestamp_ns)
+                                                 now_ns=self.observation.timestamp_ns, **recovery)
 
 
 class ObstacleSceneUnstable(RuntimeError):
@@ -149,10 +151,10 @@ def boxes_from_json(value):
     return boxes_from_snapshot(value)
 
 
-def validate_obstacle_snapshot(value, max_age, *, allow_tracked_obbs=False, allow_scoped_unknown=False):
+def validate_obstacle_snapshot(value, max_age, *, allow_tracked_obbs=False):
     if allow_tracked_obbs and _tracked_obbs_cover_unstable_scene(value):
         value = {**value, "status": "tracked_obbs_in_use"}
-    return validate_snapshot(value, max_age, allow_scoped_unknown=allow_scoped_unknown)
+    return validate_snapshot(value, max_age)
 
 
 def snapshot_state(value):
@@ -175,9 +177,9 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
     An infinite max_age disables only the age cutoff and requires a finite
     http_timeout_s so an unresponsive detector cannot block indefinitely.
     A supplied transform runs before validation; the manual replay filter uses
-    it to retain unknown checks inside its explicitly marked voxel scope.
-    ``after_timestamp_ns`` waits for a newer capture when swept free-space
-    evidence has expired even though the snapshot's overall age is acceptable.
+    it to check occupied cells inside its explicitly marked voxel scope.
+    ``after_timestamp_ns`` explicitly requires a newer capture, even if the
+    snapshot's overall age is acceptable.
     """
     if not np.isfinite(max_wait_s) or max_wait_s < 0:
         raise ValueError("Snapshot wait must be finite and nonnegative")
@@ -196,13 +198,12 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
             return json.load(response)
     while True:
         value = timed_call(timing_stats, "fetch_and_json", fetch)
-        if snapshot_transform is not None:
-            value = timed_call(timing_stats, "manual_filter", snapshot_transform, value)
         try:
-            validate_obstacle_snapshot(value, max_age, allow_tracked_obbs=allow_tracked_obbs,
-                                       allow_scoped_unknown=snapshot_transform is not None)
+            if snapshot_transform is not None:
+                value = timed_call(timing_stats, "manual_filter", snapshot_transform, value)
+            validate_obstacle_snapshot(value, max_age, allow_tracked_obbs=allow_tracked_obbs)
             if after_timestamp_ns is not None and value["host_timestamp_ns"] <= after_timestamp_ns:
-                raise SnapshotExpired("Waiting for a newer capture after swept free-space evidence expired")
+                raise SnapshotExpired("Waiting for a newer capture")
         except SnapshotExpired as exc:
             remaining = deadline - time.monotonic()
             if max_wait_s > 0 and remaining > 0:
@@ -223,6 +224,9 @@ def read_snapshot(url, max_age, *, max_wait_s=0., http_timeout_s=None,
             # Live replay accepts only the explicitly covered OBB fallback;
             # other unstable frames still fail immediately during motion.
             remaining = deadline - time.monotonic()
+            if value.get("status") == "initializing" and max_wait_s > 0 and remaining > 0:
+                time.sleep(min(.05, remaining))
+                continue
             if str(value.get("status", "")).startswith("error: unstable obstacle point clusters"):
                 if max_wait_s > 0 and remaining > 0:
                     time.sleep(min(.05, remaining))

@@ -1,0 +1,9 @@
+{
+  "scene": "ur7e_single_pika",
+  "robot_ip": "192.168.124.73",
+  "verified": false,
+  "flange_to_pika_step_frame": null,
+  "mesh_reference_opening_mm": 0.0,
+  "moving_finger_kinematics_verified": false,
+  "convention": "parent_T_child; maps Pika STEP coordinates in metres into UR flange coordinates. Verify fingers move along STEP -X/+X by half the measured opening change."
+}

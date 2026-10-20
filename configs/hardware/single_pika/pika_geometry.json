@@ -1,0 +1,52 @@
+{
+  "scene": "ur7e_single_pika",
+  "robot_ip": "192.168.124.73",
+  "geometry_mode": "legacy_inherited",
+  "acceptance_basis": "same_installation_as_legacy",
+  "verified": false,
+  "moving_finger_kinematics_verified": false,
+  "flange_to_pika_step_frame": [
+    [
+      -1.0,
+      0.0,
+      0.0,
+      -0.009943775258064518
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0,
+      -0.007155615580645166
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      -0.07282770000000001
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "mesh_reference_opening_mm": 0.0,
+  "moving_finger_model": "legacy_parallel_step_x",
+  "legacy_reference": {
+    "source": "outputs/calibration/pika_mount_from_tcp_provisional.json",
+    "source_sha256": "3af1907f6127b8440aa73092cf5a91296e1d5758d60a1654fa768222b6983200",
+    "source_status": "provisional_requires_visual_validation",
+    "finger_model_source": "real_scripts/live_ur7e_scene_viewer.py",
+    "nominal_flange_T_tcp_pose": [
+      0.0,
+      0.0,
+      0.1983,
+      0.0,
+      0.0,
+      1.5708
+    ]
+  },
+  "convention": "parent_T_child; maps Pika STEP coordinates in metres into UR flange coordinates.",
+  "note": "User states the physical installation is the same as the old single-arm scene. Reuses the old mount, closed-mesh reference and +/- STEP X finger motion; no new physical mount or finger-kinematic measurement is claimed."
+}

@@ -12,5 +12,6 @@
 `real_scripts/live_dual_ur7e_obstacle_model.py` 读取。所有安全几何必须使用实测
 `flange→active_tcp`，并统一到 `left_base`。
 
-`pika_gripper/` 和 `ur7e_pika/` 是早期单臂实验留下的资产，不属于当前
-2F-85/EPick 双臂部署逻辑；保留它们仅用于结果复现，不应被当前入口加载。
+`pika_gripper/` 的 body/finger 网格也用于独立的 [单臂 Pika 场景](../../docs/SINGLE_UR7E_PIKA.md)，
+需使用该场景实测的安装变换和已核验手指运动学；双臂默认入口不加载这些资产。
+`ur7e_pika/` 中的早期 URDF/示例配置保留用于结果复现。

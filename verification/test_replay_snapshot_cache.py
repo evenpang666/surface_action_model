@@ -120,7 +120,7 @@ def test_latest_policy_reuses_expired_capture_without_any_new_frame_wait():
         reader.close()
 
 
-def test_latest_policy_uses_capture_time_belief_but_unknown_and_occupied_still_block():
+def test_frame_age_does_not_block_free_voxels_but_occupied_and_scene_errors_still_block():
     import numpy as np
     from obstacle_validation.lerobot_replay import LiveSceneReader, _motion_safe
     from safety_module.occupancy import LocalOccupancyGrid
@@ -135,7 +135,7 @@ def test_latest_policy_uses_capture_time_belief_but_unknown_and_occupied_still_b
     q, grip, delta = np.zeros(12), np.zeros(2), np.zeros(12)
     delta[0] = .01
     safety = {'collision_margin_m': .01, 'inter_arm_margin_m': .035}
-    assert not _motion_safe(TwoPointSampler(), q, grip, delta, grip, strict.boxes(old), safety)
+    assert _motion_safe(TwoPointSampler(), q, grip, delta, grip, strict.boxes(old), safety)
     assert _motion_safe(TwoPointSampler(), q, grip, delta, grip, latest.boxes(old), safety)
     assert latest.boxes(old).observation.timestamp_ns == stamp
     assert old['host_timestamp_ns'] == old['occupancy_map']['capture_timestamp_ns'] == stamp
@@ -145,7 +145,7 @@ def test_latest_policy_uses_capture_time_belief_but_unknown_and_occupied_still_b
     unknown_grid = LocalOccupancyGrid([-.5, -.5, -.5], np.eye(3), [10, 10, 10], .1)
     unknown_grid.update(timestamp_ns=stamp+2_000_000, raw_hits=[], free_ids=np.empty(0, np.int64))
     unknown = snapshot(unknown_grid.timestamp_ns, occupancy_map=unknown_grid.snapshot(), obbs=[])
-    assert not _motion_safe(TwoPointSampler(), q, grip, delta, grip, latest.boxes(unknown), safety)
+    assert _motion_safe(TwoPointSampler(), q, grip, delta, grip, latest.boxes(unknown), safety)
     with pytest.raises(SnapshotUnknown):
         latest._validate(snapshot(stamp, scene_observation_state='unknown'))
 

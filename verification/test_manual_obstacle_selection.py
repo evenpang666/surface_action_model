@@ -129,11 +129,99 @@ def test_empty_selection_requires_boxes_but_allows_missing_depth():
     assert result["voxel_count"] == 0 and result["objects"][0]["obb"] is None
 
 
+@pytest.mark.parametrize("single_view", [False, True])
+def test_viewer_filters_current_occupancy_without_changing_frozen_or_safety_data(tmp_path, single_view):
+    frames, grid = fixture()
+    if single_view:
+        frames = {"front": frames["front"]}
+    coordinate_frame = "ur_base" if single_view else "left_base"
+    store = ManualSelectionStore(tmp_path, camera_names=tuple(frames), coordinate_frame=coordinate_frame)
+    snapshot = {"frame": 4, "host_timestamp_ns": 100, "occupancy_map": grid.snapshot(),
+                "coordinate_frame": coordinate_frame, "_manual_frames": frames, "obbs": [{"original": True}]}
+    assert store.viewer_filter(snapshot)["state"] == "missing_annotations"
+    capture = store.capture(snapshot, {"frame": 4})
+    annotations = {name: [box(.5, 0, width=2)] for name in frames}
+    frozen = store.select(capture["capture_id"], annotations, "depth")
+    assert frozen["voxel_count"] == 2
+    # Mutating the request after applying it must not change the applied boxes.
+    annotations["front"][0]["cx"] = 2.
+    grid.update(timestamp_ns=200, raw_hits=[[1, 0, 1], [2, 0, 1]], free_ids=np.empty(0, np.int64))
+    current = {**snapshot, "frame": 5, "host_timestamp_ns": 200, "occupancy_map": grid.snapshot()}
+    before = json.dumps(current["occupancy_map"])
+    result = store.viewer_filter(current)
+    assert result["state"] == "applied" and result["frame"] == 5 and result["annotation_frame"] == 4
+    assert result["voxel_count"] == 1
+    np.testing.assert_allclose(result["obbs"][0]["center"], [1., 0., 1.])
+    assert current["obbs"] == [{"original": True}]
+    assert json.dumps(current["occupancy_map"]) == before
+    assert store.scene_payload()["manual_selection"] == frozen
+    assert "viewer_filter" not in current
+    assert store.viewer_filter({**current, "coordinate_frame": "foreign"})["state"] == "scene_changed"
+    assert store.viewer_filter({**current, "calibration": {"changed": True}})["state"] == "scene_changed"
+    assert store.viewer_filter({k: v for k, v in current.items() if k != "occupancy_map"})["state"] == "map_unavailable"
+    grid.update(timestamp_ns=300, raw_hits=[], free_ids=np.empty(0, np.int64))
+    empty = store.viewer_filter({**current, "frame": 6, "occupancy_map": grid.snapshot()})
+    assert empty["state"] == "applied" and empty["voxel_count"] == 0 and not empty["obbs"]
+    store.capture(snapshot, {"frame": 4})
+    assert store.viewer_filter(current)["state"] == "missing_annotations"
+
+
+def test_viewer_filter_requires_matching_object_ids_in_both_views(tmp_path):
+    frames, grid = fixture()
+    snapshot = {"frame": 4, "host_timestamp_ns": 100, "occupancy_map": grid.snapshot(),
+                "coordinate_frame": "left_base", "_manual_frames": frames}
+    store = ManualSelectionStore(tmp_path)
+    capture = store.capture(snapshot, {"frame": 4})
+    annotations = {"front": [box(0, 0, object_id="a"), box(2, 0, object_id="b")],
+                   "side": [box(2, 0, object_id="a"), box(0, 0, object_id="b")]}
+    store.select(capture["capture_id"], annotations, "depth")
+    result = store.viewer_filter(snapshot)
+    assert result["state"] == "applied" and result["voxel_count"] == 0
+
+
+def test_viewer_does_not_add_new_cells_inside_applied_rgb_boxes(tmp_path):
+    frames, grid = fixture()
+    # Both RGB boxes cover the currently missing (2, 0, 1) cell too.
+    grid.update(timestamp_ns=200, raw_hits=[[0, 0, 1], [1, 0, 1]], free_ids=np.empty(0, np.int64))
+    snapshot = {"frame": 1, "host_timestamp_ns": 200, "occupancy_map": grid.snapshot(),
+                "coordinate_frame": "left_base", "_manual_frames": frames}
+    store = ManualSelectionStore(tmp_path)
+    capture = store.capture(snapshot, {"frame": 1})
+    result = store.select(capture["capture_id"], {name: [box(1, 0, width=3)] for name in frames}, "depth")
+    assert result["voxel_count"] == 2
+    grid.update(timestamp_ns=300, raw_hits=[[2, 0, 1]], free_ids=np.empty(0, np.int64))
+    filtered = store.viewer_filter({**snapshot, "frame": 2, "occupancy_map": grid.snapshot()})
+    assert filtered["state"] == "applied"
+    assert filtered["voxel_count"] == 0
+
+
 def test_internal_annotation_arrays_never_enter_public_snapshots():
     from real_scripts.live_dual_ur7e_obstacle_model import snapshot_payload
     snapshot = {"frame": 1, "obbs": [], "_manual_frames": {"front": object()}}
     for options in ({}, {"compact": True}, {"viewer": True}):
         assert json.loads(snapshot_payload(snapshot, **options)) == {"frame": 1, "obbs": []}
+
+
+def test_render_only_wire_format_preserves_safety_payload_and_source_arrays():
+    from real_scripts.live_dual_ur7e_obstacle_model import snapshot_payload
+    frames, grid = fixture()
+    snapshot = {"frame": 1, "status": "ok", "occupancy_map": grid.snapshot(), "calibration": {"sha256": "example"},
+                "environment": {"points": [[.123456789, 0., 1.]], "colors": [[10, 20, 30]]},
+                "robot": {"points": [], "colors": []},
+                "obbs": [{"center": [1, 2, 3], "corners": [[.123456789, 0, 1]]}],
+                "viewer_filter": {"state": "applied", "obbs": [{"corners": [[.123456789, 0, 1]]}]},
+                "_manual_frames": frames}
+    before = json.dumps({k: v for k, v in snapshot.items() if k != "_manual_frames"})
+    rendered = json.loads(snapshot_payload(snapshot, viewer=True, render_only=True))
+    assert "occupancy_map" not in rendered and "calibration" not in rendered
+    assert rendered["environment"]["points"] == [[.12346, 0., 1.]]
+    assert rendered["obbs"] == [{"corners": [[.12346, 0., 1.]]}]
+    assert rendered["viewer_filter"]["obbs"] == rendered["obbs"]
+    for options in ({}, {"viewer": True}, {"compact": True}, {"compact": True, "viewer": True, "render_only": True}):
+        original = json.loads(snapshot_payload(snapshot, **options))
+        assert original["occupancy_map"] == snapshot["occupancy_map"]
+        assert original["obbs"][0]["center"] == [1, 2, 3]
+    assert json.dumps({k: v for k, v in snapshot.items() if k != "_manual_frames"}) == before
 
 
 def test_native_depth_preview_marks_invalid_but_never_overlays_detector_mask():
@@ -243,3 +331,62 @@ def test_nonparallel_views_resolve_front_ray_ambiguity():
     for side_u, expected_z in ((4, 1), (5, 2)):
         result = select_voxels(frames, grid.snapshot(), {"front": [box(3, 3)], "side": [box(side_u, 3)]})
         assert result["voxel_ids"] == grid.point_ids(np.array([[0, 0, expected_z]])).tolist()
+
+
+def test_front_only_selection_requires_explicit_mode_and_uses_accepted_occupied_depth():
+    frames, grid = fixture()
+    front = {"front": frames["front"]}
+    annotations = {"front": [box(1, 0, width=3), box(1, 1), box(2, 2)]}
+    with pytest.raises(ValueError, match="all configured"):
+        select_voxels(front, grid.snapshot(), annotations)
+    result = select_voxels(front, grid.snapshot(), annotations, camera_names=("front",))
+    assert result["voxel_ids"] == sorted(grid.point_ids(np.array([[0, 0, 1], [1, 0, 1], [2, 0, 1]])).tolist())
+    assert result["fusion_rule"] == "single_view_depth" and result["camera_names"] == ["front"]
+    # Rejected center pixel and never-occupied returns are not turned into cells.
+    assert result["accepted_points"]["front"]["1"] == 3
+    with pytest.raises(ValueError, match="captured camera names"):
+        select_voxels(front, grid.snapshot(), {**annotations, "side": []}, camera_names=("front",))
+
+
+def test_front_only_3d_envelope_still_respects_rgb_boxes_and_occupied_cells():
+    frames, grid = fixture()
+    frame = frames["front"]
+    frame.accepted[0, 1] = False
+    front = {"front": frame}
+    annotations = {"front": [box(1, 0, width=3)]}
+    exact = select_voxels(front, grid.snapshot(), annotations, camera_names=("front",))
+    envelope = select_voxels(front, grid.snapshot(), annotations, "obb", camera_names=("front",))
+    middle = grid.point_ids(np.array([[1, 0, 1]]))[0]
+    assert middle not in exact["voxel_ids"] and middle in envelope["voxel_ids"]
+    restricted = select_voxels(front, grid.snapshot(), {"front": [box(0, 0), box(2, 0)]},
+                               "obb", camera_names=("front",))
+    assert middle not in restricted["voxel_ids"]
+
+
+def test_front_only_capture_export_preview_and_dual_replay_isolation(tmp_path):
+    from obstacle_validation.manual_voxel_filter import ManualVoxelFilter
+    frames, grid = fixture()
+    snapshot = {"frame": 8, "coordinate_frame": "ur_base", "host_timestamp_ns": 100,
+                "occupancy_map": grid.snapshot(), "_manual_frames": {"front": frames["front"]},
+                "calibration": {"sha256": "single-calibration"}}
+    store = ManualSelectionStore(tmp_path, camera_names=("front",), coordinate_frame="ur_base")
+    capture = store.capture(snapshot, {"frame": 8, "coordinate_frame": "ur_base"})
+    result = store.select(capture["capture_id"], {"front": [box(2, 0)]}, "depth")
+    directory = tmp_path / capture["capture_id"]
+    assert capture["camera_names"] == ["front"] and set(capture["images"]) == {"front"}
+    assert not (directory / "side_rgb.png").exists()
+    for name in ("capture.json", "annotations.json", "selection.json"):
+        data = json.loads((directory / name).read_text())
+        assert data["coordinate_frame"] == "ur_base"
+        assert data["fusion_rule"] == "single_view_depth"
+        assert data["camera_names"] == ["front"]
+    assert store.scene_payload()["manual_selection"] == result
+    assert np.load(directory / "selected_voxels.npz")["centers"].shape == (1, 3)
+    with pytest.raises(ValueError, match="do not match"):
+        ManualVoxelFilter(directory / "selection.json")
+    with pytest.raises(ValueError, match="requires aligned"):
+        ManualSelectionStore(tmp_path / "dual").capture(snapshot, {})
+    with pytest.raises(ValueError, match="coordinate frame"):
+        store.capture({**snapshot, "coordinate_frame": "left_base"}, {})
+    with pytest.raises(ValueError, match="--occupancy-map"):
+        store.capture({k: v for k, v in snapshot.items() if k != "occupancy_map"}, {})

@@ -32,10 +32,10 @@ def test_chunk_optimizer_corrects_every_intruding_tail_action_before_execution()
     q = np.zeros(12); q[0] = .2
     actions = np.zeros((6, 14)); actions[:, 0] = [.225, .25, .275, .3, .325, .35]
     optimized, info, cbf, _ = optimize_chunk(sampler, actions, [box], q=q)
-    assert info['success'] and info['mode'] == 'optimize_all_actions'
-    assert info['modified_action_indices'] == [4, 5]
+    assert info['success'] and info['mode'] == 'joint_execution_prefix'
+    assert info['joint_variables'] == 6*12 and info['modified_action_indices'] == list(range(6))
     assert all(info['steps'][i]['qp_solve_calls'] > 0 for i in (4, 5))
-    np.testing.assert_allclose(optimized[:4], actions[:4], atol=1e-7)
+    assert info['optimized_acceleration_squared'] < info['seed_acceleration_squared']
     assert np.all(optimized[4:, 0] < .31)
     assert cbf.runtime_stats['qp_solve_calls'] >= 2
     previous = q
@@ -44,11 +44,12 @@ def test_chunk_optimizer_corrects_every_intruding_tail_action_before_execution()
         previous = action[:12]
 
 
-def test_chunk_optimizer_preserves_safe_goals_with_multiple_speed_bounded_steps():
+def test_chunk_optimizer_smooths_safe_goals_with_multiple_speed_bounded_steps():
     actions = np.zeros((2, 14)); actions[:, 0] = [.061, .07]
     optimized, info, cbf, _ = optimize_chunk(TwoPointSampler(), actions, [])
-    assert info['success'] and cbf.runtime_stats['qp_solve_calls'] == 0
-    np.testing.assert_allclose(optimized, actions, atol=1e-12)
+    assert info['success'] and info['joint_qp_solve_calls'] == 1
+    assert np.max(np.abs(optimized-actions)) < .01
+    assert info['optimized_acceleration_squared'] < info['seed_acceleration_squared']
     waypoints = np.asarray(info['waypoints'])
     assert info['waypoint_action_indices'] == [0, 0, 0, 1]
     assert np.abs(np.diff(np.vstack((np.zeros((1, 12)), waypoints[:, :12])), axis=0)).max() <= .025+1e-12
@@ -61,7 +62,7 @@ def test_chunk_optimizer_uses_each_gripper_shape_and_corrected_predecessor():
     actions = np.zeros((3, 14)); actions[:, 13] = [0., .7, 1.]
     box = OrientedBox(np.array([.03, 0., 0.]), np.eye(3), np.array([.003, .1, .1]))
     optimized, info, _, origins = optimize_chunk(GripperSampler(), actions, [box])
-    assert info['success'] and info['modified_action_indices'] == [1, 2]
+    assert info['success'] and info['modified_action_indices'] == [0, 1, 2]
     np.testing.assert_array_equal(optimized[:, 12:], actions[:, 12:])
     assert np.all(optimized[1:, 6]+.03*actions[1:, 13] < .017)
     # The last QP starts from the preceding corrected posture, not q=0.
@@ -69,7 +70,7 @@ def test_chunk_optimizer_uses_each_gripper_shape_and_corrected_predecessor():
                for origin, grip, target in origins if np.allclose(target, [0., 1.]))
 
 
-def test_failed_tail_invalidates_entire_chunk(monkeypatch):
+def test_joint_optimizer_can_recover_from_a_failed_greedy_tail(monkeypatch):
     sampler = TwoPointSampler()
     original = RecordedPathCBF.project
     calls = []
@@ -81,11 +82,12 @@ def test_failed_tail_invalidates_entire_chunk(monkeypatch):
     monkeypatch.setattr(RecordedPathCBF, 'project', fail_last)
     actions = np.zeros((3, 14)); actions[:, 0] = [.01, .02, .03]
     optimized, info, cbf, _ = optimize_chunk(sampler, actions, [])
-    assert optimized is None and not info['success'] and info['failed_action_index'] == 2
+    assert optimized is not None and info['success'] and not info['seed_success']
+    assert info['joint_variables'] == 3*12
     assert cbf.sampler is sampler
 
 
-def test_chunk_planning_check_time_does_not_extend_execution_free_space_ttl():
+def test_chunk_sweeps_allow_aged_free_voxels():
     import time
     from obstacle_validation.lerobot_replay import _motion_safe
     from safety_module.occupancy import LocalOccupancyGrid, ObservationGrid, ObservedBoxes
@@ -99,8 +101,8 @@ def test_chunk_planning_check_time_does_not_extend_execution_free_space_ttl():
     safety = {'collision_margin_m': .01, 'inter_arm_margin_m': .035}
     assert _motion_safe(TwoPointSampler(), q, grip, delta, grip, boxes, safety,
                          observation_now_ns=stamp+10_000_000)
-    assert not _motion_safe(TwoPointSampler(), q, grip, delta, grip, boxes, safety)
-    assert boxes.observation.last_blockage['reason'] == 'expired_free'
+    assert _motion_safe(TwoPointSampler(), q, grip, delta, grip, boxes, safety)
+    assert boxes.observation.last_blockage is None
 
 
 def test_preview_cache_reuses_exact_overlapping_actions_and_keys_gripper():
@@ -168,7 +170,7 @@ def test_cbf_restoration_accepts_safe_lateral_steps_or_hold_without_rrt(monkeypa
     assert checker.edge_safe(np.zeros(12), delta)
 
 
-def test_cbf_restoration_classifies_expired_free_instead_of_planning(monkeypatch):
+def test_cbf_restoration_can_advance_through_aged_free_voxels(monkeypatch):
     import time
     import obstacle_validation.core as core
     from safety_module.occupancy import LocalOccupancyGrid, ObservationGrid, ObservedBoxes
@@ -186,8 +188,8 @@ def test_cbf_restoration_classifies_expired_free_instead_of_planning(monkeypatch
                                dt=.05, speed=.5, acceleration=1.2, tolerance=.001, projector=cbf)
     checker = CollisionChecker(TwoPointSampler(), np.zeros(2), boxes, observation_now_ns=stamp+3_000_000_000)
     delta, state = follower.next_delta(np.zeros(12), checker)
-    assert state == 'scene_expired' and not delta.any()
-    assert checker.last_observation_blockage['reason'] == 'expired_free'
+    assert state == 'nominal' and delta[0] > 0
+    assert checker.last_observation_blockage is None
 
 
 def test_cbf_restoration_infeasibility_never_falls_back_to_rrt(monkeypatch):
@@ -205,7 +207,7 @@ def test_cbf_restoration_infeasibility_never_falls_back_to_rrt(monkeypatch):
     assert state == 'cbf_infeasible' and not delta.any()
 
 
-def test_current_barrier_qp_corrects_a_future_normal_that_cuts_a_rounded_corner():
+def test_full_step_cbf_corrects_a_future_normal_that_cuts_a_rounded_corner():
     sampler = TwoPointSampler()
     box = OrientedBox(np.array([-.1, 0., 0.]), np.eye(3), np.array([.02, .03, .1]))
     checker = CollisionChecker(sampler, np.zeros(2), [box], margin=.01)
@@ -215,7 +217,8 @@ def test_current_barrier_qp_corrects_a_future_normal_that_cuts_a_rounded_corner(
     nominal = -q; nominal *= .003/max(abs(nominal))
     safe, info = cbf.project(q, nominal, checker, lower=np.full(12, -1.), upper=np.full(12, 1.),
                              max_step=.025, previous_delta=np.zeros(12), acceleration_step=.003)
-    assert info['success'] and info['projection_method'] == 'current_barrier_qp'
+    assert info['success'] and info['projection_method'] == 'full_step_cbf_qp'
+    assert np.max(np.abs(safe)) >= np.max(np.abs(nominal))-1e-7
     assert safe[0] > 0. and checker.edge_safe(q, q+safe)
 
 
@@ -337,7 +340,7 @@ def test_lerobot_cbf_projects_nominal_step_before_a_box():
     assert checker.edge_safe(q, q+delta)
 
 
-def test_lerobot_cbf_backtracks_solver_step_before_obstacle(monkeypatch):
+def test_lerobot_cbf_redirects_an_unsafe_solver_step_without_shortening(monkeypatch):
     import obstacle_validation.cbf as cbf_module
     sampler = TwoPointSampler()
     box = OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))
@@ -353,7 +356,9 @@ def test_lerobot_cbf_backtracks_solver_step_before_obstacle(monkeypatch):
                              upper=np.full(12, 1.), max_step=.1,
                              previous_delta=np.zeros(12), acceleration_step=.2)
     assert 0 <= safe[0] < .1
-    assert info['success'] and info['fk_backtrack_fraction'] < 1.
+    assert info['success'] and info['projection_method'] == 'full_step_cbf_qp'
+    assert np.max(np.abs(safe)) == pytest.approx(.1)
+    assert 'fk_backtrack_fraction' not in info
     assert checker.edge_safe(q, q+safe)
 
 
@@ -434,7 +439,7 @@ def test_lerobot_cbf_uses_future_points_to_recover_clearance():
     assert _motion_safe(sampler, q, grip, corrected, grip, [box], safety, True)
 
 
-def test_lerobot_cbf_relaxes_recovery_when_one_tick_cannot_clear_margin():
+def test_lerobot_cbf_preserves_full_step_when_recovering_a_deficient_margin():
     from obstacle_validation.lerobot_replay import _motion_safe
 
     sampler = TwoPointSampler()
@@ -455,9 +460,45 @@ def test_lerobot_cbf_relaxes_recovery_when_one_tick_cannot_clear_margin():
         swept_safe=lambda step: _motion_safe(sampler, q, grip, step, grip,
                                              [box], safety, True))
     future_clearance = checker.clearance(q+corrected)[0]
-    assert info['success'] and info['recovery_alpha'] == .5
+    assert info['success'] and info['projection_method'] == 'full_step_cbf_qp'
+    assert np.max(np.abs(corrected)) == pytest.approx(.003)
     assert corrected[0] < 0.
     assert .005 < future_clearance < .01
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_lerobot_cbf_recovers_voxel_margin_without_shortening_or_entering_occupied_cell(captured):
+    from obstacle_validation.lerobot_replay import _motion_safe
+    from obstacle_validation.runtime import CapturedFrameObservation
+    from safety_module.occupancy import LocalOccupancyGrid, ObservationGrid, ObservedBoxes
+
+    grid = LocalOccupancyGrid([.42, -.01, -.01], np.eye(3), [1, 1, 1], .02)
+    grid.update(timestamp_ns=1, raw_hits=[[.43, 0., 0.]], free_ids=np.empty(0, np.int64))
+    observation = ObservationGrid(grid.snapshot())
+    if captured:
+        observation = CapturedFrameObservation(observation)
+    box = OrientedBox(np.array([.43, 0., 0.]), np.eye(3), np.full(3, .01))
+    boxes = ObservedBoxes([box], observation)
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    q = np.zeros(12); q[0] = .415
+    nominal = np.zeros(12); nominal[0] = .003
+    safety = {'collision_margin_m': .01, 'inter_arm_margin_m': .035}
+    checker = CollisionChecker(sampler, grip, boxes, margin=.01)
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025,
+                          alpha=1., iterations=64)
+    lower, upper = np.zeros(12), np.zeros(12)
+    lower[0], upper[0] = -1., 1.
+    corrected, info = cbf.project(
+        q, nominal, checker, lower=lower, upper=upper,
+        max_step=.003, previous_delta=np.zeros(12), acceleration_step=.003,
+        swept_safe=lambda step: _motion_safe(sampler, q, grip, step, grip, boxes, safety, True))
+    assert info['success'] and info['recovery_step']
+    assert corrected[0] == pytest.approx(-.003)
+    assert np.max(np.abs(corrected)) == pytest.approx(.003)
+    assert .005 < checker.clearance(q+corrected)[0] < .01
+    assert not _motion_safe(sampler, q, grip, nominal, grip, boxes, safety, True)
+    assert not _motion_safe(sampler, q, grip, corrected, grip, boxes, safety, False)
 
 
 def test_lerobot_cbf_rejects_action_with_no_possible_clearance_progress():
@@ -486,10 +527,10 @@ def test_lerobot_cbf_rejects_action_with_no_possible_clearance_progress():
                                  {'collision_margin_m': .01, 'inter_arm_margin_m': .035}, True))
     assert not info['success']
     assert info['current_state_below_clearance']
-    assert info['reason'] == 'recovery_future_or_sweep_unsafe'
+    assert info['reason'] == 'no_safe_full_joint_step'
 
 
-def test_lerobot_cbf_uses_verified_prefix_when_future_face_linearization_is_infeasible():
+def test_lerobot_cbf_preserves_step_when_future_face_linearization_is_infeasible():
     sampler = TwoPointSampler()
     box = OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))
     checker = CollisionChecker(sampler, np.zeros(2), [box], margin=.01)
@@ -502,7 +543,133 @@ def test_lerobot_cbf_uses_verified_prefix_when_future_face_linearization_is_infe
                              upper=np.full(12, 1.), max_step=.2,
                              previous_delta=np.zeros(12), acceleration_step=.2)
     assert info['success']
-    assert info['projection_method'] == 'verified_nominal_prefix'
+    assert info['projection_method'] == 'full_step_cbf_qp'
+    assert np.max(np.abs(safe)) == pytest.approx(.2)
     assert info['predicted_obstacle_penetration_m'] > 0
     assert 0 < safe[0] < .06
     assert checker.edge_safe(q, q+safe)
+
+
+def test_repeated_avoidance_preserves_step_and_passes_obstacle_without_oscillation():
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    boxes = [OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))]
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025, alpha=1., iterations=64)
+    q = np.zeros(12); q[0] = .4
+    goal = q.copy(); goal[0] = .8
+    previous = np.zeros(12)
+    poses = [q.copy()]
+    for _ in range(40):
+        nominal = np.clip(goal-q, -.025, .025)
+        checker = CollisionChecker(sampler, grip, boxes, margin=.01, inter_arm_margin=.035)
+        delta, info = cbf.project(
+            q, nominal, checker, lower=np.full(12, -1.), upper=np.full(12, 1.), max_step=.025,
+            previous_delta=previous, acceleration_step=.003, target_gripper=grip)
+        assert info['success'] and checker.edge_safe(q, q+delta)
+        assert np.max(np.abs(nominal))-1e-7 <= np.max(np.abs(delta)) <= .025+1e-7
+        assert 'fk_backtrack_fraction' not in info
+        q += delta
+        poses.append(q.copy())
+        previous = delta
+        if np.max(np.abs(q-goal)) < 1e-6:
+            break
+    else:
+        pytest.fail('Full steps must make a detour, rather than alternate along the same face')
+    assert np.max(np.abs(np.asarray(poses)[:, 1])) > .16
+    np.testing.assert_allclose(q, goal, atol=1e-6)
+
+
+def test_no_full_step_within_joint_limits_fails_instead_of_creeping_or_using_null_joints():
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    boxes = [OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))]
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025, alpha=1., iterations=64)
+    q = np.zeros(12); q[0] = .4
+    nominal = np.zeros(12); nominal[0] = .025
+    lower, upper = np.full(12, -1.), np.full(12, 1.)
+    lower[0] = q[0]  # No retreat; the only tangential joint is locked.
+    lower[1] = upper[1] = 0.
+    checker = CollisionChecker(sampler, grip, boxes, margin=.01)
+    delta, info = cbf.project(q, nominal, checker, lower=lower, upper=upper,
+                              max_step=.025, previous_delta=np.zeros(12), acceleration_step=.003)
+    assert not info['success'] and info['reason'] == 'no_safe_full_joint_step'
+    np.testing.assert_array_equal(delta, np.zeros(12))
+
+
+def test_chunk_preview_keeps_detour_memory_local_until_a_waypoint_is_executed():
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    boxes = [OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .15, .1]))]
+    q = np.zeros(12); q[0] = .4
+    actions = np.zeros((8, 14)); actions[:, 0] = .5
+    optimized, info, cbf, _ = optimize_chunk(sampler, actions, boxes, q=q)
+    assert info['success'] and optimized is not None
+    assert np.any(info['waypoint_steps'][0]['detour_direction'])
+    np.testing.assert_array_equal(cbf.detour_direction, np.zeros(12))
+    waypoints = np.asarray(info['waypoints'])[:, :12]
+    assert np.all(np.max(np.abs(np.diff(np.vstack((q, waypoints)), axis=0)), axis=1) <= .025+1e-7)
+    # Each already-corrected target is accepted once, instead of repeatedly
+    # chasing the nominal target with its original subdivision count.
+    assert len(info['waypoints']) == len(actions)
+
+
+def test_full_step_redirection_preserves_inter_arm_separation():
+    class NearArmSampler(TwoPointSampler):
+        def link_points(self, q, grip):
+            return np.asarray([[[q[0], q[1], 0.]], [[.04, 0., 0.]]])
+
+    sampler, grip = NearArmSampler(), np.zeros(2)
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025, alpha=1., iterations=64)
+    q, nominal = np.zeros(12), np.zeros(12)
+    nominal[0] = .025
+    checker = CollisionChecker(sampler, grip, [], inter_arm_margin=.035)
+    delta, info = cbf.project(q, nominal, checker, lower=np.full(12, -1.), upper=np.full(12, 1.),
+                              max_step=.025, previous_delta=np.zeros(12), acceleration_step=.003)
+    assert info['success'] and info['inter_arm_constraints'] > 0
+    assert np.max(np.abs(delta)) == pytest.approx(.025)
+    assert checker.edge_safe(q, q+delta)
+
+
+def test_full_step_reselects_detour_when_old_direction_reaches_a_joint_bound():
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    boxes = [OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .03, .1]))]
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025, alpha=1., iterations=64)
+    q = np.zeros(12); q[:2] = [.40999, .05]
+    cbf.detour_direction[1] = 1.
+    nominal = np.zeros(12); nominal[:2] = [.025, -.025]
+    lower, upper = np.full(12, -1.), np.full(12, 1.)
+    upper[1] = q[1]
+    checker = CollisionChecker(sampler, grip, boxes, margin=.01)
+    delta, info = cbf.project(q, nominal, checker, lower=lower, upper=upper, max_step=.025,
+                              previous_delta=np.zeros(12), acceleration_step=.003)
+    assert info['success'] and info['detour_reselected']
+    assert np.max(np.abs(delta)) == pytest.approx(.025)
+    assert q[1]+delta[1] <= upper[1]+1e-7
+    assert checker.edge_safe(q, q+delta)
+
+
+def test_chunk_full_steps_stay_within_each_actions_tracking_bounds():
+    sampler, grip = TwoPointSampler(), np.zeros(2)
+    boxes = [OrientedBox(np.array([.5, 0., 0.]), np.eye(3), np.array([.08, .03, .1]))]
+    cbf = RecordedPathCBF(sampler, grip, collision_margin_m=.01,
+                          inter_arm_margin_m=.035, trigger_margin_m=.025, alpha=1., iterations=64)
+    q = np.zeros(12); q[0] = .4
+    actions = np.zeros((8, 14)); actions[:, 0] = np.arange(1, 9)*.025+.4
+    lower, upper = np.full((8, 12), -1.), np.full((8, 12), 1.)
+    lower[:, 0] = np.linspace(.3, .45, len(actions))
+    lower[:, 1], upper[:, 1] = -.06, np.linspace(.06, .05, len(actions))
+    checker = CollisionChecker(sampler, grip, boxes, margin=.01)
+    optimized, info = cbf.project_chunk(
+        q, grip, actions, checker, lower=lower, upper=upper, max_step=.025,
+        previous_delta=np.zeros(12), acceleration_step=.003,
+        swept_safe=lambda origin, opening, delta, target: checker.edge_safe(origin, origin+delta))
+    assert info['success'] and optimized is not None
+    previous = q
+    for waypoint, source in zip(info['waypoints'], info['waypoint_action_indices']):
+        point = np.asarray(waypoint[:12])
+        assert np.all(point >= lower[source]-1e-7) and np.all(point <= upper[source]+1e-7)
+        assert checker.edge_safe(previous, point)
+        previous = point
+    assert all(step['joint_step_rad'] <= .025+1e-7 and step['joint_optimization']
+               for step in info['waypoint_steps'])

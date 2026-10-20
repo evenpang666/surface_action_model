@@ -1,6 +1,7 @@
 __pycache__/
 outputs/
 *.pyc
+real_scripts/_voxblox_native*.so
 *.egg-info
 *.egg
 .idea

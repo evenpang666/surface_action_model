@@ -1,16 +1,20 @@
-"""Explicit, fixed 3D OBB scope for model-free live voxel replay."""
+"""Explicit, fixed selected-cell scope for model-free live voxel replay."""
 
 import json
 from pathlib import Path
 
 import numpy as np
 
-from safety_module.occupancy import (FREE, OCCUPIED, OUTSIDE, UNKNOWN,
+from safety_module.occupancy import (FREE, OCCUPIED, OUTSIDE,
                                      LocalOccupancyGrid, ObservationGrid, _pack)
+from safety_module.voxel_selection import VoxelSelectionScope
 
 
 class ManualVoxelFilter:
-    """Filter each fresh map using the OBBs fitted to a reviewed capture."""
+    """Constrain only live occupancy inside the reviewed capture's selected cells."""
+
+    scope_policy = "selected_voxel_cells"
+    geometry_source = "manual_selected_live_voxels"
 
     def __init__(self, selection_path):
         self.path = Path(selection_path).resolve()
@@ -51,12 +55,12 @@ class ManualVoxelFilter:
             self.boxes.append((center, axes, half))
         if not self.boxes:
             raise ValueError("Manual selection has no occupied 3D OBB")
-        self.selected_centers = self.reference.centers(ids)
-        centers = self.reference.centers(np.arange(self.reference.size))
-        captured_scope = np.zeros(self.reference.size, bool)
+        self.cell_scope = VoxelSelectionScope(self.reference, ids)
+        self.selected_centers = self.cell_scope.centers
+        captured_scope = np.zeros(len(ids), bool)
         for center, axes, half in self.boxes:
-            captured_scope |= np.all(np.abs((centers-center) @ axes) <= half+1e-9, axis=1)
-        if not np.all(captured_scope[ids]):
+            captured_scope |= np.all(np.abs((self.selected_centers-center) @ axes) <= half+1e-9, axis=1)
+        if not np.all(captured_scope):
             raise ValueError("Saved manual OBBs do not enclose their selected voxels")
         self.calibration_digest = (capture.get("calibration") or {}).get("sha256")
         if not self.calibration_digest:
@@ -67,30 +71,32 @@ class ManualVoxelFilter:
         self.last_diagnostics = None
 
     def _prepare_geometry(self, live):
-        """Reproject saved world-frame OBBs when the detector grid changes."""
-        key = (tuple(live.origin), tuple(live.axes.reshape(-1)),
-               tuple(live.shape), live.resolution_m)
-        mapped, inside = live.indices(self.selected_centers)
-        if not np.all(inside) or np.any(live.state[mapped] == OUTSIDE):
-            raise ValueError("Saved manual obstacle falls outside the live occupancy workspace; recapture and reselect")
+        """Cache selected cells without expanding to their fitted OBBs."""
+        key = self.cell_scope.geometry_key(live)
+        scope = self.cell_scope.mask_for(live)
         if key == self.geometry_key:
             return
-        centers = live.centers(np.arange(live.size))
-        scope = np.zeros(live.size, bool)
-        for center, axes, half in self.boxes:
-            selected = np.all(np.abs((centers-center) @ axes) <= half+1e-9, axis=1)
-            if not np.any(selected & (live.state != OUTSIDE)):
-                raise ValueError("Saved manual OBB has no live occupancy cells; recapture and reselect")
-            scope |= selected
         self.packer = LocalOccupancyGrid(live.origin, live.axes, live.shape, live.resolution_m)
         self.scope, self.geometry_key = scope, key
 
     def __call__(self, snapshot):
-        if snapshot.get("obstacle_backend") != "probabilistic_voxels":
-            raise ValueError("Manual selection requires the live probabilistic voxel backend")
+        status = str(snapshot.get("status", ""))
+        # Failed acquisition/calibration snapshots have no map or backend. Report
+        # that original failure before checking selection compatibility.
+        if (status == "initializing" or (status.startswith("error:")
+                and status != "error: unknown obstacle space"
+                and not status.startswith("error: unstable obstacle point clusters"))):
+            raise RuntimeError(f"Live obstacle detector: {status}")
+        if snapshot.get("coordinate_frame") != "left_base":
+            raise ValueError("Dual-arm manual replay requires the live left_base coordinate frame")
+        payload = snapshot.get("occupancy_map")
+        backend = snapshot.get("obstacle_backend") or (payload.get("backend") if isinstance(payload, dict) else None)
+        if backend not in ("probabilistic_voxels", "numpy", "octomap", "voxblox"):
+            raise ValueError(f"Manual selection requires a live voxel map (NumPy, OctoMap or Voxblox); "
+                             f"received backend={backend!r}, status={status!r}. "
+                             "Start detection with --occupancy-map --occupancy-backend voxblox")
         if (snapshot.get("calibration") or {}).get("sha256") != self.calibration_digest:
             raise ValueError("Manual selection calibration differs from the live detector")
-        payload = snapshot.get("occupancy_map")
         if not isinstance(payload, dict) or payload.get("capture_timestamp_ns") != snapshot.get("host_timestamp_ns"):
             raise ValueError("Live occupancy map is missing or not capture aligned")
         live = ObservationGrid(payload)
@@ -101,39 +107,38 @@ class ManualVoxelFilter:
         state[~self.scope] = OUTSIDE
         selected_ids = np.flatnonzero(state == OCCUPIED)
         boxes = self.packer.boxes(occupied_ids=selected_ids)
-        # Inflate as the detector does; the frozen OBBs only define selection scope.
-        margin_value = (snapshot.get("diagnostics") or {}).get("box_margin_m")
-        if margin_value is None:
-            raise ValueError("Detector must publish box_margin_m; restart the updated detection service")
-        margin = float(margin_value)
-        if not np.isfinite(margin) or margin < 0:
-            raise ValueError("Invalid detector box margin")
+        # Rebuild exact occupied-cell geometry even when an older detector
+        # publishes inflated OBBs. Fitted selection OBBs never broaden scope.
         result_boxes = []
         for box in boxes:
-            half = box.extents / 2 + margin
+            half = box.extents / 2
             result_boxes.append({"center": box.center.tolist(), "axes": box.rotation.tolist(),
                                  "half_sizes": half.tolist(), "voxel_count": box.point_count,
-                                 "geometry_source": "manual_selected_live_voxels"})
+                                 "geometry_source": self.geometry_source})
         counts = np.bincount(state, minlength=4)
         filtered_map = {**payload, "state_data": _pack(state),
-                        "unknown_voxels": int(counts[UNKNOWN]), "free_voxels": int(counts[FREE]),
+                        "unknown_voxels": 0, "free_voxels": int(counts[FREE]),
                         "occupied_voxels": int(counts[OCCUPIED]), "outside_voxels": int(counts[OUTSIDE]),
-                        # The map does not encode per-cell historical hazard flags.
-                        # Treat every scoped unknown as potentially historical.
-                        "historical_unknown_voxels": int(counts[UNKNOWN])}
-        diagnostics = {**snapshot.get("diagnostics", {}),
+                        "historical_unknown_voxels": 0}
+        # The global ESDF contains distances to unselected obstacles. Cropping
+        # its sample mask cannot recompute those distances for our new scope.
+        if payload.get("backend") == "voxblox" and (payload.get("voxblox") or {}).get("esdf"):
+            native = payload["voxblox"]
+            filtered_map["voxblox"] = {**native, "esdf": {
+                **native["esdf"], "guidance_usable": False,
+                "guidance_disabled_reason": "manual_obstacle_scope_not_recomputed"}}
+        diagnostics = {**snapshot.get("diagnostics", {}), "box_margin_m": 0.,
                        "manual_selection": {"path": str(self.path),
+                                            "scope_policy": self.scope_policy,
                                             "scope_voxels": int(self.scope.sum()),
                                             "occupied_voxels": len(selected_ids),
-                                            "detector_occupied_voxels": int(payload["occupied_voxels"]),
-                                            "unknown_voxels": int(counts[UNKNOWN]),
-                                            "unscoped_historical_unknown_voxels": payload.get("historical_unknown_voxels", 0)}}
+                                            "detector_occupied_voxels": int(payload["occupied_voxels"])}}
         self.last_diagnostics = diagnostics["manual_selection"]
         status = snapshot.get("status", "")
         if not other_unknown and status == "error: unknown obstacle space":
             status = "manual selected voxel scope"
         return {**snapshot, "obbs": result_boxes, "occupancy_map": filtered_map,
-                "obstacle_scope": "manual_obb_voxels_v1",
+                "obstacle_scope": "manual_selected_voxels_v1",
                 "unknown_obstacles": other_unknown,
                 "scene_observation_state": "unknown" if other_unknown else "observed",
                 "status": status, "diagnostics": diagnostics}

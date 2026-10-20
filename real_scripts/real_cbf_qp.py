@@ -28,7 +28,7 @@ def boxes_from_snapshot(snapshot):
     if snapshot.get("coordinate_frame") != "left_base":
         raise ValueError("Obstacle coordinates must explicitly be left_base")
     payload = snapshot.get("occupancy_map")
-    if payload is None and snapshot.get("obstacle_backend") == "probabilistic_voxels":
+    if payload is None and snapshot.get("obstacle_backend") in ("probabilistic_voxels", "octomap", "voxblox"):
         raise ValueError("Probabilistic obstacle snapshot is missing its occupancy map")
     observation = None if payload is None else ObservationGrid(payload)
     if observation is not None and observation.timestamp_ns != snapshot.get("host_timestamp_ns"):
@@ -274,8 +274,12 @@ def project_joint_delta_qp(
     iterations: int = 32,
     use_current_barrier: bool = False,
     use_predicted_linearization: bool = False,
+    guidance: tuple[np.ndarray, float] | None = None,
 ) -> tuple[np.ndarray, dict[str, float | int | bool | str]]:
-    """Solve ``min 0.5||dq-dq_nom||²`` with bounds and linear CBF constraints."""
+    """Solve ``min 0.5||dq-dq_nom||²`` with bounds and linear CBF constraints.
+
+    Optional MCBF ``guidance=(row, minimum)`` adds ``row @ dq >= minimum``.
+    """
     nominal = np.asarray(nominal_delta, dtype=np.float64).reshape(-1)
     low = np.asarray(lower_delta, dtype=np.float64).reshape(-1)
     high = np.asarray(upper_delta, dtype=np.float64).reshape(-1)
@@ -288,7 +292,7 @@ def project_joint_delta_qp(
     if use_current_barrier and use_predicted_linearization:
         raise ValueError("Choose only one CBF linearization reference")
     delta = np.clip(nominal, low, high)
-    if not constraints:
+    if not constraints and guidance is None:
         return delta.astype(np.float32), {"triggered": False, "success": True, "constraint_count": 0, "max_violation": 0.0}
     rows, rhs = [], []
     for item in constraints:
@@ -320,6 +324,12 @@ def project_joint_delta_qp(
             continue
         rows.append(grad)
         rhs.append(required)
+    if guidance is not None:
+        row, minimum = np.asarray(guidance[0], dtype=float), float(guidance[1])
+        if row.shape != nominal.shape or not np.isfinite(row).all() or not np.isfinite(minimum):
+            raise ValueError("Invalid tangent guidance constraint")
+        rows.append(row)
+        rhs.append(minimum)
     if not rows:
         return delta.astype(np.float32), {"triggered": True, "success": True, "constraint_count": len(constraints), "max_violation": 0.0}
     matrix = np.stack(rows)

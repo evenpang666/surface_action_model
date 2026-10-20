@@ -2,17 +2,20 @@
 
 The action provider is the recorded dataset, not a learned policy.  Joint
 actions are absolute 12-joint targets; the two gripper values are closing
-targets.  Physical output is disabled unless the explicit execute flag and
-acknowledgement are supplied.
+targets. Replay executes on hardware by default; use --no-execute for virtual
+replay.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
+from datetime import datetime
 import json
 import math
 from pathlib import Path
 import socket
+import sys
 import time
 
 import h5py
@@ -20,14 +23,16 @@ import numpy as np
 import pyarrow.parquet as parquet
 import yaml
 
-from obstacle_validation.cbf import CBFGoalFollower, PreviewFKCache, RecordedPathCBF
+from obstacle_validation.cbf import PreviewFKCache, RecordedPathCBF
 from obstacle_validation.core import CollisionChecker, segments_within_box_margin, vector
 from obstacle_validation.quest3_schema import NAMES, _joint_order
 from obstacle_validation.runtime import (EXECUTE_ACK, CapturedFrameObservation, DualCommander, LatestSnapshotCache,
                                          boxes_from_json, read_snapshot, snapshot_state, timed_call,
                                          validate_obstacle_snapshot)
 from obstacle_validation.manual_voxel_filter import ManualVoxelFilter
+from obstacle_validation.manual_annotation_filter import ManualAnnotationFilter
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler
+from real_scripts.manual_obstacle_selection import latest_annotation_path
 from safety_module.geometry import swept_inter_arm_safe
 from safety_module.dual_camera_calibration import validate_calibration_identity
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
@@ -37,6 +42,16 @@ from safety_module.runtime_contract import SnapshotExpired
 SCHEMA = "quest3_dual_ur7e_lerobot_absolute_action_v1"
 STATE_NAMES = [*NAMES, "left_gripper", "right_gripper"]
 ACTION_NAMES = [*NAMES, "left_gripper_target", "right_gripper_target"]
+
+
+def latest_manual_annotations() -> Path:
+    """Find the newest capture directory containing annotations, including legacy IDs."""
+    root = resolve_repo_path("outputs/manual_obstacles")
+    path = latest_annotation_path(root)
+    if path is None:
+        raise ValueError(f"No annotations.json found under {root}; save annotations first "
+                         "or pass --manual-annotations /path/to/annotations.json")
+    return path
 
 
 def _episode_arrays(filename: Path, start_frame: int, end_frame: int | None):
@@ -229,7 +244,7 @@ class RobotiqTargetWriter:
 class DualGripperCommander:
     """Two explicit, non-resetting Robotiq outputs."""
 
-    def __init__(self, left_ip: str, right_ip: str, *, speed: int = 40, force: int = 25):
+    def __init__(self, left_ip: str, right_ip: str, *, speed: int = 255, force: int = 25):
         if not 0 <= speed <= 255 or not 0 <= force <= 255:
             raise ValueError("Robotiq speed and force must be in [0,255]")
         self.outputs = []
@@ -326,7 +341,8 @@ def _motion_safe(sampler, q, grip, delta, target_grip, boxes, safety, allow_unsa
     if not initial_safe:
         return (allow_unsafe_start and observation_rollout_safe(
             sampler, q, grip, [delta], boxes, gripper_chunk=[target_grip],
-            margin_m=safety["collision_margin_m"], now_ns=observation_now_ns) and _recovery_motion_safe(
+            margin_m=safety["collision_margin_m"], now_ns=observation_now_ns,
+            allow_margin_recovery=True) and _recovery_motion_safe(
                 sampler, q, grip, delta, target_grip, boxes, safety))
     # Check observation, rounded obstacle margins and inter-arm separation in
     # the same FK pass. Each commanded sweep is still checked at four substeps.
@@ -375,8 +391,9 @@ def _motion_failure_context(sampler, q, grip, delta, target_grip, boxes, safety,
         reason = "combined_joint_gripper_sweep_blocked"
     from safety_module.occupancy import observation_rollout_safe
     if not observation_rollout_safe(sampler, q, grip, [delta], boxes,
-                                    gripper_chunk=[target_grip], margin_m=safety["collision_margin_m"]):
-        reason = "unknown_or_expired_voxel_sweep"
+                                    gripper_chunk=[target_grip], margin_m=safety["collision_margin_m"],
+                                    allow_margin_recovery=allow_unsafe_start):
+        reason = "occupied_voxel_sweep"
 
     def finite(value):
         return float(value) if np.isfinite(value) else None
@@ -397,7 +414,7 @@ def _motion_failure_context(sampler, q, grip, delta, target_grip, boxes, safety,
 class LiveSceneReader:
     """Read cached OBBs with an explicit latest-frame or strict age policy."""
 
-    def __init__(self, url, age, manual_filter=None, *, reuse_expired=False):
+    def __init__(self, url, age, manual_filter=None, *, reuse_expired=False, provider=None):
         self.url, self.age, self.manual_filter = url, age, manual_filter
         self.reuse_expired = reuse_expired
         self.stale_snapshot_reads = 0
@@ -405,20 +422,28 @@ class LiveSceneReader:
         self.unstable_scene_reads = 0
         self.timings = {}
         self.cache = None
+        self.provider = provider
+        self._closed = False
         self._decoded_snapshot = self._decoded_boxes = None
 
     def start(self, initial):
+        if self.provider is not None:
+            return  # The embedded source already publishes from its own worker.
         self.cache = LatestSnapshotCache(self._read_direct, self._validate, initial,
                                          reuse_on_transport_error=self.reuse_expired)
 
     def close(self):
+        if self._closed:
+            return
         if self.cache is not None:
             self.cache.close()
+        if self.provider is not None:
+            self.provider.close()
+        self._closed = True
 
     def _validate(self, snapshot):
         age = validate_obstacle_snapshot(snapshot, float("inf") if self.reuse_expired else self.age,
-                                         allow_tracked_obbs=True,
-                                         allow_scoped_unknown=self.manual_filter is not None)
+                                         allow_tracked_obbs=True)
         self.max_snapshot_age_s = max(self.max_snapshot_age_s, age)
         if age > self.age:
             self.stale_snapshot_reads += 1
@@ -431,6 +456,8 @@ class LiveSceneReader:
             if self.reuse_expired and getattr(self._decoded_boxes, "observation", None) is not None:
                 self._decoded_boxes.observation = CapturedFrameObservation(self._decoded_boxes.observation)
             self._decoded_snapshot = snapshot
+            if hasattr(self._decoded_boxes, "__dict__"):
+                self._decoded_boxes.source_snapshot = snapshot
         return self._decoded_boxes
 
     def read(self, *, max_wait_s=0., after_timestamp_ns=None):
@@ -441,6 +468,11 @@ class LiveSceneReader:
         return self._read_direct(max_wait_s=max_wait_s, after_timestamp_ns=after_timestamp_ns)
 
     def _read_direct(self, *, max_wait_s=0., after_timestamp_ns=None):
+        if self.provider is not None:
+            snapshot = timed_call(self.timings, "embedded_read", self.provider.read,
+                                  max_wait_s=max_wait_s, after_timestamp_ns=after_timestamp_ns)
+            self._validate(snapshot)
+            return snapshot
         options = {"snapshot_transform": self.manual_filter} if self.manual_filter is not None else {}
         if after_timestamp_ns is not None:
             options["after_timestamp_ns"] = after_timestamp_ns
@@ -465,14 +497,35 @@ def _read_checked(commander, *, live, url, age, calibration_digest, snapshot_rea
 
 
 def run_replay(args) -> dict:
+    # Acquisition can start before the main replay loop, including in virtual
+    # mode. Release it on every initialization error as well as normal exit.
+    with ExitStack() as cleanup:
+        return _run_replay(args, cleanup)
+
+
+def _run_replay(args, cleanup) -> dict:
+    annotation_path = getattr(args, "manual_annotations", None)
+    if args.mode == "avoid" and not (args.manual_selection or annotation_path):
+        annotation_path = args.manual_annotations = latest_manual_annotations()
+        print(f"[replay] using latest annotations: {annotation_path}", file=sys.stderr, flush=True)
+    if args.mode == "baseline" and (args.manual_selection or annotation_path):
+        raise ValueError("--manual-selection / --manual-annotations is only used with --mode avoid")
+    # Mode determines acquisition: direct replay never starts perception;
+    # avoidance always reads the selected live scene, even without --live.
+    args.live = args.mode == "avoid"
     config, config_path = load_project_config(args.project_config)
     safety = config["safety"]
-    if (not np.isfinite(args.speed) or args.speed <= 0 or not np.isfinite(args.acceleration)
-            or args.acceleration <= 0 or not np.isfinite(args.gripper_speed_fraction_s)
-            or args.gripper_speed_fraction_s <= 0 or args.action_horizon < 1 or args.execute_horizon < 1
+    # Use the full Robotiq hardware speed in both replay modes unless requested otherwise.
+    gripper_speed = args.gripper_speed
+    if not 0 <= gripper_speed <= 255 or not 0 <= args.gripper_force <= 255:
+        raise ValueError("Robotiq gripper speed and force must be in [0,255]")
+    rate_limits = (args.speed, args.acceleration)
+    if (any(value is not None and (not np.isfinite(value) or value <= 0) for value in rate_limits)
+            or not np.isfinite(args.restore_speed) or args.restore_speed <= 0
+            or not np.isfinite(args.gripper_speed_fraction_s) or args.gripper_speed_fraction_s <= 0
+            or args.action_horizon < 1 or args.execute_horizon < 1
             or not np.isfinite(args.restore_settle_timeout) or args.restore_settle_timeout <= 0
             or not np.isfinite(args.restore_timeout) or args.restore_timeout <= 0
-            or not np.isfinite(args.restore_joint_room) or args.restore_joint_room <= 0
             or (args.mode == "baseline" and
                 (not np.isfinite(args.action_timeout) or args.action_timeout <= 0))
             or not np.isfinite(args.arrival_tolerance) or args.arrival_tolerance <= 0
@@ -482,10 +535,6 @@ def run_replay(args) -> dict:
         raise ValueError("--initial-state is only available for virtual replay")
     if args.execute and args.execute_ack != EXECUTE_ACK:
         raise ValueError(f"Physical execution requires --execute-ack {EXECUTE_ACK}")
-    if args.execute and args.mode == "avoid" and not args.live:
-        raise ValueError("Physical CBF replay requires --live obstacle detection")
-    if args.manual_selection and (not args.live or args.mode != "avoid"):
-        raise ValueError("--manual-selection requires --mode avoid --live")
     if args.live and not safety.get("camera_calibration_valid", False):
         raise RuntimeError("Live replay requires validated dual-view calibration")
     if args.hdf5 is not None:
@@ -496,6 +545,9 @@ def run_replay(args) -> dict:
     else:
         dataset_path = args.dataset
     policy = DatasetActionPolicy(dataset_path)
+    max_joint_step = args.speed*policy.period if args.speed is not None else np.inf
+    restore_max_joint_step = args.restore_speed*policy.period
+    acceleration_step = args.acceleration*policy.period**2 if args.acceleration is not None else np.inf
     if args.hdf5 is not None:
         requested = Path(args.hdf5).resolve()
         source = policy.metadata
@@ -503,19 +555,47 @@ def run_replay(args) -> dict:
                 or source["time_scale"] != args.time_scale or source["start_frame"] != args.start_frame
                 or (args.end_frame is not None and source["end_frame_inclusive"] != args.end_frame)):
             raise ValueError("Existing LeRobot dataset does not match requested HDF5 conversion")
-    sampler = DualUR7eSurfacePointSampler(points_per_link=args.points_per_link, project_config=config_path)
-    if args.execute and (not all(sampler.tcp_transform_verified.values()) or not sampler.calibration_digest):
+    sampler = (DualUR7eSurfacePointSampler(points_per_link=args.points_per_link, project_config=config_path)
+               if args.mode == "avoid" else None)
+    if args.execute and sampler is not None and (not all(sampler.tcp_transform_verified.values()) or not sampler.calibration_digest):
         raise RuntimeError("Physical replay requires verified dual TCP and shared calibration")
     if args.live and not sampler.calibration_digest:
         raise RuntimeError("Live replay requires shared dual-camera calibration")
     url = args.obstacle_url or safety["obstacle_url"]
     age = safety["stale_timeout_s"]
-    manual_filter = ManualVoxelFilter(args.manual_selection) if args.manual_selection else None
+    if annotation_path:
+        manual_filter = ManualAnnotationFilter(annotation_path, config_path)
+    elif args.manual_selection:
+        # Existing command lines may pass annotations.json through the old option.
+        saved_path = Path(args.manual_selection)
+        saved = json.loads(saved_path.read_text(encoding="utf-8")) if saved_path.is_file() else {}
+        manual_filter = (ManualAnnotationFilter(args.manual_selection, config_path)
+                         if "annotations" in saved or "boxes" in saved else ManualVoxelFilter(args.manual_selection))
+    else:
+        manual_filter = None
     reuse_expired = args.mode == "avoid" and args.obstacle_age_policy == "latest"
-    scene_reader = LiveSceneReader(url, age, manual_filter, reuse_expired=reuse_expired)
-    # Startup has no controller attached yet. Latest mode accepts the last
-    # published frame immediately; strict mode may wait for fresh evidence.
-    first = scene_reader.read(max_wait_s=5.) if args.live else None
+    embedded = (args.live and args.mode == "avoid" and manual_filter is not None
+                and args.obstacle_source == "auto" and args.obstacle_url is None)
+    provider = None
+    if embedded:
+        from real_scripts.replay_voxblox import ReplayVoxbloxSource
+        provider = ReplayVoxbloxSource(config_path, manual_filter,
+                                      startup_timeout_s=args.voxblox_startup_timeout,
+                                      robot_mask=getattr(args, "robot_mask", False))
+        scene_reader = LiveSceneReader(url, age, manual_filter, reuse_expired=reuse_expired, provider=provider)
+        print(f"[replay] starting selected-region Voxblox TSDF (robot mask={getattr(args, 'robot_mask', False)}; ESDF/viewer off)",
+              file=sys.stderr, flush=True)
+    else:
+        scene_reader = LiveSceneReader(url, age, manual_filter, reuse_expired=reuse_expired)
+    cleanup.callback(scene_reader.close)
+    # Physical restoration uses robot feedback only; defer live perception
+    # until it finishes. Virtual live replay may read a scene for its initial pose.
+    # Embedded acquisition must be ready before creating motion controllers.
+    # The physical restore still uses only robot feedback.
+    ready = scene_reader.read(max_wait_s=5.) if embedded else None
+    if ready is not None:
+        validate_calibration_identity(ready, sampler.calibration_digest)
+    first = (ready if embedded else scene_reader.read(max_wait_s=5.)) if args.live and not args.execute else None
     if first is not None:
         validate_calibration_identity(first, sampler.calibration_digest)
     q0, g0 = vector(policy.metadata["initial_state"][:12], 12, "recorded initial joints"), vector(
@@ -527,7 +607,7 @@ def run_replay(args) -> dict:
         commander = DualCommander(left_ip, right_ip, policy.period)
         gripper_commander = None
         try:
-            gripper_commander = DualGripperCommander(left_ip, right_ip, speed=args.gripper_speed,
+            gripper_commander = DualGripperCommander(left_ip, right_ip, speed=gripper_speed,
                                                      force=args.gripper_force)
         except BaseException:
             commander.close()
@@ -551,37 +631,95 @@ def run_replay(args) -> dict:
     cbf = (RecordedPathCBF(sampler, grip, collision_margin_m=safety["collision_margin_m"],
                            inter_arm_margin_m=safety["inter_arm_margin_m"],
                            trigger_margin_m=safety["trigger_margin_m"], alpha=safety["cbf_alpha"],
-                           iterations=safety["cbf_iterations"]) if args.mode == "avoid" else None)
+                           iterations=safety["cbf_iterations"],
+                           modulation=args.avoidance_controller == "mcbf",
+                           optimization_space=args.optimization_space) if args.mode == "avoid" else None)
+    adaptive = None
+    if cbf is not None and cbf.modulation:
+        from obstacle_validation.ellipsoid_mcbf import EllipsoidMCBF, EllipsoidMCBFConfig
+        adaptive = EllipsoidMCBF(
+            sampler, margin=safety["collision_margin_m"], alpha=safety["cbf_alpha"],
+            inter_arm_margin=safety["inter_arm_margin_m"], period=policy.period,
+            optimization_space=args.optimization_space,
+            config=EllipsoidMCBFConfig(**safety.get("ellipsoid_mcbf", {})))
     scene_snapshot = first
     boxes = scene_reader.boxes(first) if first is not None else []
     failure_context = None
-    action_joint_lower = np.minimum(policy.states[:, :12].min(0), q0)-.15
-    action_joint_upper = np.maximum(policy.states[:, :12].max(0), q0)+.15
-    planning_sampler = PreviewFKCache(sampler, capacity=max(64, 2*args.action_horizon))
+    last_cbf_failure = last_tracking_excursion = None
+    action_joint_lower = np.minimum(policy.states[:, :12].min(0), q0)-.15 if cbf is not None else None
+    action_joint_upper = np.maximum(policy.states[:, :12].max(0), q0)+.15 if cbf is not None else None
+    if adaptive is not None:
+        # The recorded tracking tube excludes useful detours. Use the UR
+        # model's joint range, retaining the same angle branch as the episode.
+        arm_limits = np.array([2*np.pi, 2*np.pi, np.pi, 2*np.pi, 2*np.pi, 2*np.pi])
+        limits = np.tile(arm_limits, 2)
+        action_joint_lower, action_joint_upper = -limits, limits
+        if np.any(policy.actions[:, :12] < -limits) or np.any(policy.actions[:, :12] > limits):
+            raise ValueError("Recorded targets exceed the UR model joint bounds")
+    # Preserve waypoint precision when removing the speed limit: a looser
+    # arrival tolerance would consume room reserved for avoidance detours.
+    avoid_waypoint_tolerance = min(.0125, args.arrival_tolerance, max_joint_step/2,
+                                  args.max_tracking_error/4)
+    tracking_feedback_margin = min(float(safety.get("max_state_drift_rad", .01)),
+                                   args.max_tracking_error/4)
+    # A measured waypoint can be reached with residual error. Reserve that
+    # tolerance and feedback motion inside the original tracking limit.
+    planning_tracking_room = (args.max_tracking_error-avoid_waypoint_tolerance
+                              -tracking_feedback_margin)*(1.-1e-6)
+    planning_sampler = (PreviewFKCache(sampler, capacity=max(64, 2*args.action_horizon))
+                        if cbf is not None else None)
     runtime_timings = {}
 
     def measure(name, function, *args, **kwargs):
         return timed_call(runtime_timings, name, function, *args, **kwargs)
 
     def plan_dataset_chunk(measured_q, measured_grip, boxes, actions, previous_delta):
-        nonlocal failure_context
+        nonlocal last_cbf_failure
+        if adaptive is not None:
+            optimized, info = measure(
+                "adaptive_mcbf_pipeline", adaptive.plan, measured_q, measured_grip, actions, boxes,
+                lower=action_joint_lower, upper=action_joint_upper,
+                max_step=max_joint_step, previous_delta=previous_delta, acceleration_step=acceleration_step)
+            progress_log.write(json.dumps({"action_index": action_index, "stage": "adaptive_control",
+                "elapsed_s": info["planning_seconds"], "adaptive_stage": info["adaptive_stage"],
+                "solver_message": info["steps"][0]["solver_message"]})+"\n")
+            progress_log.flush()
+            return optimized, info
+        def progress(event):
+            row = {"action_index": action_index, "horizon": len(actions), **event}
+            progress_log.write(json.dumps(row)+"\n")
+            progress_log.flush()
+            if event["stage"] in ("seed", "joint_qp", "joint_qp_complete", "guidance_fallback", "complete"):
+                print(f"[replay] action {action_index}:{action_index+len(actions)} "
+                      f"{event['stage']} {event['elapsed_s']:.2f}s"
+                      +(f" space={event['optimization_space']}" if "optimization_space" in event else "")
+                      +(f" {event['solver_message']}" if "solver_message" in event else "")
+                      +(f" {event['reason']}" if event.get("reason") else ""), file=sys.stderr, flush=True)
+        cbf.progress_callback = progress
         planning_now = time.monotonic_ns()
         scene = CollisionChecker(planning_sampler, measured_grip, boxes,
                                  margin=safety["collision_margin_m"],
                                  inter_arm_margin=safety["inter_arm_margin_m"],
                                  observation_now_ns=planning_now)
+        indices = action_index+np.arange(len(actions))
+        references = policy.states[indices, :12]
+        following = policy.states[np.minimum(indices+1, len(policy.states)-1), :12]
+        # Each corrected endpoint must remain valid when the executor advances
+        # to the next sample; do not plan a detour that the tracking guard rejects.
+        room = planning_tracking_room
+        lower = np.maximum(action_joint_lower, np.maximum(references, following)-room)
+        upper = np.minimum(action_joint_upper, np.minimum(references, following)+room)
+        # The CBF requires a finite step bound. With no requested rate limit,
+        # use the full joint/tracking envelope so no valid motion is clipped.
+        planning_max_step = min(max_joint_step, float(np.max(
+            np.maximum(upper.max(0), measured_q)-np.minimum(lower.min(0), measured_q))))
         optimized, info = measure(
             "chunk_cbf_pipeline", cbf.project_chunk, measured_q, measured_grip, actions, scene,
-            lower=action_joint_lower, upper=action_joint_upper,
-            max_step=args.speed*policy.period, previous_delta=previous_delta,
-            acceleration_step=args.acceleration*policy.period**2, fk_sampler=planning_sampler,
-            swept_safe=lambda origin, opening, delta, target: _motion_safe(
-                planning_sampler, origin, opening, delta, target, boxes, safety, True, planning_now))
-        blockage = info.get("sweep_blockage")
-        if blockage and blockage["reason"] == "expired_free":
-            raise SnapshotExpired("Chunk CBF-QP requires fresh free-space evidence")
+            lower=lower, upper=upper,
+            max_step=planning_max_step, previous_delta=previous_delta,
+            acceleration_step=acceleration_step, fk_sampler=planning_sampler)
         if not info["success"]:
-            failure_context = {
+            last_cbf_failure = {
                 "reason": "cbf_projection_failed", "action_index": action_index,
                 "failed_action_index": action_index+info["failed_action_index"],
                 "qpos": measured_q.tolist(), "gripper_position": measured_grip.tolist(),
@@ -589,30 +727,20 @@ def run_replay(args) -> dict:
                 "dataset_action": actions[info["failed_action_index"]].tolist(),
                 "nominal_delta": info["failed_nominal_delta"], "cbf": info["failed_step"],
                 "dataset_action_chunk": actions.tolist(), "cbf_chunk": info,
-                "joint_lower": action_joint_lower.tolist(), "joint_upper": action_joint_upper.tolist(),
+                "joint_lower": info["failed_joint_lower"], "joint_upper": info["failed_joint_upper"],
                 "obbs": [{"center": b.center.tolist(), "axes": b.axes.tolist(),
                           "half_sizes": b.half_sizes.tolist()} for b in boxes]}
-            raise RuntimeError(f"CBF could not project action chunk: {info['reason']}")
         return optimized, info
 
-    def plan_baseline_step(measured_q, measured_grip, boxes, action):
-        nonlocal failure_context
-        desired_q, desired_grip = action[:12], action[12:]
-        delta = np.clip(desired_q-measured_q, -args.speed*policy.period, args.speed*policy.period)
-        if not _motion_safe(sampler, measured_q, measured_grip, delta, desired_grip, boxes, safety):
-            observation = getattr(boxes, "observation", None)
-            blockage = getattr(observation, "last_blockage", None)
-            if blockage and blockage["reason"] == "expired_free":
-                raise SnapshotExpired("Dataset sweep requires fresh free-space evidence")
-            failure_context = _motion_failure_context(
-                sampler, measured_q, measured_grip, delta, desired_grip, boxes, safety,
-                action=action, cbf_info=None)
-            failure_context.update(action_index=action_index,
-                                   source_frame=int(policy.source_frames[action_index]))
-            raise RuntimeError(f"Dataset joint/gripper action is blocked: {failure_context['reason']}")
-        return delta, desired_grip, None
-
     args.output.mkdir(parents=True, exist_ok=True)
+    # A previous run's failure must not look like this run's live status while
+    # a long optimization is still in progress. Final metrics replace this.
+    (args.output/"report.json").write_text(json.dumps({
+        "status": "running", "completed": False,
+        "execution": "physical" if args.execute else "virtual", "mode": args.mode,
+        "constraint_checks": cbf is not None, "action_optimization": cbf is not None,
+        "dataset": str(Path(dataset_path).resolve()),
+        "progress_file": "planning.jsonl" if cbf is not None else None}), encoding="utf-8")
     records = []
     start_time = time.monotonic()
     restore_start = start_time
@@ -623,6 +751,23 @@ def run_replay(args) -> dict:
     stale_scene_pauses = 0
     def active_time():
         return time.monotonic()
+
+    def check_tracking(measured_q, index):
+        nonlocal max_tracking_error, failure_context, last_tracking_excursion
+        difference = np.abs(measured_q-policy.states[index, :12])
+        joint = int(np.argmax(difference))
+        error = float(difference[joint])
+        max_tracking_error = max(max_tracking_error, error)
+        if cbf is not None and error > args.max_tracking_error:
+            context = {"reason": "dataset_tracking_error", "action_index": index,
+                               "joint_index": joint, "joint_name": STATE_NAMES[joint],
+                               "tracking_error_rad": error, "limit_rad": args.max_tracking_error,
+                               "qpos": measured_q.tolist(),
+                               "recorded_qpos": policy.states[index, :12].tolist()}
+            # Continue optimizing the same action back into its tracking
+            # envelope. An excursion does not consume or abort an action.
+            last_tracking_excursion = context
+        return error
 
     def pause_for_fresh_scene(after_timestamp_ns=None):
         nonlocal gripper_commands_sent, stale_scene_pauses
@@ -648,319 +793,125 @@ def run_replay(args) -> dict:
                 raise
             return pause_for_fresh_scene()
 
+    def read_restore_feedback():
+        # Restoration intentionally does not consume perception or run FK.
+        return measure("robot_feedback", commander.read_state)
+
+    restore_deadline = active_time()+args.restore_timeout
+
+    def check_restore_timeout():
+        nonlocal failure_context
+        if active_time() >= restore_deadline:
+            failure_context = {"phase": "restore", "reason": "restore_timeout",
+                               "qpos": q.tolist(), "gripper_position": grip.tolist(),
+                               "target_qpos": q0.tolist(), "target_gripper": g0.tolist(),
+                               "restore_controller": "interpolation", "collision_checks": False}
+            raise RuntimeError(f"Initial-state restoration exceeded {args.restore_timeout:g}s")
+
     try:
-        if args.live:
-            scene_reader.start(first)
-        # Baseline matches the VLA runtime's joint/gripper interpolation.
-        # Avoid mode follows a separately checked joint path, then restores
-        # grippers in checked increments before any dataset action is sent.
-        distance = max(float(np.max(np.abs(q0-q)))/args.speed,
+        # Both modes restore with independent joint/gripper interpolation rates, without
+        # obstacle, observation, inter-arm or CBF checks. Live scene consumption
+        # starts only after physical restoration has settled and stopped.
+        distance = max(float(np.max(np.abs(q0-q)))/args.restore_speed,
                        float(np.max(np.abs(g0-grip)))/args.gripper_speed_fraction_s)
         restore_steps = max(1, math.ceil(1.5*distance/policy.period))
         start_q, start_grip = q.copy(), grip.copy()
         with (args.output/"steps.jsonl").open("w", encoding="utf-8") as log, \
-             (args.output/"chunks.jsonl").open("w", encoding="utf-8") as chunk_log:
-            if cbf is not None:
-                # Restore with fixed gripper geometry. Every nominal joint
-                # action aims at the recorded start and is projected by the
-                # future-surface QP-CBF. This controller has no geometric
-                # planner fallback: each accepted action comes from the QP.
-                room = args.restore_joint_room
-                restore_follower = CBFGoalFollower(
-                    q0, lower=np.minimum(start_q, q0)-room,
-                    upper=np.maximum(start_q, q0)+room, dt=policy.period,
-                    speed=args.speed, acceleration=args.acceleration,
-                    tolerance=args.restore_tolerance, projector=cbf)
-                if commander:
-                    cbf.before_solve = lambda: measure("stop", commander.stop)
-                restore_deadline = active_time()+args.restore_timeout
-                restore_steps = 0  # The checked follower replaces linear interpolation.
-                restore_step = 0
-                grip_first = False
-                arms_stopped_for_grip = False
-
-                def restoration_failure(reason, delta, scene, scene_boxes):
-                    nonlocal failure_context
-                    obstacle_clearance, arm_clearance = scene.clearance(q)
-                    failure_context = {
-                        "reason": reason, "phase": "restore", "restore_step": restore_step,
-                        "qpos": q.tolist(), "gripper_position": grip.tolist(),
-                        "target_qpos": q0.tolist(), "target_gripper": g0.tolist(),
-                        "joint_delta": np.asarray(delta).tolist(),
-                        "joint_lower": restore_follower.lower.tolist(),
-                        "joint_upper": restore_follower.upper.tolist(),
-                        "current_obstacle_clearance_m": (float(obstacle_clearance)
-                                                         if np.isfinite(obstacle_clearance) else None),
-                        "current_inter_arm_clearance_m": float(arm_clearance),
-                        "cbf": restore_follower.last_cbf_info,
-                        "restore_controller": "cbf_qp",
-                        "restore_replans": 0,
-                        "restore_cbf_interventions": restore_follower.cbf_interventions,
-                        "restore_cbf_failures": restore_follower.cbf_failures,
-                        "cbf_step_duration_s": restore_follower.last_step_duration_s,
-                        "planning_edge_rejections": dict(scene.edge_rejections),
-                        "planning_observation_rejections": dict(scene.observation_rejections),
-                        "planning_observation_blockage": scene.last_observation_blockage,
-                        "planning_observation_check_ns": scene.observation_now_ns,
-                        "occupancy_map": (scene_snapshot.get("occupancy_map")
-                                          if scene_snapshot is not None else None),
-                        "obbs": [{"center": b.center.tolist(), "axes": b.axes.tolist(),
-                                  "half_sizes": b.half_sizes.tolist()} for b in scene_boxes]}
-
-                def refresh_expired_scene(scene_boxes, *, force=False):
-                    nonlocal q, grip, boxes, scene_snapshot
-                    observation = getattr(scene_boxes, "observation", None)
-                    blockage = getattr(observation, "last_blockage", None)
-                    if not args.live or observation is None or (
-                            not force and (not blockage or blockage["reason"] != "expired_free")):
-                        return False
-                    restore_follower.last_delta[:] = 0
-                    if commander:
-                        q, grip, boxes, scene_snapshot = pause_for_fresh_scene(observation.timestamp_ns)
-                    else:
-                        scene_snapshot = scene_reader.read(max_wait_s=3.,
-                                                           after_timestamp_ns=observation.timestamp_ns)
-                        validate_calibration_identity(scene_snapshot, sampler.calibration_digest)
-                        boxes = scene_reader.boxes(scene_snapshot)
-                    return True
-
-                while True:
-                    tick = time.monotonic()
-                    if active_time() >= restore_deadline:
-                        scene = CollisionChecker(sampler, grip, boxes,
-                                                 margin=safety["collision_margin_m"],
-                                                 inter_arm_margin=safety["inter_arm_margin_m"])
-                        restoration_failure("restore_timeout", np.zeros(12), scene, boxes)
-                        raise RuntimeError(f"Obstacle-aware initial-state restoration exceeded "
-                                           f"{args.restore_timeout:g}s")
-                    if commander:
-                        q, grip, boxes, scene_snapshot = read_checked()
-                        if scene_snapshot and scene_snapshot.get("_stale_scene_pause"):
-                            restore_follower.last_delta[:] = 0
-                    else:
-                        scene_snapshot = scene_reader.read() if args.live else None
-                        boxes = scene_reader.boxes(scene_snapshot) if scene_snapshot is not None else []
-                    scene = CollisionChecker(sampler, grip, boxes,
-                                             margin=safety["collision_margin_m"],
-                                             inter_arm_margin=safety["inter_arm_margin_m"],
-                                             observation_now_ns=(time.monotonic_ns()
-                                                                 if commander and args.live else None))
-                    if not scene.state_safe(q):
-                        restoration_failure("restore_current_state_unsafe", np.zeros(12), scene, boxes)
-                        raise RuntimeError("Current restoration state is inside obstacle/inter-arm clearance")
-                    goal_scene = CollisionChecker(sampler, g0, boxes,
-                                                  margin=safety["collision_margin_m"],
-                                                  inter_arm_margin=safety["inter_arm_margin_m"])
-                    if not goal_scene.state_safe(q0):
-                        restoration_failure("restore_goal_unsafe", np.zeros(12), scene, boxes)
-                        raise RuntimeError("Recorded initial joint/gripper state is blocked by the live scene")
-                    joint_error = float(np.max(np.abs(q-q0)))
-                    grip_error = float(np.max(np.abs(grip-g0)))
-                    if joint_error <= args.restore_tolerance and grip_error <= args.gripper_tolerance:
-                        break
-                    if joint_error > args.restore_tolerance and not scene.state_safe(q0):
-                        grip_first = True
-                    changing_grip = grip_first or joint_error <= args.restore_tolerance
-                    delta = np.zeros(12)
-                    desired_grip = grip.copy()
-                    state = "gripper" if changing_grip else "nominal"
-                    if changing_grip:
-                        if commander and not arms_stopped_for_grip:
-                            measure("stop", commander.stop)
-                            arms_stopped_for_grip = True
-                        desired_grip = grip+np.clip(g0-grip,
-                                                     -args.gripper_speed_fraction_s*policy.period,
-                                                     args.gripper_speed_fraction_s*policy.period)
-                    else:
-                        arms_stopped_for_grip = False
-                        cbf.gripper = grip.copy()
-                        delta, state = measure("restore_cbf_step", restore_follower.next_delta, q, scene)
-                        if state == "scene_expired" and refresh_expired_scene(boxes, force=True):
-                            continue
-                        if state in ("unsafe_current_state", "cbf_infeasible", "scene_expired",
-                                     "step_blocked", "completed"):
-                            restoration_failure(f"restore_{state}", delta, scene, boxes)
-                            raise RuntimeError(f"CBF-QP restoration cannot advance: {state}; "
-                                               f"{restore_follower.last_cbf_info}")
-                    # A CBF call may outlive the map's free-space TTL. The
-                    # physical branch reads and checks a new scene below before
-                    # sending anything, so do not reject its planned step using
-                    # the old snapshot's newly expired evidence.
-                    if not (commander and args.live) and not _motion_safe(
-                            sampler, q, grip, delta, desired_grip, boxes, safety):
-                        if refresh_expired_scene(boxes):
-                            continue
-                        restoration_failure("restore_motion_blocked", delta, scene, boxes)
-                        raise RuntimeError("Obstacle-aware restoration step is blocked")
-                    if active_time() >= restore_deadline:
-                        restoration_failure("restore_timeout", delta, scene, boxes)
-                        raise RuntimeError(f"Obstacle-aware initial-state restoration exceeded "
-                                           f"{args.restore_timeout:g}s")
-                    if commander and args.live:
-                        fresh_q, fresh_grip, fresh_boxes, scene_snapshot = read_checked()
-                        if scene_snapshot and scene_snapshot.get("_stale_scene_pause"):
-                            restore_follower.last_delta[:] = 0
-                            # A stop may change the measured pose. Recompute
-                            # the bounded QP step on the fresh map next cycle.
-                            continue
-                        drift = float(np.max(np.abs(fresh_q-q)))
-                        grip_drift = float(np.max(np.abs(fresh_grip-grip)))
-                        q, grip, boxes = fresh_q, fresh_grip, fresh_boxes
-                        if drift > safety.get("max_state_drift_rad", .01) or grip_drift > .02:
-                            restore_follower.last_delta[:] = 0
-                            continue
-                        if changing_grip:
-                            desired_grip = grip+np.clip(g0-grip,
-                                                         -args.gripper_speed_fraction_s*policy.period,
-                                                         args.gripper_speed_fraction_s*policy.period)
-                        scene = CollisionChecker(sampler, grip, boxes,
-                                                 margin=safety["collision_margin_m"],
-                                                 inter_arm_margin=safety["inter_arm_margin_m"])
-                        if (np.any(q+delta < restore_follower.lower) or
-                                np.any(q+delta > restore_follower.upper) or
-                                not measure("fresh_sweep", _motion_safe, sampler, q, grip, delta, desired_grip, boxes, safety)):
-                            if refresh_expired_scene(boxes):
-                                continue
-                            restore_follower.last_delta[:] = 0
-                            continue
-                    if active_time() >= restore_deadline:
-                        restoration_failure("restore_timeout", delta, scene, boxes)
-                        raise RuntimeError(f"Obstacle-aware initial-state restoration exceeded "
-                                           f"{args.restore_timeout:g}s")
-                    if commander:
-                        if state == "cbf_hold":
-                            measure("stop", commander.stop)
-                        elif not changing_grip:
-                            measure("joint_command", commander.send, q, delta)
-                        else:
-                            gripper_commands_sent += measure("gripper_command", gripper_commander.send_if_changed, desired_grip)
-                    else:
-                        q += delta
-                        grip = desired_grip.copy()
-                    if grip_first and np.max(np.abs(grip-g0)) <= args.gripper_tolerance:
-                        adjusted_goal = CollisionChecker(sampler, grip, boxes,
-                                                         margin=safety["collision_margin_m"],
-                                                         inter_arm_margin=safety["inter_arm_margin_m"])
-                        if adjusted_goal.state_safe(q0):
-                            grip_first = False
-                    row = {"phase": "restore", "step": restore_step, "state": state,
-                           "qpos": q.tolist(), "gripper_position": grip.tolist(),
-                           "target_qpos": q0.tolist(), "target_gripper": desired_grip.tolist(),
-                           "joint_delta": delta.tolist(), "cbf": restore_follower.last_cbf_info,
-                           "restore_controller": "cbf_qp", "restore_replans": 0,
-                           "restore_cbf_interventions": restore_follower.cbf_interventions,
-                           "cycle_compute_s": time.monotonic()-tick}
-                    records.append(row)
-                    log.write(json.dumps(row)+"\n")
-                    restore_step += 1
-                    if commander or args.live:
-                        time.sleep(max(0., policy.period-(time.monotonic()-tick)))
-                cbf.before_solve = None
+             (args.output/"chunks.jsonl").open("w", encoding="utf-8") as chunk_log, \
+             (args.output/"planning.jsonl").open("w", encoding="utf-8") as progress_log:
             for index in range(restore_steps):
                 tick = time.monotonic()
+                check_restore_timeout()
                 fraction = smoothstep((index+1)/restore_steps)
                 desired_q = start_q+fraction*(q0-start_q)
                 desired_grip = start_grip+fraction*(g0-start_grip)
                 if commander:
-                    q, grip, boxes, _ = read_checked()
-                else:
-                    boxes = scene_reader.boxes(scene_reader.read()) if args.live else []
-                delta = np.clip(desired_q-q, -args.speed*policy.period, args.speed*policy.period)
-                if not _motion_safe(sampler, q, grip, delta, desired_grip, boxes, safety):
-                    raise RuntimeError("Interpolated initial-state restoration is blocked")
+                    q, grip = read_restore_feedback()
+                delta = np.clip(desired_q-q, -restore_max_joint_step, restore_max_joint_step)
                 if commander:
-                    # The arms and grippers can still move after the previous
-                    # servoJ/SET. Use this measured state as the command base;
-                    # a second read may differ even without external control.
-                    if args.live:
-                        q, grip, boxes, _ = read_checked()
-                        delta = np.clip(desired_q-q, -args.speed*policy.period, args.speed*policy.period)
-                        if not _motion_safe(sampler, q, grip, delta, desired_grip, boxes, safety):
-                            raise RuntimeError("Fresh scene blocks initial-state restoration")
                     measure("joint_command", commander.send, q, delta)
-                    sent = measure("gripper_command", gripper_commander.send_if_changed, desired_grip)
-                    gripper_commands_sent += sent
+                    gripper_commands_sent += measure("gripper_command", gripper_commander.send_if_changed, desired_grip)
                 else:
                     q += delta
                     grip = desired_grip.copy()
                 row = {"phase": "restore", "step": index, "qpos": q.tolist(), "gripper_position": grip.tolist(),
                        "target_qpos": desired_q.tolist(), "target_gripper": desired_grip.tolist(),
+                       "joint_delta": delta.tolist(), "cbf": None,
+                       "restore_controller": "interpolation", "collision_checks": False,
                        "cycle_compute_s": time.monotonic()-tick}
                 records.append(row)
                 log.write(json.dumps(row)+"\n")
                 if commander or args.live:
                     time.sleep(max(0., policy.period-(time.monotonic()-tick)))
-            if commander and cbf is None:
-                deadline = active_time()+args.restore_settle_timeout
+            if commander:
+                settle_deadline = active_time()+args.restore_settle_timeout
                 while True:
                     tick = time.monotonic()
-                    q, grip, boxes, _ = read_checked()
+                    q, grip = read_restore_feedback()
                     if (np.max(np.abs(q-q0)) <= args.restore_tolerance
                             and np.max(np.abs(grip-g0)) <= args.gripper_tolerance):
                         break
-                    if active_time() >= deadline:
+                    check_restore_timeout()
+                    if active_time() >= settle_deadline:
+                        failure_context = {"phase": "restore", "reason": "restore_settle_timeout",
+                                           "qpos": q.tolist(), "gripper_position": grip.tolist(),
+                                           "target_qpos": q0.tolist(), "target_gripper": g0.tolist(),
+                                           "collision_checks": False}
                         raise RuntimeError("Initial-state restoration did not settle at recorded joints/grippers")
-                    delta = np.clip(q0-q, -args.speed*policy.period, args.speed*policy.period)
-                    if not _motion_safe(sampler, q, grip, delta, g0, boxes, safety):
-                        raise RuntimeError("Initial-state settling is blocked")
-                    if args.live:
-                        q, grip, boxes, _ = read_checked()
-                        delta = np.clip(q0-q, -args.speed*policy.period, args.speed*policy.period)
-                        if not _motion_safe(sampler, q, grip, delta, g0, boxes, safety):
-                            raise RuntimeError("Fresh scene blocks initial-state settling")
+                    delta = np.clip(q0-q, -restore_max_joint_step, restore_max_joint_step)
                     measure("joint_command", commander.send, q, delta)
                     gripper_commands_sent += measure("gripper_command", gripper_commander.send_if_changed, g0)
                     time.sleep(max(0., policy.period-(time.monotonic()-tick)))
                 measure("stop", commander.stop)
-                q, grip = measure("robot_feedback", commander.read_state)
-            elif commander:
-                measure("stop", commander.stop)
-                q, grip = measure("robot_feedback", commander.read_state)
+                q, grip = read_restore_feedback()
             if np.max(np.abs(q-q0)) > args.restore_tolerance or np.max(np.abs(grip-g0)) > args.gripper_tolerance:
                 raise RuntimeError("Initial-state restoration did not reach the recorded joint/gripper state")
             restore_elapsed = time.monotonic()-restore_start
+            if args.live:
+                scene_snapshot = scene_reader.read(max_wait_s=5.)
+                validate_calibration_identity(scene_snapshot, sampler.calibration_digest)
+                boxes = scene_reader.boxes(scene_snapshot)
+                scene_reader.start(scene_snapshot)
             path_start = time.monotonic()
             action_index = 0
             action_attempt = 0
             action_started_at = active_time()
             hold_ticks = 0
+            detour_control_ticks = 0
             max_tracking_error = 0.
             previous_delta = np.zeros(12)
             chunk_plan = chunk_info = None
             chunk_start = chunk_end = 0
             chunk_id = -1
             chunk_replans = 0
+            optimization_retries = 0
             waypoint_index = 0
             final_optimized_target = np.asarray(policy.metadata["final_joint_state"]).copy()
             while action_index < len(policy.actions):
                 tick = time.monotonic()
                 if commander:
-                    q, grip, boxes, scene_snapshot = read_checked()
+                    if cbf is None:
+                        q, grip = measure("robot_feedback", commander.read_state)
+                    else:
+                        q, grip, boxes, scene_snapshot = read_checked()
                     if scene_snapshot and scene_snapshot.get("_stale_scene_pause"):
                         previous_delta[:] = 0
                         chunk_plan = None
                         chunk_replans += 1
                 else:
-                    boxes = scene_reader.boxes(scene_reader.read()) if args.live else []
+                    if args.live:
+                        scene_snapshot = scene_reader.read()
+                        boxes = scene_reader.boxes(scene_snapshot)
+                    else:
+                        boxes = []
                 action = policy.actions[action_index]
-                error = float(np.max(np.abs(q-policy.states[action_index, :12])))
-                max_tracking_error = max(max_tracking_error, error)
-                if error > args.max_tracking_error:
-                    raise RuntimeError(f"Dataset action replay lost its recorded path: {error:.4f} rad")
-                if commander and args.live and cbf is None:
-                    q, grip, boxes, scene_snapshot = read_checked()
-                    if scene_snapshot and scene_snapshot.get("_stale_scene_pause"):
-                        previous_delta[:] = 0
-                    error = float(np.max(np.abs(q-policy.states[action_index, :12])))
-                    max_tracking_error = max(max_tracking_error, error)
-                    if error > args.max_tracking_error:
-                        raise RuntimeError(f"Dataset action replay lost its recorded path: {error:.4f} rad")
+                error = check_tracking(q, action_index)
                 try:
                     if cbf is not None:
                         if chunk_plan is None or action_index >= chunk_end:
-                            # Planning can take longer than one servo cycle.
-                            # Hold the arms before constructing a whole chunk.
-                            if commander:
+                            # The CBF chunk pipeline holds before planning;
+                            # Adaptive MCBF computes the next feedback command.
+                            if commander and adaptive is None:
                                 measure("stop", commander.stop)
                                 q, grip, boxes, scene_snapshot = read_checked()
                                 previous_delta[:] = 0
@@ -972,6 +923,34 @@ def run_replay(args) -> dict:
                             execution_actions = action_chunk[:chunk_end-chunk_start]
                             chunk_plan, chunk_info = plan_dataset_chunk(
                                 q, grip, boxes, execution_actions, previous_delta)
+                            if chunk_info.get("adaptive_feedback"):
+                                execution_actions = execution_actions[:1]
+                                chunk_end = chunk_start+1
+                            if not chunk_info["success"]:
+                                optimization_retries += 1
+                                chunk_replans += 1
+                                hold_ticks += 1
+                                action_attempt += 1
+                                previous_delta[:] = 0
+                                chunk_plan = None
+                                row = {"phase": "optimization_retry", "step": action_index,
+                                       "attempt": action_attempt, "action_advanced": False,
+                                       "qpos": q.tolist(), "gripper_position": grip.tolist(),
+                                       "reason": chunk_info.get("reason", "cbf_projection_failed"),
+                                       "cbf": chunk_info["failed_step"],
+                                       "tracking_error_rad": error,
+                                       "cycle_compute_s": time.monotonic()-tick}
+                                records.append(row)
+                                log.write(json.dumps(row)+"\n")
+                                log.flush()
+                                chunk_log.write(json.dumps({"status": "retry",
+                                    "optimization_retry": optimization_retries,
+                                    **last_cbf_failure})+"\n")
+                                chunk_log.flush()
+                                # Retry indefinitely with new feedback/scene,
+                                # retaining the action index and full step size.
+                                time.sleep(max(0., policy.period-(time.monotonic()-tick)))
+                                continue
                             waypoint_index = 0
                             chunk_id += 1
                             chunk_log.write(json.dumps({
@@ -984,17 +963,42 @@ def run_replay(args) -> dict:
                                 "control_waypoints": chunk_info["waypoints"],
                                 "waypoint_action_indices": chunk_info["waypoint_action_indices"],
                                 "triggered_action_indices": chunk_info["triggered_action_indices"],
-                                "modified_action_indices": chunk_info["modified_action_indices"]})+"\n")
+                                "modified_action_indices": chunk_info["modified_action_indices"],
+                                "avoidance_controller": args.avoidance_controller,
+                                "optimization_mode": chunk_info.get("mode"),
+                                "optimization_space": chunk_info.get("optimization_space"),
+                                "joint_variables": chunk_info.get("joint_variables"),
+                                "ee_variables": chunk_info.get("ee_variables", 0),
+                                "gripper_variables": chunk_info.get("gripper_variables", 0),
+                                "ik_method": chunk_info.get("ik_method"),
+                                "cartesian_objective_before": chunk_info.get("cartesian_objective_before"),
+                                "cartesian_objective_after": chunk_info.get("cartesian_objective_after"),
+                                "joint_qp_solve_calls": chunk_info.get("joint_qp_solve_calls"),
+                                "solver": chunk_info.get("solver"),
+                                "adaptive_stage": chunk_info.get("adaptive_stage"),
+                                "velocity_source": chunk_info.get("velocity_source"),
+                                "post_optimization_checks": chunk_info.get("post_optimization_checks"),
+                                "avoidance_bypassed": chunk_info.get("avoidance_bypassed", False),
+                                "passthrough_reason": (chunk_info.get("reason")
+                                                       if chunk_info.get("avoidance_bypassed") else None),
+                                "planning_seconds": chunk_info.get("planning_seconds"),
+                                "guidance_fallback": chunk_info.get("guidance_fallback"),
+                                "sweep_validation_enabled": chunk_info.get("sweep_validation_enabled", False),
+                                "smoothness_weights": chunk_info.get("smoothness_weights"),
+                                "seed_acceleration_squared": chunk_info.get("seed_acceleration_squared"),
+                                "optimized_acceleration_squared": chunk_info.get("optimized_acceleration_squared"),
+                                "target_repairs": chunk_info.get("target_repairs", [])})+"\n")
                             chunk_log.flush()
                         planned_action = np.asarray(chunk_info["waypoints"][waypoint_index])
                         optimized_action = chunk_plan[action_index-chunk_start]
                         desired_grip = planned_action[12:]
-                        delta = np.clip(planned_action[:12]-q, -args.speed*policy.period, args.speed*policy.period)
+                        delta = np.clip(planned_action[:12]-q, -max_joint_step, max_joint_step)
                         info = chunk_info["waypoint_steps"][waypoint_index]
                     else:
                         planned_action = action
                         optimized_action = action
-                        delta, desired_grip, info = plan_baseline_step(q, grip, boxes, action)
+                        delta = np.clip(action[:12]-q, -max_joint_step, max_joint_step)
+                        desired_grip, info = action[12:], None
                 except SnapshotExpired:
                     if not args.live:
                         raise
@@ -1010,41 +1014,13 @@ def run_replay(args) -> dict:
                     chunk_plan = None
                     chunk_replans += 1
                     continue
-                if commander and args.live and cbf is not None:
-                    # Chunk FK and the QP take time. Read perception and feedback
-                    # after planning, then check only the step about to be sent.
-                    fresh_q, fresh_grip, fresh_boxes, scene_snapshot = read_checked()
-                    if scene_snapshot and scene_snapshot.get("_stale_scene_pause"):
-                        previous_delta[:] = 0
-                        chunk_plan = None
-                        chunk_replans += 1
-                        continue
-                    drift = float(np.max(np.abs(fresh_q-q)))
-                    grip_drift = float(np.max(np.abs(fresh_grip-grip)))
-                    q, grip, boxes = fresh_q, fresh_grip, fresh_boxes
-                    delta = np.clip(planned_action[:12]-q, -args.speed*policy.period, args.speed*policy.period)
-                    if (drift > safety.get("max_state_drift_rad", .01) or grip_drift > .02
-                            or np.any(q+delta < action_joint_lower)
-                            or np.any(q+delta > action_joint_upper)
-                            or not measure("fresh_sweep", _motion_safe, sampler, q, grip, delta, desired_grip, boxes, safety, True)):
-                        measure("stop", commander.stop)
-                        previous_delta[:] = 0
-                        chunk_plan = None
-                        chunk_replans += 1
-                        continue
-                    error = float(np.max(np.abs(q-policy.states[action_index, :12])))
-                    max_tracking_error = max(max_tracking_error, error)
-                    if error > args.max_tracking_error:
-                        raise RuntimeError(f"Dataset action replay lost its recorded path: {error:.4f} rad")
-                elif cbf is not None and not measure("execution_sweep", _motion_safe, sampler, q, grip,
-                                                     delta, desired_grip, boxes, safety, True):
-                    observation = getattr(boxes, "observation", None)
-                    blockage = getattr(observation, "last_blockage", None)
-                    if args.live and blockage and blockage["reason"] == "expired_free":
-                        scene_reader.read(max_wait_s=3., after_timestamp_ns=observation.timestamp_ns)
-                    chunk_plan = None
-                    chunk_replans += 1
-                    continue
+                if commander and cbf is not None:
+                    # Execute the solved QP targets with refreshed feedback.
+                    # Avoid mode performs no swept-path validation, either
+                    # during optimization or before sending commands.
+                    q, grip = measure("robot_feedback", commander.read_state)
+                    delta = np.clip(planned_action[:12]-q, -max_joint_step, max_joint_step)
+                    error = check_tracking(q, action_index)
                 if commander:
                     measure("joint_command", commander.send, q, delta)
                     sent = measure("gripper_command", gripper_commander.send_if_changed, desired_grip)
@@ -1061,11 +1037,15 @@ def run_replay(args) -> dict:
                 # example, after contacting an object). Dataset actions are
                 # commands, not measured waypoints for the grippers. Their
                 # live feedback still drives every FK/CBF check above.
-                waypoint_reached = waypoint_error <= min(arrival_tolerance, args.speed*policy.period/2)
+                waypoint_reached = waypoint_error <= min(arrival_tolerance, avoid_waypoint_tolerance)
                 last_waypoint_for_action = (cbf is None or waypoint_index+1 == len(chunk_info["waypoints"])
                                            or chunk_info["waypoint_action_indices"][waypoint_index+1]
                                            != action_index-chunk_start)
                 advanced = target_error <= arrival_tolerance and last_waypoint_for_action and (cbf is None or waypoint_reached)
+                next_tracking_error = (float(np.max(np.abs(q-policy.states[action_index+1, :12])))
+                                       if action_index+1 < len(policy.states) else None)
+                if cbf is not None and adaptive is None and next_tracking_error is not None:
+                    advanced = advanced and next_tracking_error <= args.max_tracking_error
                 row = {"phase": "path", "step": action_index, "attempt": action_attempt,
                        "action_advanced": advanced, "target_error_rad": target_error,
                        "gripper_error": gripper_error,
@@ -1078,11 +1058,18 @@ def run_replay(args) -> dict:
                        "chunk_step": action_index-chunk_start if cbf is not None else None,
                        "sent_joint_delta": delta.tolist(),
                        "gripper_target": desired_grip.tolist(), "cbf": info,
-                       "tracking_error_rad": error, "cycle_compute_s": time.monotonic()-tick}
+                       "tracking_error_rad": error, "next_tracking_error_rad": next_tracking_error,
+                       "cycle_compute_s": time.monotonic()-tick}
                 records.append(row)
                 log.write(json.dumps(row)+"\n")
                 previous_delta = delta.copy()
-                if cbf is not None and waypoint_reached:
+                if adaptive is not None:
+                    # A detour waypoint is not the dataset goal. Rebuild the
+                    # controller from feedback until that original goal is reached.
+                    chunk_plan = None
+                if cbf is not None:
+                    cbf.detour_direction = np.asarray(info.get("detour_direction", np.zeros(12)), float)
+                if cbf is not None and waypoint_reached and (not last_waypoint_for_action or advanced):
                     waypoint_index += 1
                 if advanced:
                     final_optimized_target = optimized_action[:12].copy()
@@ -1090,7 +1077,10 @@ def run_replay(args) -> dict:
                     action_attempt = 0
                     action_started_at = active_time()
                 else:
-                    hold_ticks += 1
+                    if adaptive is None:
+                        hold_ticks += 1
+                    else:
+                        detour_control_ticks += 1
                     action_attempt += 1
                     if args.mode == "baseline" and active_time()-action_started_at > args.action_timeout:
                         failure_context = {"reason": "dataset_action_arrival_timeout",
@@ -1132,23 +1122,49 @@ def run_replay(args) -> dict:
             scene_reader.close()
             report = {"status": status, "completed": status == "completed", "execution": "physical" if args.execute else "virtual",
                       "inference_source": "lerobot_dataset_actions", "mode": args.mode,
+                      "avoidance_controller": args.avoidance_controller if cbf is not None else None,
+                      "optimization_space": args.optimization_space if cbf is not None else None,
+                      "gripper_optimization": False,
                       "action_horizon": args.action_horizon,
                       "obstacle_age_policy": args.obstacle_age_policy if args.mode == "avoid" else "strict",
                       "stale_snapshot_reads": scene_reader.stale_snapshot_reads,
                       "max_snapshot_age_s": scene_reader.max_snapshot_age_s,
                       "execute_horizon": args.execute_horizon,
-                      "effective_execute_horizon": min(args.action_horizon, args.execute_horizon),
-                      "cbf_chunk_mode": "optimize_execution_prefix" if cbf is not None else None,
+                      "effective_execute_horizon": (1 if adaptive is not None else min(args.action_horizon, args.execute_horizon)),
+                      "cbf_chunk_mode": ("ellipsoid_mcbf_feedback" if adaptive is not None else (("cartesian_execution_prefix" if args.optimization_space == "ee"
+                                          else "joint_execution_prefix") if cbf is not None else None)),
+                      "progress_file": "planning.jsonl" if cbf is not None else None,
                       "chunk_plans": locals().get("chunk_id", -1)+1,
                       "chunk_replans": locals().get("chunk_replans", 0),
-                      "restore_controller": "cbf_qp" if cbf is not None else "interpolation",
+                      "optimization_retries": locals().get("optimization_retries", 0),
+                      "optimization_retry_policy": ("penalized_distance_slack" if adaptive is not None
+                                                    else "until_actions_exhausted" if cbf is not None else None),
+                      "controller_variant": "ellipsoid_mcbf" if adaptive is not None else args.avoidance_controller if cbf is not None else None,
+                      "adaptive_mcbf_config": vars(adaptive.config) if adaptive is not None else None,
+                      "post_optimization_checks": True if adaptive is not None else None,
+                      "constraint_checks": cbf is not None,
+                      "action_optimization": cbf is not None,
+                      "post_optimization_collision_checks": False,
+                      "optimization_sweep_checks": False,
+                      "last_cbf_failure": last_cbf_failure,
+                      "last_tracking_excursion": last_tracking_excursion,
+                      "restore_controller": "interpolation",
+                      "restore_collision_checks": False,
                       "manual_selection": str(manual_filter.path) if manual_filter else None,
-                      "manual_selection_diagnostics": (getattr(manual_filter, "last_diagnostics", None)
+                      "manual_annotations": (str(manual_filter.path)
+                                             if isinstance(manual_filter, ManualAnnotationFilter) else None),
+                      "obstacle_source": "embedded_voxblox" if embedded else "external" if args.live else "disabled",
+                      "replay_voxblox": ((scene_snapshot or {}).get("diagnostics", {}).get("replay_voxblox")
+                                         if embedded else None),
+                      "manual_selection_diagnostics": ((scene_snapshot or {}).get("diagnostics", {}).get(
+                                                           "manual_selection")
+                                                       or getattr(manual_filter, "last_diagnostics", None)
                                                        if manual_filter else None),
                       "dataset": str(Path(dataset_path).resolve()), "source": policy.metadata,
                       "steps": len(records), "actions_executed": sum(r.get("action_advanced", False) for r in records),
                       "path_control_ticks": sum(r["phase"] == "path" for r in records),
                       "hold_ticks": locals().get("hold_ticks", 0),
+                      "detour_control_ticks": locals().get("detour_control_ticks", 0),
                       "unstable_scene_reads": scene_reader.unstable_scene_reads,
                       "stale_scene_pauses": stale_scene_pauses,
                       "runtime_timings": runtime_timings,
@@ -1159,26 +1175,35 @@ def run_replay(args) -> dict:
                                           "last_refresh_error": scene_reader.cache.last_refresh_error,
                                           "poll_interval_s": scene_reader.cache.poll_interval_s}
                                          if scene_reader.cache is not None else None),
-                      "cbf_runtime": getattr(cbf, "runtime_stats", None),
-                      "planning_fk_cache": {"hits": planning_sampler.hits, "misses": planning_sampler.misses},
+                      "cbf_runtime": adaptive.runtime_stats if adaptive is not None else getattr(cbf, "runtime_stats", None),
+                      "planning_fk_cache": ({"hits": planning_sampler.hits, "misses": planning_sampler.misses}
+                                            if planning_sampler is not None else None),
                       "watchdog_stops": getattr(commander, "watchdog_stops", 0),
                       "gripper_commands_sent": gripper_commands_sent.tolist(),
+                      "gripper_speed": gripper_speed,
+                      "joint_speed_limit_rad_s": args.speed,
+                      "joint_acceleration_limit_rad_s2": args.acceleration,
+                      "restore_joint_speed_limit_rad_s": args.restore_speed,
+                      "restore_gripper_speed_limit_fraction_s": args.gripper_speed_fraction_s,
+                      "gripper_force": args.gripper_force,
                       "gripper_hold_on_error": gripper_hold_on_error,
                       "failure_context": failure_context,
                       "mean_cycle_compute_s": (float(np.mean([r["cycle_compute_s"] for r in records])) if records else None),
                       "max_cycle_compute_s": (max(r["cycle_compute_s"] for r in records) if records else None),
                       "restore_elapsed_s": locals().get("restore_elapsed", time.monotonic()-restore_start),
                       "restore_replans": restore_replans,
-                      "restore_cbf_interventions": (locals()["restore_follower"].cbf_interventions
-                                                    if "restore_follower" in locals() else 0),
-                      "restore_cbf_failures": (locals()["restore_follower"].cbf_failures
-                                               if "restore_follower" in locals() else 0),
-                      "restore_cbf_hold_ticks": (locals()["restore_follower"].hold_ticks
-                                                 if "restore_follower" in locals() else 0),
+                      "restore_cbf_interventions": 0,
+                      "restore_cbf_failures": 0,
+                      "restore_cbf_hold_ticks": 0,
                       "path_elapsed_s": locals().get("path_elapsed", time.monotonic()-path_start if "path_start" in locals() else None),
                       "final_joint_error_rad": locals().get("final_error"),
                       "final_optimized_joint_error_rad": locals().get("final_optimized_error"),
                       "max_tracking_error_rad": locals().get("max_tracking_error"),
+                      "tracking_error_limit_rad": args.max_tracking_error if cbf is not None else None,
+                      "tracking_error_policy": "diagnostic_only" if adaptive is not None else "tracking_envelope",
+                      "planning_tracking_room_rad": planning_tracking_room if cbf is not None and adaptive is None else None,
+                      "tracking_feedback_margin_rad": tracking_feedback_margin if cbf is not None else None,
+                      "waypoint_tolerance_rad": avoid_waypoint_tolerance if cbf is not None else None,
                       "elapsed_s": time.monotonic()-start_time}
             (args.output/"report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return report
@@ -1200,15 +1225,37 @@ def parser() -> argparse.ArgumentParser:
     source = replay.add_mutually_exclusive_group(required=True)
     source.add_argument("--hdf5", type=Path)
     source.add_argument("--dataset", type=Path)
-    replay.add_argument("--output", type=Path, required=True)
-    replay.add_argument("--mode", choices=("baseline", "avoid"), default="baseline")
-    replay.add_argument("--live", action="store_true")
-    replay.add_argument("--execute", action="store_true")
-    replay.add_argument("--execute-ack", default="")
+    replay.add_argument("--output", type=Path,
+                        default=Path("outputs/obstacle_validation") / f"annotation_replay_{datetime.now().astimezone():%Y%m%d_%H%M%S_%f%z}",
+                        help="Run output directory (default: outputs/obstacle_validation/annotation_replay_<timestamp>)")
+    replay.add_argument("--mode", choices=("baseline", "avoid"), default="baseline",
+                        help="baseline: direct recorded actions, no constraints or optimization; avoid: selected-voxel CBF/MCBF")
+    replay.add_argument("--avoidance-controller", choices=("cbf", "mcbf"), default="mcbf",
+                        help="Avoid mode: mcbf uses whole-body ellipsoid Adaptive MCBF-QP with stage selection, geodesics "
+                             "and one-step feedback toward the original recorded target")
+    replay.add_argument("--optimization-space", choices=("joint", "ee"), default="joint",
+                        help="Avoid mode: ee optimizes active-TCP position/orientation increments via local IK; "
+                             "joint retains the existing optimizer. Gripper commands are never optimized")
+    replay.add_argument("--live", action="store_true",
+                        help="Compatibility flag: avoid always uses live detection; baseline never uses it")
+    replay.add_argument("--execute", action=argparse.BooleanOptionalAction, default=True,
+                        help="Execute on hardware (default); --no-execute uses virtual replay")
+    replay.add_argument("--execute-ack", default=EXECUTE_ACK,
+                        help="Compatibility option; the execution acknowledgement is supplied by default")
     replay.add_argument("--initial-state", type=Path)
     replay.add_argument("--obstacle-url")
-    replay.add_argument("--manual-selection", type=Path,
-                        help="Saved manual-obstacles selection.json; scope live voxel avoidance to its 3D OBBs")
+    replay.add_argument("--obstacle-source", choices=("auto", "external"), default="auto",
+                        help="Auto starts selected-region Voxblox in avoid mode; explicit URL uses external detection")
+    replay.add_argument("--voxblox-startup-timeout", type=float, default=30.,
+                        help="Embedded camera/map startup deadline in seconds (default: 30)")
+    replay.add_argument("--robot-mask", action=argparse.BooleanOptionalAction, default=False,
+                        help="Opt in to RGB-D robot masking; disabled by default for lower latency")
+    manual = replay.add_mutually_exclusive_group()
+    manual.add_argument("--manual-annotations", "--annotations", type=Path,
+                        help="Avoid mode: annotations.json (default: newest capture directory under outputs/manual_obstacles); "
+                             "filter current voxels by matching front/side RGB boxes")
+    manual.add_argument("--manual-selection", type=Path,
+                        help="Compatibility: selection.json for saved cell scope, or annotations.json for RGB box filtering")
     replay.add_argument("--fps", type=int, default=20)
     replay.add_argument("--time-scale", type=float, default=1.)
     replay.add_argument("--start-frame", type=int, default=0)
@@ -1217,23 +1264,29 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("--action-horizon", type=int, default=32,
                         help="Dataset/VLA prediction chunk length; only its execution prefix is optimized")
     replay.add_argument("--execute-horizon", type=int, default=10,
-                        help="Optimize and execute at most this many actions from each prediction (default: 10)")
+                        help="Jointly optimize and execute this many actions from each prediction (default: 10)")
     replay.add_argument("--obstacle-age-policy", choices=("latest", "strict"), default="latest",
                         help="Avoid mode: latest reuses cached occupancy without age expiry or refresh waits; strict enforces expiry")
-    replay.add_argument("--speed", type=float, default=.5)
-    replay.add_argument("--acceleration", type=float, default=1.2)
-    replay.add_argument("--gripper-speed-fraction-s", type=float, default=.5)
-    replay.add_argument("--gripper-speed", type=int, default=40)
+    replay.add_argument("--speed", type=float,
+                        help="Optional dataset replay joint speed limit in rad/s; default: no software limit")
+    replay.add_argument("--acceleration", type=float,
+                        help="Optional CBF joint acceleration limit in rad/s²; default: no software limit")
+    replay.add_argument("--restore-speed", type=float, default=.5,
+                        help="Restoration joint interpolation speed in rad/s (default: 0.5); independent of replay speed")
+    replay.add_argument("--gripper-speed-fraction-s", type=float, default=.5,
+                        help="Restoration gripper interpolation rate in closing fraction/s (default: 0.5)")
+    replay.add_argument("--gripper-speed", type=int, default=255,
+                        help="Robotiq SPE register [0,255]; default: full hardware speed (255) in both modes")
     replay.add_argument("--gripper-force", type=int, default=25)
     replay.add_argument("--restore-tolerance", type=float, default=.015)
     replay.add_argument("--gripper-tolerance", type=float, default=.06)
     replay.add_argument("--restore-settle-timeout", type=float, default=10.)
     replay.add_argument("--restore-timeout", type=float, default=90.,
-                        help="Maximum total time for obstacle-aware restoration, seconds")
+                        help="Maximum total time for initial-state interpolation and settling, seconds")
     replay.add_argument("--restore-planning-timeout", type=float, help=argparse.SUPPRESS)
     replay.add_argument("--restore-joint-room", "--restore-detour-room", dest="restore_joint_room",
                         type=float, default=.35,
-                        help="Extra joint-space bounds for CBF restoration, radians")
+                        help=argparse.SUPPRESS)
     replay.add_argument("--max-tracking-error", type=float, default=.12)
     replay.add_argument("--arrival-tolerance", type=float, default=.04)
     replay.add_argument("--action-timeout", type=float, default=5.,
