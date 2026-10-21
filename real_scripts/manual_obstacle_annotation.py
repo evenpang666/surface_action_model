@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from real_scripts.batch_obstacle_annotation import (
-    BatchAnnotations, annotation_schema, handler_for, png_url, validate_boxes,
+    BatchAnnotations, PAIRED_SCHEMA, annotation_schema, handler_for, png_url, validate_boxes,
 )
 from real_scripts.manual_obstacle_selection import timestamp_capture_directory
 from safety_module.project_config import DEFAULT_PROJECT_CONFIG, load_project_config, resolve_repo_path
@@ -90,16 +90,17 @@ class CameraAnnotations:
             if type(revision) is not int or revision != frame["revision"]:
                 raise ValueError("Frame changed in another window; reload before saving")
             status = body.get("status", "objects")
-            boxes = validate_boxes(body.get("boxes"), status, frame["cameras"])
+            boxes = validate_boxes(body.get("boxes"), status, frame["cameras"], body.get("visibility"))
             saved = {key: value for key, value in frame.items() if key != "images"}
-            saved.update(schema=annotation_schema(frame["camera_names"]), boxes=boxes, status=status,
+            saved["visibility"] = body.get("visibility")
+            saved.update(schema=PAIRED_SCHEMA if body.get("visibility") is not None and len(frame["camera_names"]) == 2 else annotation_schema(frame["camera_names"]), boxes=boxes, status=status,
                          revision=revision+1, reviewed=True, updated_at_utc=datetime.now(timezone.utc).isoformat())
             # Keep labels beside the immutable RGB capture, with its readable capture time.
             directory = Path(frame["output_dir"])
             pending = directory / "annotations.json.tmp"
             pending.write_text(json.dumps(saved, ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8")
             pending.replace(directory / "annotations.json")
-            self.captures[frame["episode_id"]].update(boxes=boxes, status=status, revision=revision+1, reviewed=True)
+            self.captures[frame["episode_id"]].update(boxes=boxes, status=status, revision=revision+1, reviewed=True, visibility=body.get("visibility"))
             return {"episode_id": frame["episode_id"], "frame_index": 0, "revision": revision+1,
                     "reviewed": True, "status": status, "output_path": str(directory / "annotations.json")}
 

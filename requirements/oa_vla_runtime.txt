@@ -1,0 +1,14 @@
+# Run from the requirements/ directory. Independent local sensor/control client;
+# model inference runs in a separate OA-VLA policy environment.
+-e ..
+numpy==1.26.4
+scipy==1.14.1
+PyYAML==6.0.2
+h5py==3.12.1
+opencv-python==4.10.0.84
+trimesh==4.5.1
+pillow==11.0.0
+msgpack>=1.0,<2
+osqp>=1.0,<2
+pyrealsense2==2.55.1.6486
+ur-rtde==1.6.0

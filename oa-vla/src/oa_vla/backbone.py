@@ -1,0 +1,311 @@
+"""Joint attention between private PaliGemma and action experts (Apache-2.0 derivative)."""
+from typing import Literal
+import torch
+from torch import nn
+from importlib.metadata import version
+from transformers import PaliGemmaConfig
+from .vendor.transformers.gemma_config import GemmaConfig
+from .vendor.transformers.gemma_model import GemmaForCausalLM
+from .vendor.transformers.paligemma_model import PaliGemmaForConditionalGeneration
+from .vendor.transformers import gemma_model as modeling_gemma
+
+if version("transformers") != "4.53.2":
+    raise RuntimeError("oa-vla requires transformers==4.53.2 for its bundled model extensions")
+
+class PaliGemmaWithExpertModel(nn.Module):
+    def __init__(
+        self,
+        vlm_config,
+        action_expert_config,
+        use_adarms=None,
+        precision: Literal["bfloat16", "float32"] = "bfloat16",
+        model_config=None,
+    ):
+        if use_adarms is None:
+            use_adarms = [False, False]
+        super().__init__()
+
+        cfg = model_config
+        vlm_config_hf = PaliGemmaConfig(vision_config={
+            "image_size": cfg.image_size, "patch_size": cfg.vision_patch_size,
+            "hidden_size": cfg.vision_width, "num_hidden_layers": cfg.vision_layers,
+            "num_attention_heads": cfg.vision_heads, "intermediate_size": cfg.vision_mlp_dim,
+        })
+        vlm_config_hf._vocab_size = cfg.vocab_size  # noqa: SLF001
+        vlm_config_hf.image_token_index = cfg.vocab_size
+        vlm_config_hf.text_config.hidden_size = vlm_config.width
+        vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
+        vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
+        vlm_config_hf.text_config.head_dim = vlm_config.head_dim
+        vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
+        vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
+        vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
+        vlm_config_hf.text_config.torch_dtype = "float32"
+        vlm_config_hf.text_config.vocab_size = cfg.vocab_size
+        vlm_config_hf.text_config.use_adarms = use_adarms[0]
+        vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        vlm_config_hf.vision_config.intermediate_size = cfg.vision_mlp_dim
+        # Image features must project into the PaliGemma text-token width.
+        # This is 2048 for the released PI05 checkpoint, but using the config
+        # keeps the lightweight ``dummy`` variant internally consistent too.
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width
+        vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
+        vlm_config_hf.vision_config.torch_dtype = "float32"
+
+        action_expert_config_hf = GemmaConfig(
+            head_dim=action_expert_config.head_dim,
+            hidden_size=action_expert_config.width,
+            intermediate_size=action_expert_config.mlp_dim,
+            num_attention_heads=action_expert_config.num_heads,
+            num_hidden_layers=action_expert_config.depth,
+            num_key_value_heads=action_expert_config.num_kv_heads,
+            vocab_size=cfg.vocab_size,
+            hidden_activation="gelu_pytorch_tanh",
+            torch_dtype="float32",
+            use_adarms=use_adarms[1],
+            adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+        )
+
+        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+        self.gemma_expert.model.embed_tokens = None
+        # The action expert consumes projected action tokens and its hidden
+        # states are decoded by PI0.action_out_proj.  A 257k-token language
+        # head is therefore both unused and absent from the JAX checkpoint;
+        # keeping it would add roughly 0.5 GiB of random bfloat16 weights.
+        self.gemma_expert.lm_head = None
+
+        self.to_bfloat16_for_selected_params(precision)
+
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"):
+        if precision == "bfloat16":
+            self.to(dtype=torch.bfloat16)
+        elif precision == "float16":
+            # V100's LayerNorm kernel requires its input and affine parameters
+            # to share a dtype.  Keeping selected norms in fp32 (the BF16
+            # stability policy below) produces ``Float but found Half`` in the
+            # SigLIP vision tower, so FP16 uses a uniform module dtype.
+            self.to(dtype=torch.float16)
+            return
+        elif precision == "float32":
+            self.to(dtype=torch.float32)
+            return
+        else:
+            raise ValueError(f"Invalid precision: {precision}")
+
+        params_to_keep_float32 = [
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            "input_layernorm",
+            "post_attention_layernorm",
+            "model.norm",
+        ]
+
+        for name, param in self.named_parameters():
+            if any(selector in name for selector in params_to_keep_float32):
+                param.data = param.data.to(dtype=torch.float32)
+
+    def embed_image(self, image: torch.Tensor):
+        return self.paligemma.model.get_image_features(image)
+
+    def embed_language_tokens(self, tokens: torch.Tensor):
+        return self.paligemma.language_model.embed_tokens(tokens)
+
+    def forward(
+        self,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: object | None = None,
+        inputs_embeds: list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = None,
+        adarms_cond: list[torch.Tensor] | None = None,
+    ):
+        if adarms_cond is None:
+            adarms_cond = [None, None]
+
+        def condition_for_norm(norm, condition):
+            """Match AdaRMS conditioning to its dense projection dtype.
+
+            The PI0.5 time MLP is deliberately fp32 for stable time features,
+            whereas a V100 FP16 backbone stores AdaRMS ``dense`` in fp16.
+            ``nn.Linear`` does not permit this mixed input/weight pair.
+            """
+            dense = getattr(norm, "dense", None)
+            if condition is not None and dense is not None and condition.dtype != dense.weight.dtype:
+                return condition.to(dtype=dense.weight.dtype)
+            return condition
+        if inputs_embeds[1] is None:
+            prefix_output = self.paligemma.language_model.forward(
+                inputs_embeds=inputs_embeds[0],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+            )
+            prefix_past_key_values = prefix_output.past_key_values
+            prefix_output = prefix_output.last_hidden_state
+            suffix_output = None
+        elif inputs_embeds[0] is None:
+            # In autoregressive sampling this shortcut calls Hugging Face's
+            # expert model directly rather than the joint-layer loop below.
+            # Cast the FP32 time/AdaRMS condition to the expert norm's FP16
+            # projection dtype before it reaches GemmaRMSNorm.dense.
+            expert_condition = adarms_cond[1] if adarms_cond is not None else None
+            if self.gemma_expert.model.layers:
+                expert_condition = condition_for_norm(self.gemma_expert.model.layers[0].input_layernorm, expert_condition)
+                expert_dtype = self.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+                expert_inputs = inputs_embeds[1].to(dtype=expert_dtype)
+            else:
+                expert_inputs = inputs_embeds[1]
+            suffix_output = self.gemma_expert.model.forward(
+                inputs_embeds=expert_inputs,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                adarms_cond=expert_condition,
+            )
+            suffix_output = suffix_output.last_hidden_state
+            prefix_output = None
+            prefix_past_key_values = None
+        else:
+            models = [self.paligemma.language_model, self.gemma_expert.model]
+            num_layers = self.paligemma.config.text_config.num_hidden_layers
+
+            # Check if gradient checkpointing is enabled for any of the models
+            use_gradient_checkpointing = (
+                hasattr(self.gemma_expert.model, "gradient_checkpointing")
+                and self.gemma_expert.model.gradient_checkpointing
+                and self.training
+            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+
+            # Define the complete layer computation function for gradient checkpointing
+            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+                models = [self.paligemma.language_model, self.gemma_expert.model]
+
+                query_states = []
+                key_states = []
+                value_states = []
+                gates = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    layer = models[i].layers[layer_idx]
+                    input_condition = condition_for_norm(layer.input_layernorm, adarms_cond[i])
+                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=input_condition)  # noqa: PLW2901
+                    gates.append(gate)
+
+                    input_shape = hidden_states.shape[:-1]
+                    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                    query_states.append(query_state)
+                    key_states.append(key_state)
+                    value_states.append(value_state)
+
+                # Concatenate and process attention
+                query_states = torch.cat(query_states, dim=2)
+                key_states = torch.cat(key_states, dim=2)
+                value_states = torch.cat(value_states, dim=2)
+
+                dummy_tensor = torch.zeros(
+                    query_states.shape[0],
+                    query_states.shape[2],
+                    query_states.shape[-1],
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                )
+                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+                query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, unsqueeze_dim=1
+                )
+
+                batch_size = query_states.shape[0]
+                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
+
+                # Attention computation
+                att_output, _ = modeling_gemma.eager_attention_forward(
+                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    scaling,
+                )
+                # Get head_dim from the current layer, not from the model
+                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
+                att_output = att_output.reshape(batch_size, -1, self.paligemma.config.text_config.num_attention_heads * head_dim)
+
+                # Process layer outputs
+                outputs_embeds = []
+                start_pos = 0
+                for i, hidden_states in enumerate(inputs_embeds):
+                    layer = models[i].layers[layer_idx]
+                    end_pos = start_pos + hidden_states.shape[1]
+
+                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+
+                    # first residual
+                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                    after_first_residual = out_emb.clone()
+                    post_condition = condition_for_norm(layer.post_attention_layernorm, adarms_cond[i])
+                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=post_condition)
+                    # Keep activations in the linear layer's compute dtype.
+                    if layer.mlp.up_proj.weight.dtype in (torch.bfloat16, torch.float16):
+                        out_emb = out_emb.to(dtype=layer.mlp.up_proj.weight.dtype)
+
+                    out_emb = layer.mlp(out_emb)
+                    # second residual
+                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                    outputs_embeds.append(out_emb)
+                    start_pos = end_pos
+
+                return outputs_embeds
+
+            # Process all layers with gradient checkpointing if enabled
+            for layer_idx in range(num_layers):
+                if use_gradient_checkpointing:
+                    inputs_embeds = torch.utils.checkpoint.checkpoint(
+                        compute_layer_complete,
+                        layer_idx,
+                        inputs_embeds,
+                        attention_mask,
+                        position_ids,
+                        adarms_cond,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    inputs_embeds = compute_layer_complete(
+                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
+                    )
+
+                # Old code removed - now using compute_layer_complete function above
+
+            # final norm
+            # Define final norm computation function for gradient checkpointing
+            def compute_final_norms(inputs_embeds, adarms_cond):
+                outputs_embeds = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    final_condition = condition_for_norm(models[i].norm, adarms_cond[i])
+                    out_emb, _ = models[i].norm(hidden_states, cond=final_condition)
+                    outputs_embeds.append(out_emb)
+                return outputs_embeds
+
+            # Apply gradient checkpointing to final norm if enabled
+            if use_gradient_checkpointing:
+                outputs_embeds = torch.utils.checkpoint.checkpoint(
+                    compute_final_norms, inputs_embeds, adarms_cond, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+
+            prefix_output = outputs_embeds[0]
+            suffix_output = outputs_embeds[1]
+            prefix_past_key_values = None
+
+        return [prefix_output, suffix_output], prefix_past_key_values

@@ -70,6 +70,8 @@ def fake_sdk(monkeypatch, *, fail_serial=None, fail_intrinsics=None, fail_stop=N
             if self.config.serial == fail_stop: raise RuntimeError('USB disconnected during stop')
         def wait_for_frames(self, timeout):
             w, h, _ = self.config.streams['color']
+            if 'depth' not in self.config.streams:
+                return NS(get_color_frame=lambda: Frame(np.zeros((h,w,3),np.uint8),Profile('color',w,h,15)))
             dw, dh, rate = self.config.streams['depth']
             return NS(get_color_frame=lambda: Frame(np.zeros((h, w, 3), np.uint8), Profile('color', w, h, 15)),
                       get_depth_frame=lambda: Frame(np.full((dh, dw), 1100, np.uint16), Profile('depth', dw, dh, rate)))
@@ -214,3 +216,21 @@ def test_worker_initialization_error_is_published_and_reported(monkeypatch, caps
         assert disconnected == ['left-ip']
     elif failure == 'camera':
         assert set(disconnected) == {'left-ip', 'right-ip'} and stopped
+
+
+
+def test_rgb_only_wrist_does_not_open_a_depth_stream(monkeypatch):
+    pipelines = fake_sdk(monkeypatch)
+    camera = RealSenseD435iSource(cameras=(D435iCameraConfig('front','front-id'),D435iCameraConfig('right_wrist','side-id')),
+                                 width=640,height=480,fps=15,rgb_only_views=('right_wrist',))
+    camera.start()
+    try:
+        assert 'depth' in pipelines[0].config.streams
+        assert 'depth' not in pipelines[1].config.streams
+        assert camera.get_stream_info()['right_wrist']['depth'] is None
+        frames = camera.read()
+        assert frames['right_wrist'].rgb.shape == (480,640,3)
+        assert not frames['right_wrist'].depth_m.any()
+        assert frames['front'].depth_m.max() > 0
+    finally:
+        camera.stop()

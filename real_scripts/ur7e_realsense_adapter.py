@@ -65,6 +65,7 @@ class RealSenseD435iSource:
         wait_timeout_ms: int = 5000,
         read_retries: int = 3,
         retain_native_depth: bool = False,
+        rgb_only_views: Sequence[str] = (),
     ) -> None:
         self.cameras = tuple(cameras)
         if not self.cameras:
@@ -82,6 +83,9 @@ class RealSenseD435iSource:
         self.wait_timeout_ms = int(wait_timeout_ms)
         self.read_retries = max(int(read_retries), 1)
         self.retain_native_depth = bool(retain_native_depth)
+        self.rgb_only_views = frozenset(rgb_only_views)
+        if self.rgb_only_views - {camera.name for camera in self.cameras}:
+            raise ValueError("rgb_only_views must name configured cameras")
         self._rs = None
         self._pipelines = []
         self._aligns = []
@@ -115,7 +119,9 @@ class RealSenseD435iSource:
             if requested not in profiles[rs.stream.color]:
                 raise RuntimeError(f"RealSense {camera.name!r} serial={serial} USB={usb}: "
                                    f"unsupported RGB {requested}; supported: {sorted(profiles[rs.stream.color])}")
-            if self.depth_size is not None:
+            if camera.name in self.rgb_only_views:
+                depth = None
+            elif self.depth_size is not None:
                 depth = (*self.depth_size, self.fps)
                 if depth not in profiles[rs.stream.depth]:
                     raise RuntimeError(f"RealSense {camera.name!r} serial={serial} USB={usb}: "
@@ -130,7 +136,7 @@ class RealSenseD435iSource:
                 depth = min(candidates, key=lambda p: (abs(p[0]*p[1]-self.width*self.height), p))
                 warnings.warn(f"RealSense {camera.name!r} serial={serial} USB={usb}: depth {requested} "
                               f"unsupported; using {depth}, aligned to RGB {requested}", RuntimeWarning, stacklevel=2)
-            info = {"serial": serial, "usb": usb, "color": list(requested), "depth": list(depth)}
+            info = {"serial": serial, "usb": usb, "color": list(requested), "depth": None if depth is None else list(depth)}
             requests.append((camera.name, serial, depth, info))
         return requests
 
@@ -152,7 +158,8 @@ class RealSenseD435iSource:
                 config = rs.config()
                 config.enable_device(serial)
                 config.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
-                config.enable_stream(rs.stream.depth, *depth[:2], rs.format.z16, depth[2])
+                if depth is not None:
+                    config.enable_stream(rs.stream.depth, *depth[:2], rs.format.z16, depth[2])
                 try:
                     profile = pipeline.start(config)
                 except RuntimeError as exc:
@@ -173,7 +180,7 @@ class RealSenseD435iSource:
                     "height": int(color_intrinsics.height),
                 }
                 self._stream_info[name] = info
-                self._aligns.append(rs.align(rs.stream.color))
+                self._aligns.append(rs.align(rs.stream.color) if depth is not None else None)
         except BaseException:
             try:
                 self.stop()
@@ -216,7 +223,7 @@ class RealSenseD435iSource:
             for attempt in range(1, self.read_retries + 1):
                 try:
                     sdk_frames = pipeline.wait_for_frames(self.wait_timeout_ms)
-                    if self.retain_native_depth:
+                    if align is not None and self.retain_native_depth:
                         native = sdk_frames.get_depth_frame()
                         color = sdk_frames.get_color_frame()
                         if not native or not color:
@@ -232,7 +239,7 @@ class RealSenseD435iSource:
                             np.asarray(native.get_data(), dtype=np.uint16), float(native.get_units()),
                             np.array([[intr.fx, 0., intr.ppx], [0., intr.fy, intr.ppy], [0., 0., 1.]]),
                             transform, np.asarray(intr.coeffs), str(intr.model).rsplit(".", 1)[-1])
-                    aligned = align.process(sdk_frames)
+                    aligned = align.process(sdk_frames) if align is not None else sdk_frames
                     break
                 except RuntimeError as exc:
                     last_error = exc
@@ -245,23 +252,29 @@ class RealSenseD435iSource:
             if aligned is None:
                 raise RuntimeError(f"Failed to read RealSense camera {name!r}") from last_error
             color_frame = aligned.get_color_frame()
-            depth_frame = aligned.get_depth_frame()
-            if not color_frame or not depth_frame:
+            depth_frame = aligned.get_depth_frame() if align is not None else None
+            if not color_frame or (align is not None and not depth_frame):
                 raise RuntimeError(f"Failed to read synchronized RGB-D frame from camera {name!r}")
             rgb = np.asarray(color_frame.get_data(), dtype=np.uint8).copy()
-            depth_scale = float(depth_frame.get_units())
-            depth_m = np.asarray(depth_frame.get_data(), dtype=np.float32) * depth_scale
+            if depth_frame is None:
+                # RGB-only wrist streams are never used for 3D mapping. A zero
+                # array preserves the RGBDFrame interface without claiming depth.
+                depth_m = np.zeros(rgb.shape[:2], np.float32)
+            else:
+                depth_scale = float(depth_frame.get_units())
+                depth_m = np.asarray(depth_frame.get_data(), dtype=np.float32) * depth_scale
+            timestamp_frame = color_frame if depth_frame is None else depth_frame
             # The camera timestamp is retained even though two independent
             # D435i devices may not share a clock.  host_timestamp_ns is the
             # common-clock arrival marker used to calculate/validate skew.
-            timestamp_domain = str(depth_frame.get_frame_timestamp_domain())
+            timestamp_domain = str(timestamp_frame.get_frame_timestamp_domain())
             frames[name] = RGBDFrame(
                 name,
                 rgb,
                 depth_m.astype(np.float32),
                 host_timestamp_ns=time.monotonic_ns(),
-                device_timestamp_ms=float(depth_frame.get_timestamp()),
-                frame_number=int(depth_frame.get_frame_number()),
+                device_timestamp_ms=float(timestamp_frame.get_timestamp()),
+                frame_number=int(timestamp_frame.get_frame_number()),
                 timestamp_domain=timestamp_domain,
                 native_depth=native_depth,
             )

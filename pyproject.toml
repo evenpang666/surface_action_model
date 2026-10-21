@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "surface-action-model"
-version = "0.3.0"
+version = "0.4.0"
 requires-python = ">=3.11,<3.13"
-description = "PI0.5 surface/action flow matching and dual-UR7e perception runtime"
+description = "Four-view PI0.5 actions with front/side SAM 3 boxes and dual-UR7e perception runtime"
 dependencies = ["numpy>=1.24,<2", "PyYAML>=6", "scipy>=1.11", "h5py>=3.8", "osqp>=1.0,<2"]
 
 [project.optional-dependencies]

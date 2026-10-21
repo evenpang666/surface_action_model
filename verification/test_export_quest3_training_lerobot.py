@@ -82,3 +82,19 @@ def test_export_rejects_stale_shard_and_unreviewed_final_export(tmp_path):
     with pytest.raises(ValueError, match="unreviewed"):
         export(shard, episode, tmp_path / "bad", repo_id="local/test", require_reviewed=True,
                dataset_class=FakeDataset)
+
+
+def test_export_accepts_paired_v3_single_view_visibility(tmp_path):
+    episode, shard = sources(tmp_path)
+    with h5py.File(episode, "r+") as source:
+        group = source["annotations/obstacle_obbs"]
+        row = json.loads(group["frames_json"][0])
+        row["schema"] = "dual_rgb_paired_obb_v3"
+        row["boxes"]["side"] = []
+        row["visibility"] = {"tube": {"front": True, "side": False}}
+        group.attrs["schema"] = row["schema"]
+        group["frames_json"][0] = json.dumps(row)
+    info = export(shard, episode, tmp_path/"lerobot", repo_id="local/test", dataset_class=FakeDataset)
+    assert info["annotation_schema"] == "dual_rgb_paired_obb_v3"
+    assert FakeDataset.last.frames[0]["annotation.obstacle_ids.front"][0] == 1
+    assert not FakeDataset.last.frames[0]["annotation.obstacle_ids.side"].any()

@@ -1,5 +1,9 @@
 # RGB 障碍标注
 
+OA-VLA 配对训练使用同一对象在 front/side 中相同的编号，每视角每对象仅一个 OBB；
+不同物体请使用不同编号。新版界面支持显式标记某侧不可见，保存为 `dual_rgb_paired_obb_v3`。
+旧 v2 完整双视角标注可直接读取并按 ID 对齐。独立工具与完整训练协议见 [OA-VLA](../oa-vla/README.md)。
+
 在仓库根目录、`surface-runtime` 环境运行。页面默认 <http://127.0.0.1:8770>。
 
 ## 捕获当前相机
@@ -19,7 +23,7 @@ python real_scripts/manual_obstacle_annotation.py
 默认相机序列号来自项目硬件配置；覆盖用 `--front-serial SERIAL --side-serial SERIAL`。
 `--output-dir PATH` 更换输出根目录，`--no-browser` 关闭自动打开页面。
 
-保存后可直接[回放避障](MODEL_FREE_OBSTACLE_VALIDATION.md)；检测可视化需重启后加载最新文件，按 B 开启筛选。
+所有对象在两侧均可见时，保存后可直接[回放避障](MODEL_FREE_OBSTACLE_VALIDATION.md)；检测可视化需重启后加载最新文件，按 B 开启筛选。
 
 ## 标注 HDF5
 
@@ -44,7 +48,8 @@ python real_scripts/batch_obstacle_annotation.py --task-dir /path/to/task
 
 - 双视角输入需 `timestamps_ns` 和 `observations/images/{front,side}/rgb`。
 - 在录制 RGB 上画框；仅做二维标注时不要求深度。
-- 双视角格式为 `dual_rgb_obb_annotation_v2`，单视角为 `single_rgb_obb_annotation_v1`。
+- 新双视角格式为 `dual_rgb_paired_obb_v3`（兼容读取 v2），单视角为 `single_rgb_obb_annotation_v1`。
+- 显式单侧不可见标注可用于 OA-VLA 训练；旧双视角体素交集筛选需要所有对象在两侧均有框。
 - `reviewed=false` 表示未标注；`reviewed=true` 且 `status=no_obstacles` 才表示确认无障碍。
 - 旧深度像素框 `dual_depth_obb_annotation_v1` 不能当作 RGB 标注续写，需另存数据重新标注。
 

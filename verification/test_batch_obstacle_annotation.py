@@ -189,3 +189,44 @@ def test_frame_count_mismatch_is_not_silently_truncated(tmp_path):
         source.attrs["num_samples"] = 2
     with pytest.raises(ValueError, match="num_samples"):
         BatchAnnotations(tmp_path)
+
+
+def test_paired_annotations_preserve_ids_rotation_and_confirmed_visibility(tmp_path):
+    from real_scripts.batch_obstacle_annotation import PAIRED_SCHEMA
+    path = episode(tmp_path / "paired.h5", n=2)
+    dataset = BatchAnnotations(path)
+    body = save_body()
+    first = dict(object_id="a", cx=2., cy=2., width=2., height=1., angle_deg=35.)
+    second = dict(object_id="b", cx=5., cy=3., width=2., height=1., angle_deg=-20.)
+    body["boxes"] = {"front": [first, second], "side": [second, first]}
+    # A legacy fully-visible save remains readable after a v3 group upgrade.
+    dataset.save(body)
+    body.update(frame_index=1, boxes={"front": [], "side": [first]},
+                visibility={"a": {"front": False, "side": True}})
+    dataset.save(body)
+    resumed = BatchAnnotations(path)
+    assert resumed.frame(0, 1)["visibility"] == body["visibility"]
+    assert resumed.manifest()["reviewed_frames"] == 2
+    with h5py.File(path, "r") as source:
+        assert source[GROUP].attrs["schema"] == PAIRED_SCHEMA
+        assert json.loads(source[GROUP+"/frames_json"][0])["schema"] == SCHEMA
+        row = json.loads(source[GROUP+"/frames_json"][1])
+        assert row["schema"] == PAIRED_SCHEMA
+        assert row["boxes"]["side"][0]["angle_deg"] == 35.
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "visibility_mismatch", "both_invisible"])
+def test_invalid_pair_annotations_are_rejected_before_writing(tmp_path, fault):
+    path = episode(tmp_path / "episode.h5")
+    original = path.read_bytes()
+    body = save_body()
+    if fault == "duplicate":
+        body["boxes"]["front"].append(dict(body["boxes"]["front"][0]))
+    elif fault == "visibility_mismatch":
+        body["visibility"] = {"tube": {"front": False, "side": True}}
+    else:
+        body["boxes"] = {"front": [], "side": []}
+        body["visibility"] = {"tube": {"front": False, "side": False}}
+    with pytest.raises(ValueError):
+        BatchAnnotations(path).save(body)
+    assert path.read_bytes() == original

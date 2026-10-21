@@ -179,13 +179,19 @@ def box_groups(boxes, gap=.005):
 
 
 def fit_obstacles(boxes, *, max_parts=8, max_span=.25):
-    """Partition occupied cuboids, enclosing all eight corners of each cuboid.
+    """Preserve direct ellipsoids and partition occupied cuboids.
 
-    Splits never cut a cuboid. Concave clusters retain local components instead
-    of being replaced by a single convex hull.
+    Enclose all eight corners of every measured cuboid. Splits never cut a
+    cuboid. Concave clusters retain local components instead of a convex hull.
     """
     signs = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)])
-    output = []
+    # Paired RGB volumes already enclose their entire frustum intersection.
+    # Keep each one as a separate obstacle; refitting its OBB would inflate it
+    # again and merging it with measured cuboids would lose object identity.
+    output = [Ellipsoid(np.asarray(box.center, float), np.asarray(box.ellipsoid_shape, float),
+                        key=f"transparent_{getattr(box, 'object_id', index)}")
+              for index, box in enumerate(boxes) if getattr(box, "ellipsoid_shape", None) is not None]
+    boxes = [box for box in boxes if getattr(box, "ellipsoid_shape", None) is None]
     for cluster, ids in enumerate(box_groups(boxes)):
         parts = [ids]
         fitted = {}

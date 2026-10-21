@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from real_scripts.batch_obstacle_annotation import GROUP, SCHEMA, rgb_image
+from real_scripts.batch_obstacle_annotation import GROUP, SCHEMA, PAIRED_SCHEMA, rgb_image, validate_boxes
 from safety_module.shards import open_shard
 
 VIEWS = ("front", "side", "left_wrist", "right_wrist")
@@ -34,8 +34,8 @@ def annotation_rows(episode: h5py.File, indices: np.ndarray, rgb_shapes: dict[st
     if GROUP not in episode:
         return [None] * len(indices), {}
     labels = episode[GROUP]
-    if labels.attrs.get("schema") != SCHEMA or labels.attrs.get("annotation_image") != "recorded_rgb":
-        raise ValueError("Obstacle annotations must use the RGB-pixel v2 schema")
+    if labels.attrs.get("schema") not in (SCHEMA, PAIRED_SCHEMA) or labels.attrs.get("annotation_image") != "recorded_rgb":
+        raise ValueError("Obstacle annotations must use the RGB-pixel v2/v3 schema")
     count = len(episode["timestamps_ns"])
     if (labels["reviewed"].shape != (count,) or labels["frames_json"].shape != (count,)
             or not np.array_equal(labels["timestamps_ns"][:], episode["timestamps_ns"][:])):
@@ -46,27 +46,19 @@ def annotation_rows(episode: h5py.File, indices: np.ndarray, rgb_shapes: dict[st
             rows.append(None)
             continue
         row = json.loads(labels["frames_json"][index])
-        if (row.get("schema") != SCHEMA or row.get("annotation_image") != "recorded_rgb"
+        if (row.get("schema") not in (SCHEMA, PAIRED_SCHEMA) or row.get("annotation_image") != "recorded_rgb"
                 or row.get("frame_index") != int(index)
                 or row.get("timestamp_ns") != str(int(episode["timestamps_ns"][index]))):
             raise ValueError(f"Obstacle annotation for frame {index} is stale or in the wrong coordinates")
         boxes = row.get("boxes", {})
         if set(boxes) != {"front", "side"} or any(len(boxes[view]) > MAX_BOXES for view in ("front", "side")):
             raise ValueError(f"Obstacle annotation for frame {index} has invalid views or box count")
-        front_ids = {box["object_id"] for box in boxes["front"]}
-        side_ids = {box["object_id"] for box in boxes["side"]}
-        if (row.get("status") == "no_obstacles" and (front_ids or side_ids)) or (
-                row.get("status") == "objects" and (not front_ids or front_ids != side_ids)):
-            raise ValueError(f"Obstacle annotation for frame {index} has inconsistent status or object IDs")
-        if row.get("status") not in ("no_obstacles", "objects"):
-            raise ValueError(f"Obstacle annotation for frame {index} has invalid status")
-        for view in ("front", "side"):
-            height, width = rgb_shapes[view][:2]
-            for box in boxes[view]:
-                values = np.asarray([box[field] for field in BOX_FIELDS], dtype=float)
-                if (not np.isfinite(values).all() or not 0 <= values[0] < width
-                        or not 0 <= values[1] < height or values[2] < 1 or values[3] < 1):
-                    raise ValueError(f"Obstacle annotation for frame {index} leaves the {view} RGB grid")
+        dimensions = {view: {"rgb_height": rgb_shapes[view][0], "rgb_width": rgb_shapes[view][1]}
+                      for view in ("front", "side")}
+        if row["schema"] == PAIRED_SCHEMA and not isinstance(row.get("visibility"), dict):
+            raise ValueError("Paired v3 annotations require explicit visibility")
+        validate_boxes(boxes, row.get("status"), dimensions,
+                       row.get("visibility") if row["schema"] == PAIRED_SCHEMA else None)
         names.update(box["object_id"] for view in ("front", "side") for box in boxes[view])
         rows.append(row)
     return rows, {name: number for number, name in enumerate(sorted(names), start=1)}
@@ -182,7 +174,7 @@ def export(shard_path: Path, episode_path: Path, output: Path, *, repo_id: str, 
             dataset.add_frame(frame)
         dataset.save_episode()
         metadata = {"schema": "quest3_surface_training_lerobot_v1", "source_hdf5": str(episode_path),
-                    "source_shard": str(shard_path), "annotation_schema": SCHEMA,
+                    "source_shard": str(shard_path), "annotation_schema": episode[GROUP].attrs["schema"] if GROUP in episode else None,
                     "annotation_image": "recorded_rgb", "object_ids": object_ids,
                     "action_semantics": "joint_delta_radians_plus_gripper_target",
                     "surface_coordinate_frame": "left_base", "rgb_views": list(VIEWS),

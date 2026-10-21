@@ -140,9 +140,9 @@ def test_matching_object_ids_are_intersected_before_combining_objects(annotated)
     a.path.write_text(json.dumps(a.row))
     manual = module.ManualAnnotationFilter(a.path)
     a.grid.update(timestamp_ns=time.monotonic_ns(), raw_hits=[[.0, .0, 1.0]], free_ids=np.empty(0, np.int64))
-    result = manual(snapshot(a.grid))
-    assert result["occupancy_map"]["occupied_voxels"] == 0
-    assert result["obbs"] == []
+    # Cross-matched boxes cannot create a fictitious transparent object either.
+    with pytest.raises(ValueError, match="no 3D intersection"):
+        manual(snapshot(a.grid))
 
 
 def test_old_standalone_without_intrinsics_requires_exact_rgb_profile(annotated):
@@ -258,3 +258,88 @@ def test_baseline_rejects_annotations_before_dataset_or_hardware(tmp_path):
                                        "--manual-annotations", str(tmp_path / "annotations.json"), "--output", str(tmp_path / "run")])
     with pytest.raises(ValueError, match="only used with --mode avoid"):
         replay.run_replay(args)
+
+
+def test_paired_v3_all_visible_labels_remain_usable_for_voxel_intersection(annotated):
+    a = annotated
+    a.row["schema"] = "dual_rgb_paired_obb_v3"
+    a.row["visibility"] = {"1": {"front": True, "side": True}}
+    a.path.write_text(json.dumps(a.row))
+    manual = module.ManualAnnotationFilter(a.path)
+    assert len(manual.annotations["front"]) == len(manual.annotations["side"]) == 1
+
+
+def test_single_view_labels_do_not_silently_drop_objects_from_voxel_intersection(annotated):
+    a = annotated
+    a.row["schema"] = "dual_rgb_paired_obb_v3"
+    a.row["visibility"] = {"1": {"front": True, "side": False}}
+    a.row["boxes"]["side"] = []
+    a.path.write_text(json.dumps(a.row))
+    with pytest.raises(ValueError, match="every object visible in both views"):
+        module.ManualAnnotationFilter(a.path)
+
+
+def test_transparent_replay_tracks_occupancy_changes_without_stale_support(annotated):
+    from obstacle_validation.runtime import boxes_from_json
+    from obstacle_validation.ellipsoid_geometry import fit_obstacles
+    a = annotated
+    manual = module.ManualAnnotationFilter(a.path)
+    for index, hits in enumerate(([], [[-.05, .05, 1.05]], [])):
+        a.grid.update(timestamp_ns=time.monotonic_ns(), raw_hits=np.asarray(hits).reshape(-1,3),
+                      free_ids=np.empty(0, np.int64))
+        original = snapshot(a.grid)
+        before = json.dumps(original)
+        result = manual(original)
+        diag = result['diagnostics']['paired_rgb_obstacles']
+        assert diag['transparent_count'] == (0 if hits else 1)
+        assert diag['objects']['1']['occupied_voxels'] == len(hits)
+        assert result['occupancy_map']['occupied_voxels'] == len(hits)
+        assert len(result['obbs']) == 1 and json.dumps(original) == before
+        boxes = boxes_from_json(result)
+        models = fit_obstacles(boxes)
+        assert len(models) == 1
+        if not hits:
+            assert models[0].key == 'transparent_1'
+            np.testing.assert_allclose(models[0].shape, result['obbs'][0]['ellipsoid_shape'])
+
+
+def test_thin_transparent_annotation_can_prepare_an_embedded_tsdf_roi(annotated):
+    a = annotated
+    for view in a.row['boxes']:
+        a.row['boxes'][view][0].update(width=2., height=2.)
+    a.path.write_text(json.dumps(a.row))
+    manual = module.ManualAnnotationFilter(a.path)
+    assert not manual.scope_mask(a.grid).any()  # genuinely smaller than the lattice
+    manual.prepare_reference(a.grid, a.color)
+    assert manual.cell_scope.ids.size > 0
+    a.grid.update(timestamp_ns=time.monotonic_ns(), raw_hits=np.empty((0,3)), free_ids=np.empty(0,np.int64))
+    result = manual(snapshot(a.grid))
+    assert result['diagnostics']['paired_rgb_obstacles']['transparent_objects'] == ['1']
+    assert result['obbs'][0]['ellipsoid_shape']
+
+
+def test_transparent_replay_has_an_effective_obstacle_qp_constraint(annotated):
+    from obstacle_validation.runtime import boxes_from_json
+    from obstacle_validation.ellipsoid_geometry import Ellipsoid
+    from obstacle_validation.ellipsoid_mcbf import EllipsoidMCBF
+    a = annotated
+    a.grid.update(timestamp_ns=time.monotonic_ns(), raw_hits=np.empty((0,3)), free_ids=np.empty(0,np.int64))
+    result = module.ManualAnnotationFilter(a.path)(snapshot(a.grid))
+    shape = np.asarray(result['obbs'][0]['ellipsoid_shape'])
+    center = np.asarray(result['obbs'][0]['center'])
+    # Start a 1 cm robot sphere 2 mm beyond the 5 mm obstacle margin.
+    surface = center - shape[:,0] / np.sqrt(shape[0,0])
+    robot_center = surface - [.017, 0., 0.]
+    class Volumes:
+        left_link_names = ('left',)
+        def ellipsoids(self, q, grip):
+            return [Ellipsoid(np.array([q[0], robot_center[1], robot_center[2]]), np.eye(3)*.01**2, 'left',0,0),
+                    Ellipsoid(np.array([.8, .8, 0.]), np.eye(3)*.01**2, 'right',1,0)]
+    planner = EllipsoidMCBF(Volumes(), margin=.005, inter_arm_margin=.035, period=.05)
+    q = np.zeros(12); q[0] = robot_center[0]
+    action = np.r_[q, np.zeros(2)][None]; action[0,0] += .02
+    _, info = planner.plan(q, np.zeros(2), action, boxes_from_json(result),
+                           lower=np.full(12,-2.), upper=np.full(12,2.), max_step=.04)
+    assert info['steps'][0]['active_constraint_counts']['left_obstacle'] > 0
+    assert info['waypoints'][0][0] < action[0,0] - .001
+    assert len(planner.obstacles) == 1 and planner.obstacles[0].key == 'transparent_1'

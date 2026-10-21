@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Serve a jointly trained Quest3 PI05 action + surface-flow checkpoint."""
-
+"""Serve a four-RGB SAM 3 + PI0.5 action/box checkpoint (schema 5, no points)."""
 from __future__ import annotations
 
 import argparse
 import gc
 import logging
-import os
 from pathlib import Path
 import socket
 import sys
@@ -15,11 +13,13 @@ from types import SimpleNamespace
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for path in (REPO_ROOT, REPO_ROOT / "openpi" / "src", REPO_ROOT / "openpi" / "packages" / "openpi-client" / "src"):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+for directory in (REPO_ROOT, REPO_ROOT / "openpi" / "src", REPO_ROOT / "openpi" / "packages" / "openpi-client" / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 
-from safety_module.tokenizer import MODEL_IMAGE_KEYS, _Tokenizer
+from safety_module.policy_contract import CAMERA_TO_MODEL, DETECTION_VIEWS, MODEL_TYPE, SCHEMA_VERSION
+from safety_module.sam3_policy_data import letterbox_rgb, original_xyxy_coordinates
+from safety_module.tokenizer import _Tokenizer
 
 
 def _verify_cuda_runtime(torch: object, device: object) -> None:
@@ -46,215 +46,132 @@ def _verify_cuda_runtime(torch: object, device: object) -> None:
         ) from exc
 
 
-
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-steps", type=int, default=10)
-    parser.add_argument("--tokenizer-model", type=Path, default=None)
+    parser.add_argument("--score-threshold", type=float, default=.5)
+    parser.add_argument("--tokenizer-model", type=Path)
     return parser.parse_args()
 
 
-
-
-class Quest3JointSafetyPolicy:
-    def __init__(self, checkpoint: Path, *, device_name: str, num_steps: int, tokenizer_model: Path | None) -> None:
+class Quest3Sam3VlaPolicy:
+    def __init__(self, checkpoint, *, device_name="cuda", num_steps=10, tokenizer_model=None, score_threshold=.5):
         import torch
         from openpi.models.pi0_config import Pi0Config
-        from openpi.models_pytorch.pi0_pytorch import PI05SafetyPytorch
-        from openpi.models_pytorch.surface_action_pytorch import SurfaceActionModelPytorch
-        from openpi.models_pytorch.surface_detection_pytorch import SurfaceActionDetectionModelPytorch, original_obb_coordinates
+        from openpi.models_pytorch.sam3_vla_pytorch import Sam3VlaModelPytorch
+        from safety_module.checkpoint_loading import restore_nonpersistent_buffers
 
+        if num_steps < 1 or not 0 <= score_threshold <= 1:
+            raise ValueError("num_steps must be positive and score_threshold must be in [0,1]")
         self.torch = torch
         self.device = torch.device(device_name if device_name != "cuda" or torch.cuda.is_available() else "cpu")
         _verify_cuda_runtime(torch, self.device)
-        # Keep parameter tensors memory-mapped until ``assign=True`` hands
-        # their storage directly to the module.  A conventional torch.load +
-        # copy produces a state dict, an initialized model and then a CUDA
-        # model at once; that can exhaust both 32 GB host RAM and 16 GB GPUs.
-        # The checkpoint is a zip-format torch.save file, which supports mmap.
         payload = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-        if payload.get("model_type") not in ("PI05SafetyPytorch", "SurfaceActionModelPytorch", "SurfaceActionDetectionModelPytorch"):
-            raise ValueError(f"{checkpoint} is not a jointly trained PI05SafetyPytorch checkpoint")
+        if payload.get("model_type") != MODEL_TYPE or payload.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("Expected a schema-5 SAM 3 VLA checkpoint; old point checkpoints require migration/retraining")
         self.info = dict(payload["metadata"])
-        model_class = {"PI05SafetyPytorch": PI05SafetyPytorch,
-                       "SurfaceActionModelPytorch": SurfaceActionModelPytorch,
-                       "SurfaceActionDetectionModelPytorch": SurfaceActionDetectionModelPytorch}[payload["model_type"]]
-        self.model_type = payload["model_type"]
-        self.detection_ready = self.model_type == "SurfaceActionDetectionModelPytorch" and self.info.get("detection_stage") in ("joint", "detection")
-        self.original_obb_coordinates = original_obb_coordinates
-        self.measured_surface = self.info.get("point_target") == "visual"
-        required = ("action_mean", "action_std", "qpos_mean", "qpos_std", "action_horizon", "logical_action_dim", "joint_dim", "selected_point_indices", "camera_map")
-        missing = [key for key in required if key not in self.info]
-        if missing:
-            raise ValueError(f"Checkpoint metadata is missing {missing}")
-        self.action_mean = np.asarray(self.info["action_mean"], dtype=np.float32)
-        self.action_std = np.asarray(self.info["action_std"], dtype=np.float32)
-        self.qpos_mean = np.asarray(self.info["qpos_mean"], dtype=np.float32)
-        self.qpos_std = np.asarray(self.info["qpos_std"], dtype=np.float32)
-        self.logical_action_dim = int(self.info["logical_action_dim"])
+        if self.info.get("camera_map") != CAMERA_TO_MODEL or tuple(self.info.get("detection_views", ())) != DETECTION_VIEWS:
+            raise ValueError("Checkpoint must use four policy RGB views and front/side-only detections")
         self.joint_dim = int(self.info["joint_dim"])
-        self.point_indices = np.asarray(self.info["selected_point_indices"], dtype=np.int64)
-        self.camera_map = {str(key): str(value) for key, value in self.info["camera_map"].items()}
-        config = Pi0Config(
-            action_dim=32, action_horizon=int(self.info["action_horizon"]), pi05=True,
-            dtype=str(self.info.get("precision", "bfloat16")),
-        )
-        # Constructing directly on ``meta`` prevents an otherwise-unused
-        # ~6 GB CPU parameter allocation.  ``to_empty`` allocates the final
-        # parameter storage only on the target device; load_state_dict then
-        # copies each memory-mapped tensor in turn, rather than retaining a
-        # complete extra CUDA state dict.  Some rotary buffers are not stored
-        # in the checkpoint, so assigning tensor storage directly is unsafe.
+        self.action_dim = int(self.info["logical_action_dim"])
+        if (self.joint_dim, self.action_dim) not in ((6, 7), (12, 14)):
+            raise ValueError("Checkpoint has an invalid UR7e state/action layout")
+        for field, size in (("qpos_mean", self.joint_dim), ("qpos_std", self.joint_dim),
+                            ("action_mean", self.action_dim), ("action_std", self.action_dim)):
+            value = np.asarray(self.info[field], np.float32)
+            if value.shape != (size,) or not np.isfinite(value).all() or (field.endswith("std") and (value <= 0).any()):
+                raise ValueError(f"Invalid checkpoint normalization: {field}")
+            setattr(self, field, value)
+        config = Pi0Config(pi05=True, action_horizon=int(self.info["action_horizon"]),
+                           dtype=self.info["precision"],
+                           paligemma_variant=self.info.get("paligemma_variant", "gemma_2b"),
+                           action_expert_variant=self.info.get("action_expert_variant", "gemma_300m"))
+        kwargs = {key: int(self.info[key]) for key in (
+            "detection_queries", "detection_layers", "detection_width", "detection_heads", "detection_ffn_width")}
         with torch.device("meta"):
-            self.model = model_class(config, joint_dim=self.joint_dim)
+            self.model = Sam3VlaModelPytorch(config, **kwargs)
         self.model.to_empty(device=self.device)
         self.model.load_state_dict(payload["model_state_dict"], strict=True)
-        from safety_module.checkpoint_loading import restore_nonpersistent_buffers
-
         restore_nonpersistent_buffers(self.model)
         del payload
         gc.collect()
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
         self.model.eval()
         self.tokenizer = _Tokenizer(max_len=200, model_path=tokenizer_model)
-        self.num_steps = int(num_steps)
-        self.metadata = {
-            "model_type": self.model_type, "joint_action_and_point_flow": True,
-            "coordinate_frame": self.info.get("coordinate_frame", "left_base"),
-            "action_horizon": int(self.info["action_horizon"]), "logical_action_dim": self.logical_action_dim,
-            "joint_dim": self.joint_dim, "point_count": len(self.point_indices), "camera_map": self.camera_map,
-            "surface_model_hash": self.info.get("surface_model_hash"),
-            "point_identity_version": self.info.get("point_identity_version"),
-            "points_per_link": self.info.get("points_per_link"),
-            "point_target": self.info.get("point_target", "fixed"),
-            "action_period_s": self.info.get("action_period_s"),
-            "detection_views": self.info.get("detection_views") if self.detection_ready else None,
-            "detection_ready": self.detection_ready,
-        }
+        self.num_steps, self.score_threshold = num_steps, score_threshold
+        self.detection_ready = bool(self.info.get("detection_trained"))
+        self.metadata = {key: self.info[key] for key in (
+            "camera_map", "joint_dim", "logical_action_dim", "action_horizon", "action_period_s")}
+        self.metadata.update(model_type=MODEL_TYPE, schema_version=SCHEMA_VERSION,
+                             input_views=list(CAMERA_TO_MODEL), detection_views=list(DETECTION_VIEWS),
+                             detection_box_format="xyxy_original_pixels", detection_ready=self.detection_ready,
+                             joint_action_and_point_flow=False, point_output=False)
 
-    def _points(self, value: object) -> np.ndarray:
-        points = np.asarray(value, dtype=np.float32)
-        if points.ndim == 3 and points.shape[-1] == 3:
-            points = points.reshape(-1, 3)
-        if points.ndim != 2 or points.shape[-1] != 3:
-            raise ValueError(f"robot_points must have shape [K,3] or [L,P,3], got {points.shape}")
-        if self.measured_surface:
-            if len(points) < len(self.point_indices):
-                raise ValueError("Not enough measured current surface points for this checkpoint")
-            selected = points[np.linspace(0, len(points) - 1, len(self.point_indices), dtype=np.int64)]
-        elif len(points) == len(self.point_indices):
-            selected = points
-        elif len(points) > int(self.point_indices.max(initial=-1)):
-            selected = points[self.point_indices]
-        else:
-            raise ValueError(f"robot_points has {len(points)} rows but checkpoint requires indices through {self.point_indices.max()}")
-        if not np.isfinite(selected).all():
-            raise ValueError("robot_points contains non-finite values")
-        return selected
-
-    def infer(self, obs: dict) -> dict:
+    def infer(self, request):
         torch = self.torch
-        qpos = np.asarray(obs["qpos"], dtype=np.float32).reshape(-1)
+        qpos = np.asarray(request["qpos"], np.float32)
         if qpos.shape != (self.joint_dim,) or not np.isfinite(qpos).all():
-            raise ValueError(f"qpos must be finite shape [{self.joint_dim}], got {qpos.shape}")
-        normalized_qpos = (qpos - self.qpos_mean) / self.qpos_std
-        state = np.zeros((32,), dtype=np.float32)
-        state[: self.joint_dim] = normalized_qpos
-        tokens, token_mask = self.tokenizer.tokenize(str(obs.get("prompt", "")), state)
-        available: dict[str, np.ndarray] = {}
-        for source, target in self.camera_map.items():
-            key = f"rgb_{source}"
-            if key in obs:
-                image = np.asarray(obs[key], dtype=np.uint8)
-                if image.ndim != 3 or image.shape[-1] != 3:
-                    raise ValueError(f"{key} must be HxWx3 RGB")
-                available[target] = image
-        if set(available) != set(self.camera_map.values()):
-            raise KeyError(f"All checkpoint cameras are required: {[f'rgb_{name}' for name in self.camera_map]}")
-        shape = next(iter(available.values())).shape
-        images, masks = {}, {}
-        for key in MODEL_IMAGE_KEYS:
-            image = available.get(key, np.zeros(shape, dtype=np.uint8))
-            images[key] = torch.from_numpy(np.ascontiguousarray(image)).to(self.device)[None].permute(0, 3, 1, 2).float() / 255.0 * 2.0 - 1.0
-            masks[key] = torch.tensor([key in available], dtype=torch.bool, device=self.device)
+            raise ValueError(f"qpos must be finite [{self.joint_dim}]")
+        prompt = str(request.get("prompt", "")).strip()
+        if not prompt:
+            raise ValueError("prompt must be nonempty")
+        missing = [f"rgb_{view}" for view in CAMERA_TO_MODEL if f"rgb_{view}" not in request]
+        if missing:
+            raise ValueError(f"All four RGB views are required; missing {missing}")
+        images, shapes = {}, {}
+        for view, key in CAMERA_TO_MODEL.items():
+            rgb = np.asarray(request[f"rgb_{view}"])
+            if rgb.ndim != 3 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
+                raise ValueError(f"rgb_{view} must be uint8 HxWx3 RGB")
+            shapes[view] = rgb.shape[:2]
+            padded = letterbox_rgb(rgb)
+            images[key] = torch.from_numpy(padded.copy()).to(self.device)[None].permute(0, 3, 1, 2).float() / 127.5 - 1
+        state = np.zeros(32, np.float32)
+        state[:self.joint_dim] = (qpos - self.qpos_mean) / self.qpos_std
+        tokens, token_mask = self.tokenizer.tokenize(prompt, state)
         observation = SimpleNamespace(
-            images=images, image_masks=masks,
+            images=images, image_masks={key: torch.ones(1, dtype=torch.bool, device=self.device) for key in images},
             state=torch.from_numpy(state).to(self.device)[None],
             tokenized_prompt=torch.from_numpy(tokens.astype(np.int64)).to(self.device)[None],
             tokenized_prompt_mask=torch.from_numpy(token_mask).to(self.device)[None],
-            token_ar_mask=None, token_loss_mask=None,
-        )
-        current = self._points(obs.get("current_surface", obs.get("robot_points")))
-        if self.measured_surface and obs.get("surface_source") != "measured_depth_fk_gated":
-            raise ValueError("Measured-surface checkpoint requires measured depth input, never synthetic FK points")
-        selected_indices = np.linspace(0, len(obs["current_surface"]) - 1, len(self.point_indices), dtype=np.int64) if self.measured_surface else self.point_indices
-        robot_points = torch.from_numpy(current).to(self.device)[None]
-        joints = torch.from_numpy(normalized_qpos).to(self.device)[None]
+            token_ar_mask=None, token_loss_mask=None)
         with torch.inference_mode():
-            normalized_actions, offsets = self.model.sample_actions_and_point_offsets(
-                self.device, observation, robot_points, joints, num_steps=self.num_steps
-            )
-        normalized = normalized_actions[0, :, : self.logical_action_dim].float().cpu().numpy()
-        actions = normalized * self.action_std[None, :] + self.action_mean[None, :]
-        point_offsets = offsets[0].float().cpu().numpy()
-        result = {
-            "schema_version": 4 if self.model_type == "SurfaceActionDetectionModelPytorch" else (3 if self.model_type == "SurfaceActionModelPytorch" else 2),
-            "action_chunk": actions.astype(np.float32),
-            "current_surface": current,
-            "surface_chunk": (current[None, ...] + point_offsets).astype(np.float32),
-            "actions": actions.astype(np.float32),
-            "point_offsets": point_offsets.astype(np.float32),
-            "predicted_robot_points": (current[None, ...] + point_offsets).astype(np.float32),
-            "selected_point_indices": selected_indices,
-            "surface_model_hash": self.info.get("surface_model_hash", ""),
-            "point_identity_version": self.info.get("point_identity_version", ""),
-            "points_per_link": int(self.info.get("points_per_link", 0)),
-        }
+            prediction = self.model.sample_actions_and_boxes(self.device, observation, num_steps=self.num_steps)
+        normalized = prediction["actions"][0, :, :self.action_dim].float().cpu().numpy()
+        actions = (normalized * self.action_std + self.action_mean).astype(np.float32)
+        if not np.isfinite(actions).all():
+            raise ValueError("Policy produced non-finite actions")
+        detections = {view: [] for view in DETECTION_VIEWS}
         if self.detection_ready:
-            if "rgb_side" not in obs:
-                result["detection_status"] = "missing_side_rgb"
-            else:
-                front = np.asarray(obs["rgb_front"], dtype=np.uint8)
-                side = np.asarray(obs["rgb_side"], dtype=np.uint8)
-                if front.ndim != 3 or side.ndim != 3 or front.shape[-1] != 3 or side.shape[-1] != 3:
-                    raise ValueError("Detection front/side inputs must be HxWx3 RGB")
-                images = {view: torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device)[None].permute(0, 3, 1, 2).float() / 255.0 * 2.0 - 1.0
-                          for view, rgb in (("front", front), ("side", side))}
-                with torch.inference_mode():
-                    logits, predicted = self.model.detect(images)
-                result["detections"] = {}
-                for view_index, (view, rgb) in enumerate((("front", front), ("side", side))):
-                    boxes = self.original_obb_coordinates(predicted[0, view_index], *rgb.shape[:2]).float().cpu().numpy()
-                    scores = logits[0, view_index].sigmoid().float().cpu().numpy()
-                    result["detections"][view] = [
-                        {"cx": float(box[0]), "cy": float(box[1]), "width": float(box[2]),
-                         "height": float(box[3]), "angle_deg": float(box[4]), "score": float(score)}
-                        for box, score in zip(boxes, scores, strict=True)
-                        if score >= 0.5 and 0 <= box[0] < rgb.shape[1] and 0 <= box[1] < rgb.shape[0]
-                        and box[2] >= 1 and box[3] >= 1
-                    ]
-                result["detection_status"] = "ok"
-        return result
+            for index, view in enumerate(DETECTION_VIEWS):
+                boxes = original_xyxy_coordinates(prediction["boxes"][0, index].float().cpu().numpy(), *shapes[view])
+                scores = prediction["scores"][0, index].float().cpu().numpy()
+                if not np.isfinite(boxes).all() or not np.isfinite(scores).all():
+                    raise ValueError("Policy produced non-finite detections")
+                detections[view] = [{"xyxy": box.tolist(), "score": float(score)}
+                                    for box, score in zip(boxes, scores, strict=True)
+                                    if score >= self.score_threshold and box[2] > box[0] and box[3] > box[1]]
+        return {"schema_version": SCHEMA_VERSION, "actions": actions, "action_chunk": actions,
+                "detections": detections, "detection_box_format": "xyxy_original_pixels",
+                "detection_status": "ok" if self.detection_ready else "not_trained"}
 
-    def reset(self) -> None:
+    def reset(self):
         return None
 
 
-def main() -> None:
-    args = parse_args()
-    from openpi.serving import websocket_policy_server
+# Preserve the Python import name while switching its model/output contract.
+Quest3JointSafetyPolicy = Quest3Sam3VlaPolicy
 
-    policy = Quest3JointSafetyPolicy(args.checkpoint, device_name=args.device, num_steps=args.num_steps, tokenizer_model=args.tokenizer_model)
-    logging.info("Serving joint Quest3 PI05 safety policy on %s:%d", socket.gethostname(), args.port)
-    websocket_policy_server.WebsocketPolicyServer(
-        policy=policy, host="0.0.0.0", port=args.port, metadata=policy.metadata
-    ).serve_forever()
+
+def main():
+    args = parse_args()
+    from openpi.serving.websocket_policy_server import WebsocketPolicyServer
+    policy = Quest3Sam3VlaPolicy(args.checkpoint, device_name=args.device, num_steps=args.num_steps,
+                                tokenizer_model=args.tokenizer_model, score_threshold=args.score_threshold)
+    logging.info("Serving SAM 3 VLA on %s:%d", socket.gethostname(), args.port)
+    WebsocketPolicyServer(policy=policy, host="0.0.0.0", port=args.port, metadata=policy.metadata).serve_forever()
 
 
 if __name__ == "__main__":

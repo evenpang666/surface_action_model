@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oa-vla"
+version = "0.3.0"
+description = "Standalone four-view action policy with isolated front/side SAM 3 detection"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "torch==2.7.1",
+  "torchvision==0.22.1",
+  "transformers==4.53.2",
+  "numpy>=1.26,<2",
+  "scipy>=1.11",
+  "safetensors>=0.4.3",
+  "sentencepiece>=0.2",
+  "huggingface-hub>=0.27,<1",
+  "Pillow>=10",
+]
+
+[project.optional-dependencies]
+data = ["h5py>=3.8"]
+serve = ["msgpack>=1.0,<2"]
+client = ["msgpack>=1.0,<2"]
+test = ["pytest>=8", "h5py>=3.8", "msgpack>=1.0,<2"]
+
+[project.scripts]
+oa-vla-train = "oa_vla.train:main"
+oa-vla-predict = "oa_vla.predict:main"
+oa-vla-convert = "oa_vla.convert:main"
+oa-vla-annotate = "oa_vla.annotate:main"
+oa-vla-serve = "oa_vla.serve:main"
+oa-vla-send = "oa_vla.send:main"
+oa-vla-init-test = "oa_vla.init_test_checkpoint:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+oa_vla = ["annotation.html", "vendor/NOTICE.md", "vendor/LICENSE*", "vendor/sam3/LICENSE", "vendor/sam3/NOTICE.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["src/oa_vla/vendor"]

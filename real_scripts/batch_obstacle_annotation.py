@@ -30,6 +30,7 @@ from real_scripts.manual_obstacle_selection import obb_mask
 
 GROUP = "annotations/obstacle_obbs"
 SCHEMA = "dual_rgb_obb_annotation_v2"
+PAIRED_SCHEMA = "dual_rgb_paired_obb_v3"
 CAMERAS = ("front", "side")
 
 
@@ -37,7 +38,7 @@ def annotation_schema(camera_names):
     return SCHEMA if tuple(camera_names) == CAMERAS else "single_rgb_obb_annotation_v1"
 
 
-def validate_boxes(boxes, status, cameras):
+def validate_boxes(boxes, status, cameras, visibility=None):
     """Validate and canonicalize RGB OBBs for both recorded and live frames."""
     if not isinstance(boxes, dict) or set(boxes) != set(cameras):
         raise ValueError(f"Boxes must contain {', '.join(cameras)}")
@@ -57,10 +58,24 @@ def validate_boxes(boxes, status, cameras):
             canonical[name].append({"object_id": object_id.strip(), **{
                 key: float(box[key]) for key in ("cx", "cy", "width", "height", "angle_deg")}})
     ids = [set(box["object_id"] for box in entries) for entries in canonical.values()]
+    if any(len(names) != len(canonical[view]) for names, view in zip(ids, canonical)):
+        raise ValueError("Duplicate object_id: use one OBB per object per view")
+    objects = set().union(*ids)
+    if len(objects) > 32:
+        raise ValueError("At most 32 object pairs per frame")
+    if visibility is not None:
+        if not isinstance(visibility, dict) or set(visibility) != objects:
+            raise ValueError("Visibility must describe every object with at least one visible OBB")
+        for name, flags in visibility.items():
+            if (not isinstance(flags, dict) or set(flags) != set(cameras)
+                    or any(type(flags[view]) is not bool for view in cameras)
+                    or not any(flags.values())
+                    or any(flags[view] != (name in ids[index]) for index, view in enumerate(cameras))):
+                raise ValueError(f"Visibility disagrees with visible OBBs for {name!r}")
     if status == "no_obstacles":
         if any(ids):
             raise ValueError("No-obstacle frames must have empty boxes in all views")
-    elif status != "objects" or not ids[0] or any(view != ids[0] for view in ids):
+    elif status != "objects" or not objects or visibility is None and any(view != ids[0] for view in ids):
         raise ValueError("Use the same obstacle IDs in all views, or explicitly mark no_obstacles")
     return canonical
 
@@ -138,7 +153,7 @@ def inspect_episode(path, depth_paths=None):
         reviewed = np.zeros(count, bool)
         if GROUP in source:
             group = source[GROUP]
-            if group.attrs.get("schema") != annotation_schema(camera_names):
+            if group.attrs.get("schema") not in ((SCHEMA, PAIRED_SCHEMA) if tuple(camera_names) == CAMERAS else (annotation_schema(camera_names),)):
                 raise ValueError(f"{path.name}: incompatible existing annotation schema; RGB coordinates require a new annotation group")
             for key in ("frames_json", "reviewed", "revision", "updated_at_utc", "frame_index", "timestamps_ns"):
                 if key not in group or group[key].shape != (count,):
@@ -195,7 +210,7 @@ class BatchAnnotations:
         self.episodes = [inspect_episode(path, depth_paths) for path in self.paths]
         for path, episode in zip(self.paths, self.episodes):
             with h5py.File(path, "r") as source:
-                if GROUP in source and any(c["depth_scale_m"] is None for c in episode["cameras"].values()):
+                if GROUP in source and "fallback_depth_unit_m" in source[GROUP].attrs and any(c["depth_scale_m"] is None for c in episode["cameras"].values()):
                     recorded_scale = float(source[GROUP].attrs.get("fallback_depth_unit_m", np.nan))
                     if recorded_scale != self.depth_unit_m:
                         raise ValueError(f"{path.name}: resume with the original --depth-unit-m {recorded_scale}")
@@ -232,18 +247,20 @@ class BatchAnnotations:
                     sources[name] = {**camera, "effective_depth_scale_m":
                                      (camera["depth_scale_m"] or self.depth_unit_m) if camera["depth_path"] else None}
                 reviewed, revision, boxes, status = False, 0, {name: [] for name in info["cameras"]}, None
+                visibility = None
                 if GROUP in source:
                     group = source[GROUP]
                     reviewed, revision = bool(group["reviewed"][frame_index]), int(group["revision"][frame_index])
                     if reviewed:
                         saved = json.loads(decode_text(group["frames_json"][frame_index]))
                         boxes, status = saved["boxes"], saved["status"]
+                        visibility = saved.get("visibility")
                 return {"episode_id": episode_id, "frame_index": frame_index, "frame_count": info["frame_count"],
                         "filename": str(path.relative_to(self.task_dir)), "revision": revision,
                         "timestamp_ns": str(int(source["timestamps_ns"][frame_index])),
                         "source_timestamps_ns": timestamps, "depth_sources": sources,
                         "annotation_image": "recorded_rgb", "images": references,
-                        "boxes": boxes, "reviewed": reviewed, "status": status}
+                        "boxes": boxes, "reviewed": reviewed, "status": status, "visibility": visibility}
 
     def save(self, body):
         with self.lock:
@@ -252,8 +269,9 @@ class BatchAnnotations:
             if type(revision) is not int or revision < 0:
                 raise ValueError("Frame revision is required")
             status = body.get("status", "objects")
-            canonical = validate_boxes(body.get("boxes"), status, info["cameras"])
-            schema = annotation_schema(info["cameras"])
+            visibility = body.get("visibility")
+            canonical = validate_boxes(body.get("boxes"), status, info["cameras"], visibility)
+            schema = PAIRED_SCHEMA if visibility is not None and tuple(info["cameras"]) == CAMERAS else annotation_schema(info["cameras"])
             with h5py.File(path, "r+") as source:
                 current = int(source[GROUP+"/revision"][index]) if GROUP in source else 0
                 if current != revision:
@@ -289,6 +307,11 @@ class BatchAnnotations:
                                                   (camera["depth_scale_m"] or self.depth_unit_m) if camera["depth_path"] else None}
                                            for name, camera in info["cameras"].items()},
                          "status": status, "boxes": canonical}
+                if visibility is not None:
+                    saved["visibility"] = visibility
+                if schema == PAIRED_SCHEMA:
+                    # Upgrade the group while preserving legacy v2 rows verbatim.
+                    group.attrs["schema"] = PAIRED_SCHEMA
                 # Reviewed is the commit marker, separating unvisited/failed saves
                 # from explicit empty annotations and fully saved dual-view labels.
                 group["reviewed"][index] = False

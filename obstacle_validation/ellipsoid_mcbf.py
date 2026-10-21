@@ -95,7 +95,9 @@ class EllipsoidMCBF:
             return
         stamp = (getattr(boxes, "source_snapshot", None) or {}).get("host_timestamp_ns")
         old, old_velocity, old_stamp = self.obstacles, self.velocities, self.capture_time
-        signature = np.array([np.r_[b.center, b.axes.ravel(), b.half_sizes] for b in boxes]).tobytes()
+        signature = tuple((np.r_[b.center, b.axes.ravel(), b.half_sizes].tobytes(),
+                           None if getattr(b, "ellipsoid_shape", None) is None else
+                           np.asarray(b.ellipsoid_shape).tobytes(), getattr(b, "object_id", "")) for b in boxes)
         if signature != self.geometry_signature:
             self.obstacles = fit_obstacles(boxes, max_parts=self.config.obstacle_max_parts,
                                            max_span=self.config.obstacle_max_span_m)
@@ -588,6 +590,7 @@ class EllipsoidMCBF:
                      "detour_direction": self.direction.tolist(), "avoidance_bypassed": False,
                      "constraint_pairs": len(pairs), "robot_ellipsoids": len(bodies),
                      "obstacle_ellipsoids": len(self.obstacles), "gripper_variables": 0,
+                     "minimum_predicted_barrier_after_m": min((r["predicted_barrier_after"] for r in pairs), default=float("inf")),
                      "post_optimization_checks": True, "sweep_validation_enabled": False}
         waypoint = np.r_[q+delta, action[12:]]
         info = {"success": True, "controller": "ellipsoid_mcbf", "mode": "ellipsoid_mcbf_feedback",

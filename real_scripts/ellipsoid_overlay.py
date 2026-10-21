@@ -63,10 +63,14 @@ class EllipsoidOverlay:
                 else:
                     items = snapshot.get("obbs", [])
                 boxes = [OrientedBox(np.asarray(b["center"], float), np.asarray(b["axes"], float),
-                                     np.asarray(b["half_sizes"], float)) for b in items]
+                                     np.asarray(b["half_sizes"], float),
+                                     None if b.get("ellipsoid_shape") is None else np.asarray(b["ellipsoid_shape"], float),
+                                     str(b.get("object_id", ""))) for b in items]
                 config = EllipsoidMCBFConfig(**self.scene.project.get("safety", {}).get("ellipsoid_mcbf", {}))
                 key = (config.obstacle_max_parts, config.obstacle_max_span_m,
-                       np.asarray([np.r_[b.center, b.axes.ravel(), b.half_sizes] for b in boxes]).tobytes())
+                       tuple((np.r_[b.center, b.axes.ravel(), b.half_sizes].tobytes(),
+                              None if b.ellipsoid_shape is None else b.ellipsoid_shape.tobytes(), b.object_id)
+                             for b in boxes))
                 if key != self.obstacle_key:
                     models = (fit_obstacles(boxes, max_parts=config.obstacle_max_parts,
                                             max_span=config.obstacle_max_span_m) if boxes else [])

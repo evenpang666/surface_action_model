@@ -9,6 +9,8 @@ quest3:
     - ../quest3_collect/data/left_vr_episodes/*.hdf5
     - ../quest3_collect/data/dual_vr_episodes/*.hdf5
   front_camera: front
+  # Used only by the historical point-flow preprocessor. The active policy's
+  # four-camera contract is model.camera_to_model below.
   camera_to_model:
     front: base_0_rgb
 
@@ -55,8 +57,16 @@ preprocess:
   action_source: commanded
 
 model:
-  backbone: pi05_base
+  backbone: pi05_sam3
   framework: pytorch
+  policy_views: [front, side, right_wrist, left_wrist]
+  camera_to_model:
+    front: base_0_rgb
+    side: base_1_rgb
+    right_wrist: right_wrist_0_rgb
+    left_wrist: left_wrist_0_rgb
+  detection_views: [front, side]
+  point_output: false
   pretrained: outputs/pretrained/pi05_base_pytorch/model.safetensors
   source_checkpoint: ~/.cache/openpi/openpi-assets/checkpoints/pi05_base
 

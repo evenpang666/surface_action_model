@@ -9,6 +9,7 @@ import h5py
 import numpy as np
 
 SCHEMA = "dual_rgb_obb_annotation_v2"
+PAIRED_SCHEMA = "dual_rgb_paired_obb_v3"
 GROUP = "annotations/obstacle_obbs"
 VIEWS = ("front", "side")
 MAX_BOXES = 32
@@ -34,12 +35,13 @@ def _source_path(shard_path: Path, shard) -> Path:
 
 
 def load_detection_annotations(shard_path: Path, shard, sample_frames: np.ndarray,
-                               rgb_shapes: dict[str, tuple[int, int, int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                               rgb_shapes: dict[str, tuple[int, int, int]], *,
+                               axis_aligned: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return normalized [N,2,32,6] targets, valid [N,2,32], reviewed [N,2]."""
     if set(VIEWS) - set(rgb_shapes):
         raise ValueError("Detection training requires both front and side RGB")
     n = len(sample_frames)
-    boxes = np.zeros((n, 2, MAX_BOXES, 6), np.float32)
+    boxes = np.zeros((n, 2, MAX_BOXES, 4 if axis_aligned else 6), np.float32)
     valid = np.zeros((n, 2, MAX_BOXES), bool)
     reviewed = np.zeros((n, 2), bool)
     with h5py.File(_source_path(Path(shard_path), shard), "r") as episode:
@@ -50,7 +52,7 @@ def load_detection_annotations(shard_path: Path, shard, sample_frames: np.ndarra
         if GROUP not in episode:
             return boxes, valid, reviewed
         labels = episode[GROUP]
-        if _text(labels.attrs.get("schema", "")) != SCHEMA or _text(labels.attrs.get("annotation_image", "")) != "recorded_rgb":
+        if _text(labels.attrs.get("schema", "")) not in (SCHEMA, PAIRED_SCHEMA) or _text(labels.attrs.get("annotation_image", "")) != "recorded_rgb":
             raise ValueError(f"{shard_path}: detection labels must use recorded RGB v2 coordinates")
         if (labels["reviewed"].shape != timestamps.shape or labels["frames_json"].shape != timestamps.shape
                 or not np.array_equal(np.asarray(labels["timestamps_ns"], np.int64), timestamps)):
@@ -60,7 +62,7 @@ def load_detection_annotations(shard_path: Path, shard, sample_frames: np.ndarra
             if not bool(labels["reviewed"][index]):
                 continue
             row = json.loads(_text(labels["frames_json"][index]))
-            if (row.get("schema") != SCHEMA or row.get("annotation_image") != "recorded_rgb"
+            if (row.get("schema") not in (SCHEMA, PAIRED_SCHEMA) or row.get("annotation_image") != "recorded_rgb"
                     or row.get("frame_index") != index or row.get("timestamp_ns") != str(int(timestamps[index]))):
                 raise ValueError(f"{shard_path}: stale detection label at frame {index}")
             entries = row.get("boxes", {})
@@ -71,7 +73,7 @@ def load_detection_annotations(shard_path: Path, shard, sample_frames: np.ndarra
                 raise ValueError(f"{shard_path}: duplicate detection object ID at frame {index}")
             if ((row["status"] == "no_obstacles" and any(ids))
                     or (row["status"] == "objects" and (not ids[0] or ids[0] != ids[1]))):
-                raise ValueError(f"{shard_path}: inconsistent detection IDs at frame {index}")
+                raise ValueError(f"{shard_path}: inconsistent detection IDs at frame {index}; single-view visibility requires the standalone OA-VLA paired trainer")
             reviewed[sample] = True
             for view_index, view in enumerate(VIEWS):
                 height, width = rgb_shapes[view][:2]
@@ -91,12 +93,27 @@ def load_detection_annotations(shard_path: Path, shard, sample_frames: np.ndarra
                         values[2], values[3] = values[3], values[2]
                         values[4] += 90
                     angle = np.deg2rad(2 * values[4])
-                    boxes[sample, view_index, slot] = [
-                        (values[0] * resized_w / width + left) / 224,
-                        (values[1] * resized_h / height + top) / 224,
-                        values[2] * resized_w / width / 224,
-                        values[3] * resized_h / height / 224,
-                        np.cos(angle), np.sin(angle),
-                    ]
+                    if axis_aligned:
+                        # Enclose the annotated rotated rectangle in the
+                        # original RGB plane, clip there, then letterbox it.
+                        theta = np.deg2rad(values[4])
+                        extent_x = (abs(np.cos(theta)) * values[2] + abs(np.sin(theta)) * values[3]) / 2
+                        extent_y = (abs(np.sin(theta)) * values[2] + abs(np.cos(theta)) * values[3]) / 2
+                        x0, x1 = np.clip([values[0] - extent_x, values[0] + extent_x], 0, width)
+                        y0, y1 = np.clip([values[1] - extent_y, values[1] + extent_y], 0, height)
+                        boxes[sample, view_index, slot] = [
+                            ((x0 + x1) / 2 * resized_w / width + left) / 224,
+                            ((y0 + y1) / 2 * resized_h / height + top) / 224,
+                            (x1 - x0) * resized_w / width / 224,
+                            (y1 - y0) * resized_h / height / 224,
+                        ]
+                    else:
+                        boxes[sample, view_index, slot] = [
+                            (values[0] * resized_w / width + left) / 224,
+                            (values[1] * resized_h / height + top) / 224,
+                            values[2] * resized_w / width / 224,
+                            values[3] * resized_h / height / 224,
+                            np.cos(angle), np.sin(angle),
+                        ]
                     valid[sample, view_index, slot] = True
     return boxes, valid, reviewed

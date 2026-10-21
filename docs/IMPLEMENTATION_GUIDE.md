@@ -1,5 +1,8 @@
 # 环境、数据与模型运行
 
+当前配对 OBB 模型与训练/标注入口见 [独立 OA-VLA](../oa-vla/README.md)，配置 format 2。
+本文下述 schema-5 集成版是历史独立水平框实现，不包含跨视角对象配对；旧权重须迁移并再训练。
+
 命令均在仓库根目录执行；快速入口见 [README](../README.md)。
 
 ## 环境
@@ -36,37 +39,19 @@ python scripts/build_voxblox.py
 
 ## 数据预处理
 
-使用 episode 采集时的标定；front 深度必须已对齐到 RGB，要求见[深度说明](QUEST3_DEPTH_ALIGNMENT.md)。
-在 `surface-runtime` 环境依次运行，每个 episode 重复一次：
+当前策略只需要四视角 RGB、机器人状态、动作和 front/side 的人工审核框标注，无需深度、CoTracker 或表面点。
+在 `surface-runtime` 环境运行：
 
 ```bash
-python scripts/preprocess_quest3_hdf5.py \
-  --episode /path/to/episode.hdf5 \
-  --output outputs/gates/episode_00000.shard --geometry-only
-
-python scripts/preprocess_cotracker_surface.py \
-  --episode /path/to/episode.hdf5 \
-  --geometry-shard outputs/gates/episode_00000.shard \
-  --calibration configs/hardware/calibration/left_base_to_front_camera.yaml \
-  --output outputs/tracks/episode_00000.npz \
-  --preview outputs/tracks/episode_00000.png \
-  --visualization outputs/tracks/episode_00000.html
-
-python scripts/preprocess_quest3_hdf5.py \
-  --episode /path/to/episode.hdf5 \
-  --measured-flow-npz outputs/tracks/episode_00000.npz \
-  --output outputs/surface_action/episode_00000.shard
+python scripts/preprocess_quest3_rgb_action.py \
+  --episode /path/to/episode.hdf5 --output outputs/rgb_action/episode_00000.shard
 ```
 
-CoTracker 入口默认从以下位置读取源码与权重；位置不同时传 `--repo` / `--checkpoint`：
-
-```text
-~/.cache/torch/hub/facebookresearch_co-tracker_main/
-~/.cache/torch/hub/checkpoints/scaled_offline.pth
-```
-
-检查 PNG/HTML 中跟踪点是否贴合机器人。训练读取 `.shard`，不是回放用的绝对关节 LeRobot 数据集。
-不规则时间间隔需要先重采样；不要混用不同标定或动作周期的数据。
+原 episode 必须包含 `observations/images/{front,side,right_wrist,left_wrist}/rgb`，
+并与状态、时间戳共享帧轴。缺少视角会报错，不能用零图替代。四个相机可使用不同分辨率。
+现有四视角 `.npz` / `.shard` 也可直接训练；其中旧点云字段被忽略。
+标注沿用[RGB OBB 标注流程](BATCH_OBSTACLE_ANNOTATION.md)，训练时转换为外接轴对齐 BB。
+预处理会保留源 HDF5 副本，便于定位标注；旧深度与点流流程见 `scripts/preprocess_quest3_hdf5.py`。
 
 ## PI0.5 基础权重
 
@@ -87,46 +72,22 @@ python openpi/examples/convert_jax_model_to_pytorch.py \
 
 ```bash
 conda activate surface-policy
-python scripts/train_pi05_ur7e_surface_pytorch.py \
-  --dataset outputs/surface_action --output outputs/models/surface_action.pt --validate-only
-python scripts/train_pi05_ur7e_surface_pytorch.py \
-  --dataset outputs/surface_action --output outputs/models/surface_action.pt
-python scripts/serve_quest3_pi05_safety.py --checkpoint outputs/models/surface_action.pt
+python scripts/train_pi05_sam3_pytorch.py \
+  --dataset outputs/rgb_action --output outputs/models/sam3_vla.pt --validate-only
+python scripts/train_pi05_sam3_pytorch.py \
+  --dataset outputs/rgb_action --output outputs/models/sam3_vla.pt \
+  --sam3-checkpoint /path/to/sam3.pt
+python scripts/serve_quest3_pi05_safety.py --checkpoint outputs/models/sam3_vla.pt
 ```
 
-| 参数 | 用法 |
-| --- | --- |
-| `--epochs 20` | 训练轮数 |
-| `--batch-size 1` | 每进程 batch size |
-| `--precision bfloat16` | 默认精度；不支持时按硬件改为其他可用精度 |
-| `--max-points 128` | 每帧训练点数上限 |
-| `--gradient-accumulation-steps N` | 梯度累积 |
-| `--max-steps N` | 限制优化器更新次数 |
-| `--tokenizer-model PATH` | 离线 tokenizer 路径；训练和服务均支持 |
+默认联合训练动作 expert、SAM 3 检测解码器及适配层，冻结 PaliGemma。动作分支使用四视角；
+检测分支通过独立 front/side/text prefix 保证腕部图像不会间接泄漏。详见[模型文档](PI05_DETECTION_EXPERT.md)。
+`--tokenizer-model PATH` 可指定离线 tokenizer；`--precision float16` 适用于 V100。
+`--gradient-accumulation-steps`、`--max-steps` 和 `torchrun` 多卡入口继续支持。
 
-默认训练 action + point，冻结 VLM。检测分支训练见[三头模型](PI05_DETECTION_EXPERT.md)。
-默认策略只使用 front RGB；四视角 LeRobot 导出不会自动增加模型输入视角。
-
-## 在线运行
-
-先完成[标定检查](CALIBRATION.md)。控制机在 `surface-runtime` 的两个终端运行：
-
-```bash
-# 终端 A：visual-point 模型需要 --robot-mask 才有实测 current_surface
-python real_scripts/live_obstacle_detection.py --robot-mask --no-browser
-# 终端 B：一次 dry-run
-python real_scripts/run_ur7e_vla_safety_executor.py --prompt "抓取器械并放入托盘" --once
-```
-
-策略服务默认 `8000`；执行器从 `safety.policy_host` 读取地址，可用 `--policy-host IP` 覆盖。
-去掉 `--once` 连续运行。实机运行：
-
-```bash
-python real_scripts/run_ur7e_vla_safety_executor.py --prompt "抓取器械并放入托盘" \
-  --execute --execute-ack I_UNDERSTAND_DUAL_UR7E_WILL_MOVE
-```
-
-同时控制双夹爪加 `--execute-grippers`。只读 TCP 工具不会自动更新 YAML 中的 TCP 矩阵。
+服务请求必须包含四路 RGB，格式见 [README](../README.md#3-策略服务)。
+新模型不返回表面点，因此不能接入旧 `run_ur7e_vla_safety_executor.py` 的点流 CBF 协议。
+旧 checkpoint 使用 `scripts/serve_quest3_pi05_surface_legacy.py`；标定、实时 RGB-D 地图与独立回放功能继续使用原入口。
 
 ## 排错
 

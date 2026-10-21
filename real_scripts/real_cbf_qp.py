@@ -12,6 +12,8 @@ class OrientedBox:
     center: np.ndarray  # [3]
     axes: np.ndarray  # [3,3], columns are box axes
     half_sizes: np.ndarray  # [3]
+    ellipsoid_shape: np.ndarray | None = None  # Optional depth-free obstacle volume.
+    object_id: str = ""
 
     def __post_init__(self):
         center, axes, half = map(np.asarray, (self.center, self.axes, self.half_sizes))
@@ -21,6 +23,13 @@ class OrientedBox:
             raise ValueError("OBB must be finite with positive half sizes")
         if not np.allclose(axes.T @ axes, np.eye(3), atol=1e-4):
             raise ValueError("OBB axes must be orthonormal")
+        if self.ellipsoid_shape is not None:
+            shape = np.asarray(self.ellipsoid_shape, float)
+            if (shape.shape != (3, 3) or not np.isfinite(shape).all()
+                    or not np.allclose(shape, shape.T, atol=1e-10)
+                    or np.linalg.eigvalsh(shape).min() <= 0
+                    or np.any(np.diag(axes.T @ shape @ axes) > half**2 + 1e-9)):
+                raise ValueError("Invalid ellipsoid or OBB does not enclose its ellipsoid")
 
 
 def boxes_from_snapshot(snapshot):
@@ -34,7 +43,9 @@ def boxes_from_snapshot(snapshot):
     if observation is not None and observation.timestamp_ns != snapshot.get("host_timestamp_ns"):
         raise ValueError("Occupancy map and snapshot capture timestamps disagree")
     return ObservedBoxes([OrientedBox(np.asarray(item["center"], float), np.asarray(item["axes"], float),
-                                      np.asarray(item["half_sizes"], float)) for item in snapshot["obbs"]],
+                                      np.asarray(item["half_sizes"], float),
+                                      None if item.get("ellipsoid_shape") is None else np.asarray(item["ellipsoid_shape"], float),
+                                      str(item.get("object_id", ""))) for item in snapshot["obbs"]],
                          observation)
 
 

@@ -1,5 +1,8 @@
 # 回放避障
 
+实时模型输入可使用 [oavla socket＋共享相机避障入口](OA_VLA_SOCKET_RUNTIME.md)。
+该入口直接消费模型配对 OBB，后台建图，无需人工选择文件；下文是录制动作回放入口。
+
 无需模型权重。使用双 UR7e、双 Robotiq 和已标定的 front/side 相机；
 先安装[LeRobot、OSQP、Voxblox](IMPLEMENTATION_GUIDE.md#环境)，在 `surface-runtime` 环境运行。
 
@@ -53,6 +56,21 @@ python real_scripts/manual_obstacle_annotation.py
 同一物体必须同时落入两个视角的对应框；多个物体取并集。
 筛选使用实时体素，不读取旧 `selection.json` 或旧地图。单臂标注不能用于双臂回放。
 旧 `annotations` 格式需保留同目录的 `capture.json`；新 `boxes` 格式自带 RGB 内参。
+
+### 双视角确认、无体素时的透明障碍
+
+默认逐对象检查两个对应框内的占据体素。若某对象没有占据体素，仍保留它作为透明障碍：
+将 front/side 旋转框按标定反投影为视锥，在工作空间网格的有向边界及两相机 0.01–2.5 m 光轴深度内求交，
+为交集直接生成一个包围椭球，供回放的 MCBF/QP 优化使用。有体素的对象继续采用实测几何；
+后续帧出现体素时自动切回实测。两条链路共用透明区域建模。模型推理会忽略无交集的低置信配对并保留实测体素约束；人工标注回放仍严格校验配对。
+
+补全不添加伪造的深度点或占据体素。日志和报告的 `paired_geometry` 区分对象的实测体素数与透明补全；
+快照 `obbs` 中补全项带 `geometry_source=dual_rgb_transparent_region` 和 `ellipsoid_shape`。
+即使物体小于体素分辨率，也可用连续几何生成区域；双视角没有有效空间交集或缺少一侧框时拒绝处理。
+
+该区域表示基于 RGB 的保守障碍假设，无法证明物体材质或真实厚度。椭球可能大于实物，
+工作空间边界也可能跨越双臂区域之间的间隙；畸变边界使用采样与余量近似。
+具体字段见 [透明障碍补全](OA_VLA_SOCKET_RUNTIME.md#无体素区域的透明障碍补全)。
 
 ## 双终端 action stream（可选）
 

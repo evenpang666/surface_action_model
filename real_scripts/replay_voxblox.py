@@ -14,7 +14,7 @@ from real_scripts.voxblox_obstacle_map import VoxbloxOccupancyGrid, require_voxb
 from safety_module.occupancy import GridGeometry, LocalOccupancyGrid
 
 
-def annotation_reference_grid(scene, resolution_m):
+def annotation_reference_grid(scene, resolution_m, *, max_cells=None):
     """Bound annotation frusta by the two configured arm workspaces, without a saved map."""
     corners = []
     for bounds, transform in scene.workspace_regions:
@@ -23,6 +23,8 @@ def annotation_reference_grid(scene, resolution_m):
     corners = np.concatenate(corners)
     origin = np.floor(corners.min(0)/resolution_m)*resolution_m
     shape = np.ceil((corners.max(0)-origin)/resolution_m).astype(np.int64)
+    if max_cells is not None and int(np.prod(shape)) > max_cells:
+        raise ValueError("Workspace grid exceeds cell budget; increase resolution or shrink bounds")
     grid = LocalOccupancyGrid(origin, np.eye(3), shape, resolution_m)
     centers = grid.centers(np.arange(grid.size))
     active = np.zeros(grid.size, bool)
@@ -76,10 +78,10 @@ def roi_ray_mask(camera, shape, grid, *, max_depth_m=2.5):
 class SelectedTSDFPipeline:
     """No plane fitting, completion model, ESDF, display clouds or native exports."""
 
-    def __init__(self, manual_filter, calibrations):
+    def __init__(self, manual_filter, calibrations, *, grid=None):
         self.manual_filter = manual_filter
         self.calibrations = calibrations
-        self.grid = selected_grid(manual_filter)
+        self.grid = selected_grid(manual_filter) if grid is None else grid
         self.filters = {name: RawDepthEvidenceFilter() for name in calibrations}
         self.roi_masks = {}
         self.support_masks = {}
