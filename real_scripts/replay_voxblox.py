@@ -170,6 +170,7 @@ class ReplayVoxbloxSource:
         self.thread = None
         self.latest = None
         self.error = None
+        self.cleanup_errors = []
         self.started_at = None
 
     def read(self, *, max_wait_s=0., after_timestamp_ns=None):
@@ -178,7 +179,7 @@ class ReplayVoxbloxSource:
                 raise RuntimeError("Replay Voxblox source is closed")
             if self.thread is None:
                 self.started_at = time.monotonic()
-                self.thread = threading.Thread(target=self._worker, name="replay-voxblox", daemon=True)
+                self.thread = threading.Thread(target=self._worker, name="replay-voxblox", daemon=False)
                 self.thread.start()
             deadline = time.monotonic()+max_wait_s
             while True:
@@ -201,9 +202,19 @@ class ReplayVoxbloxSource:
         with self.condition:
             self.condition.notify_all()
         if self.thread is not None:
-            self.thread.join(timeout=10.)
-            if self.thread.is_alive():
-                raise RuntimeError("Replay Voxblox worker did not finish releasing hardware")
+            # Never abandon a hardware-owning worker after a fixed timeout.
+            # SDK reads are bounded; native startup/stop may take longer.
+            self.thread.join()
+        if self.cleanup_errors:
+            details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in self.cleanup_errors)
+            raise RuntimeError(f"Replay Voxblox failed releasing hardware: {details}") from self.cleanup_errors[0]
+
+    def _release_hardware(self, close):
+        try:
+            close()
+        except BaseException as exc:
+            self.cleanup_errors.append(exc)
+            raise  # ExitStack still attempts every other registered release.
 
     def _worker(self):
         try:
@@ -225,15 +236,15 @@ class ReplayVoxbloxSource:
             receivers = {}
             for arm in scene.arms:
                 receiver = RTDEReceiveInterface(arm.ip)
-                cleanup.callback(receiver.disconnect)
+                cleanup.callback(self._release_hardware, receiver.disconnect)
                 receivers[arm.name] = receiver
             grippers = scene.open_grippers(args)
             for gripper in grippers.values():
-                cleanup.callback(gripper.close)
+                cleanup.callback(self._release_hardware, gripper.close)
             source = RealSenseD435iSource(
                 cameras=tuple(D435iCameraConfig(n, scene.report["camera_serials"][n]) for n in scene.calibrations),
                 width=args.width, height=args.height, fps=args.fps, wait_timeout_ms=1000, read_retries=1)
-            cleanup.callback(source.stop)
+            cleanup.callback(self._release_hardware, source.stop)
             source.start()
             calibrations = dict(scene.calibrations)
             color_info = source.get_color_calibrations()

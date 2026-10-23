@@ -54,6 +54,41 @@ def test_frozen_view_is_lazy_cached_and_capture_aligned(grid, monkeypatch):
     assert calls == [1]
 
 
+def test_scoped_frozen_view_preserves_native_cells_and_samples_after_filtering(grid):
+    from real_scripts.manual_obstacle_selection import scoped_native_view
+
+    plane(grid)
+    frozen = grid.freeze_view(max_voxels=2)
+    original = frozen.materialize()
+    # Choose a surface cell omitted by the global display budget.
+    ids = np.flatnonzero(grid.active & (grid.weight >= grid.min_weight)
+                         & (np.abs(grid.distance_m) <= grid.surface_band_m))
+    shown, _ = grid.indices(original["surface"]["centers"])
+    cell = np.setdiff1d(ids, shown)[0]
+    scope = np.zeros(grid.size, bool)
+    scope[cell] = True
+    snapshot = {"_voxblox_view": frozen}
+    result = scoped_native_view(snapshot, scope)["voxblox_view"]
+    surface = result["surface"]
+    assert surface["count"] == surface["shown"] == 1
+    assert not surface["sampled"]
+    np.testing.assert_allclose(surface["centers"], grid.centers([cell]), atol=1e-7)
+    assert surface["sizes_m"] == [grid.resolution_m]
+    assert surface["distances_m"] == [float(grid.distance_m[cell])]
+    assert surface["weights"] == [float(grid.weight[cell])]
+    assert result["field"]["shown"] == 0
+    for group in result["esdf"].values():
+        kept, inside = grid.indices(group["centers"])
+        assert inside.all() and np.all(kept == cell)
+        assert group["distances_m"] == grid.esdf_distance_m[kept].tolist()
+    assert result["axes"] == original["axes"]
+    assert result["capture_timestamp_ns"] == original["capture_timestamp_ns"]
+    assert frozen.materialize() is original
+    empty = frozen.materialize(scope=np.zeros(grid.size, bool))
+    assert not empty["surface"]["shown"] and not empty["field"]["shown"]
+    assert all(not group["shown"] for group in empty["esdf"].values())
+
+
 def test_cli_defaults_and_explicit_lingbot():
     assert not live.parse_args([]).lingbot_depth
     assert not live.parse_args(["--scene","single-pika"]).lingbot_depth

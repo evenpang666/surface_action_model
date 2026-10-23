@@ -200,6 +200,35 @@ def test_acquisition_initialization_error_closes_partial_hardware(monkeypatch, s
     assert events == ["receive_connect", "camera_stop", "gripper_close", "receive_disconnect"]
 
 
+def test_camera_stop_failure_is_reported_after_releasing_other_hardware(monkeypatch, selection):
+    from real_scripts import ur7e_realsense_adapter as adapter
+    source = make_source(monkeypatch, selection)
+    events = []
+
+    class Camera:
+        def __init__(self, **kwargs): pass
+        def start(self): raise RuntimeError("camera busy")
+        def stop(self):
+            events.append("camera_stop")
+            raise RuntimeError("camera stop failed")
+
+    monkeypatch.setitem(sys.modules, "rtde_receive", SimpleNamespace(RTDEReceiveInterface=lambda ip:
+                        SimpleNamespace(disconnect=lambda: events.append("receive_disconnect"))))
+    monkeypatch.setattr(adapter, "RealSenseD435iSource", Camera)
+    source.scene.arms = [SimpleNamespace(name="left", ip="fake")]
+    source.scene.calibrations = {"front": None, "side": None}
+    source.scene.report["camera_serials"] = {"front": "f", "side": "s"}
+    source.scene.open_grippers = lambda args: {"left": SimpleNamespace(close=lambda: events.append("gripper_close"))}
+    try:
+        with pytest.raises(RuntimeError, match="camera stop failed"):
+            source.read()
+    finally:
+        with pytest.raises(RuntimeError, match="failed releasing hardware.*camera stop failed"):
+            source.close()
+    assert events == ["camera_stop", "gripper_close", "receive_disconnect"]
+    assert not source.thread.is_alive()
+
+
 @pytest.mark.parametrize("external", [False, True, "url"])
 def test_replay_routes_source_and_cleans_up_on_initialization_error(tmp_path, monkeypatch, selection, external):
     events = []

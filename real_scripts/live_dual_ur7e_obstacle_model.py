@@ -81,7 +81,12 @@ const voxbloxViewer=new VoxbloxViewer(()=>{if(lastSnapshot)draw(lastSnapshot)});
 document.getElementById('hud').append(voxbloxViewer.element);
 const ellipsoidViewer=new EllipsoidViewer(()=>{if(lastSnapshot)draw(lastSnapshot);refresh()});
 document.getElementById('hud').append(ellipsoidViewer.element);
-function nativeView(d){return d.voxblox_view||d.octomap_view}
+function nativeView(d){
+  if(filterVoxels&&d.voxblox_view){
+    return manualMode?d.manual_voxblox_view:d.viewer_filter?.voxblox_view;
+  }
+  return d.voxblox_view||d.octomap_view;
+}
 function nativeViewer(d){return d.voxblox_view?voxbloxViewer:octomapViewer}
 const viewerTiming={};
 function updateViewerTiming(){document.getElementById('viewer-timing').textContent=['网页新帧间隔 '+(Number.isFinite(viewerTiming.interval)?Math.round(viewerTiming.interval)+' ms':'—'),'取数/解析 '+(Number.isFinite(viewerTiming.fetch)?Math.round(viewerTiming.fetch)+' ms':'—'),'绘制 '+(Number.isFinite(viewerTiming.render)?Math.round(viewerTiming.render)+' ms':'—')].join(' · ')}
@@ -178,7 +183,7 @@ async function draw(d){
   const renderKey=drawKey(d);
   lastSnapshot=d;
   octomapViewer.update(d.octomap_view,filterVoxels,showVoxels);
-  voxbloxViewer.update(d.voxblox_view,filterVoxels,showVoxels);
+  voxbloxViewer.update(d.voxblox_view?nativeView(d):null,filterVoxels,showVoxels);
   ellipsoidViewer.update(d.ellipsoid_view,filterVoxels,manualMode);
   const frame=tableFrame(d);
   const bounds=tableBounds(d.environment,frame);
@@ -204,7 +209,7 @@ async function draw(d){
     xaxis:{title:`${axis} X (m)`},yaxis:{title:`${axis} Y (m)`},zaxis:{title:`${axis} Z (m)`}};
   const ranges=overviewBounds(d,frame);
   if(ranges){scene.xaxis.range=ranges.x;scene.yaxis.range=ranges.y;scene.zaxis.range=ranges.z}
-  const showCloud=!nativeView(d)||nativeViewer(d).points.checked;
+  const showCloud=!(d.voxblox_view||d.octomap_view)||nativeViewer(d).points.checked;
   const traces=showCloud?[pts(d.environment,'environment',.7,frame)]:[];
   if(showRobot)traces.push(pts(d.robot,'dual robots',1.1,frame));
   traces.push(...ellipsoidViewer.traces(p=>tablePoint(p,frame)));
@@ -218,7 +223,8 @@ async function draw(d){
     if(selection){
       filterText=`人工冻结帧 ${selection.frame} · 选中 ${selection.voxel_count} 个体素 · 非实时`;
       if(showVoxels){
-        traces.push(manualVoxels(selection,frame));
+        if(voxbloxViewer.useNative(d.manual_voxblox_view))traces.push(...voxbloxViewer.traces(d.manual_voxblox_view,p=>tablePoint(p,frame)));
+        else traces.push(manualVoxels(selection,frame));
         const selectedBoxes=selection.objects.filter(o=>o.obb).map(o=>o.obb);
         traces.push(...boxes(selectedBoxes,frame).map(b=>({...b,line:{color:'#63b8ff',width:4}})));
       }
@@ -227,7 +233,10 @@ async function draw(d){
     const filtered=d.viewer_filter;
     if(filtered?.state==='applied'){
       filterText=filtered.annotation_path?`标注 ${filtered.annotation_path} · 当前帧 ${d.frame} · ${filtered.voxel_count} 个体素`:`仅标注帧 ${filtered.annotation_frame} 选中单元内的当前占据体素 · 帧 ${d.frame} · ${filtered.voxel_count} 个体素`;
-      if(showVoxels)traces.push(...boxes(filtered.obbs,frame));
+      if(showVoxels){
+        if(d.voxblox_view&&voxbloxViewer.useNative(filtered.voxblox_view))traces.push(...voxbloxViewer.traces(filtered.voxblox_view,p=>tablePoint(p,frame)));
+        else traces.push(...boxes(filtered.obbs,frame));
+      }
     }else{
       const reasons={missing_annotations:'请在标注子页面画框并点击“筛选并显示体素”。',map_unavailable:'当前没有可筛选的占据地图。',scene_changed:'相机或标定已变化，请重新捕获并标注。'};
       filterText=filtered?(filtered.error?`标注筛选不可用：${filtered.error}`:reasons[filtered.state]||'筛选结果不可用。'):'正在读取标记框筛选结果…';

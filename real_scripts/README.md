@@ -49,8 +49,10 @@ python real_scripts/manual_obstacle_annotation.py
 
 在 <http://127.0.0.1:8770> 捕获、画框并保存，详见[RGB 标注](../docs/BATCH_OBSTACLE_ANNOTATION.md)。
 独立标注捕获时需要退出检测进程；保存后重启检测即可加载最新标注。
+回放直接使用保存的 `annotations.json`，详见[回放避障](../docs/MODEL_FREE_OBSTACLE_VALIDATION.md)；
+无需生成 `selection.json`。
 
-需要旧式 `selection.json` 时，在检测页面点击「人工 OBB / 体素验证」，
+仅在兼容旧式体素选择文件时，在检测页面点击「人工 OBB / 体素验证」，
 或打开 <http://127.0.0.1:8766/manual-obstacles>：
 
 1. 捕获冻结 RGB-D 帧。

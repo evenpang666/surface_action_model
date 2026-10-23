@@ -20,19 +20,21 @@ class VoxbloxViewer extends OctomapLeafViewer {
 
   isEsdf(view) { return this.field.value==='esdf'&&!!view.esdf; }
 
+  useNative(view) { return Boolean(view && this.style.value==='native'); }
+
   update(view,filtered,showVoxels) {
     this.element.hidden=!view;
     if(!view)return;
     if(!view.esdf)this.field.value='tsdf';
-    this.field.disabled=filtered||!view.esdf||this.style.value!=='native';
-    this.style.disabled=filtered;
-    this.color.disabled=this.free.disabled=filtered||this.style.value!=='native';
+    this.field.disabled=!view.esdf||this.style.value!=='native';
+    this.style.disabled=false;
+    this.color.disabled=this.free.disabled=this.style.value!=='native';
     const esdf=this.isEsdf(view), selected=esdf?view.esdf:view;
     const surface=selected.surface, field=selected.field, kind=esdf?'ESDF':'TSDF';
     const sampled=surface.sampled||(this.free.checked&&field.sampled);
-    const note=filtered?' · 人工筛选使用精确兼容体素框':
-      this.style.value!=='native'?' · 显示 TSDF 表面与当前端点的兼容体素框':
-      `${sampled?' · 显示已抽样，距离场完整':''} · 未观测区域不绘制`;
+    const note=(this.style.value!=='native'?' · 显示兼容体素框':
+      filtered?' · 人工筛选范围内的原生体素（保留原距离值）':' · 未观测区域不绘制')+
+      (sampled?' · 显示已抽样，距离场完整':'');
     this.status.textContent=`${kind} 表面 ${surface.shown}/${surface.count} · 其余距离场 ${field.shown}/${field.count}${this.free.checked?'':'（隐藏）'} · 体素 ${(view.resolution_m*1000).toFixed(0)} mm · 表面带 ±${(view.surface_band_m*1000).toFixed(0)} mm${esdf?` · 距离上限 ${view.esdf_max_distance_m} m`:''}${note}${showVoxels?'':' · 体素已隐藏'}`;
     this.legend.textContent=this.color.value==='weight'?'颜色表示源 TSDF 融合权重；悬停查看距离、权重和边长。':
       this.color.value==='state'?`橙：${kind} 表面带 · 蓝：其余已观测距离场。当前端点补充框可切换到兼容体素框查看。`:

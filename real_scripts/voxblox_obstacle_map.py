@@ -173,10 +173,12 @@ class VoxbloxOccupancyGrid(LocalOccupancyGrid):
         """Capture arrays now; sample/convert only on a viewer HTTP request."""
         return FrozenVoxbloxView(self, max_voxels)
 
-    def viewer_payload(self, *, max_voxels=6000):
+    def viewer_payload(self, *, max_voxels=6000, scope=None):
         if not isinstance(max_voxels, int) or max_voxels < 2:
             raise ValueError("Voxblox viewer requires a budget of at least two voxels")
         known = self.active & (self.weight>=self.min_weight)
+        if scope is not None:
+            known &= scope
         surface = known & (np.abs(self.distance_m)<=self.surface_band_m)
         result = {"schema":"voxblox_tsdf_view_v1", "frame":self.frame,
                   "capture_timestamp_ns":self.timestamp_ns, "coordinate_frame":self.coordinate_frame,
@@ -198,10 +200,11 @@ class VoxbloxOccupancyGrid(LocalOccupancyGrid):
         result["surface"] = group(surface,max_voxels-field_limit,self.distance_m,self.weight)
         result["field"] = group(known & ~surface,field_limit,self.distance_m,self.weight)
         if self.esdf_enabled:
-            esdf_surface = self.esdf_observed & (np.abs(self.esdf_distance_m)<=self.surface_band_m)
+            observed = self.esdf_observed if scope is None else self.esdf_observed & scope
+            esdf_surface = observed & (np.abs(self.esdf_distance_m)<=self.surface_band_m)
             result["esdf"] = {
                 "surface":group(esdf_surface,max_voxels-field_limit,self.esdf_distance_m,self.weight),
-                "field":group(self.esdf_observed & ~esdf_surface,field_limit,self.esdf_distance_m,self.weight)}
+                "field":group(observed & ~esdf_surface,field_limit,self.esdf_distance_m,self.weight)}
         return result
 
     def snapshot(self):
@@ -267,7 +270,11 @@ class FrozenVoxbloxView(GridGeometry):
         self._payload = None
         self._lock = threading.Lock()
 
-    def materialize(self):
+    def materialize(self, *, scope=None):
+        if scope is not None:
+            # Filter the complete captured fields before sampling. Never mutate
+            # the unfiltered payload shared with other viewer requests.
+            return VoxbloxOccupancyGrid.viewer_payload(self, max_voxels=self.max_voxels, scope=scope)
         with self._lock:
             if self._payload is None:
                 self._payload = VoxbloxOccupancyGrid.viewer_payload(self, max_voxels=self.max_voxels)

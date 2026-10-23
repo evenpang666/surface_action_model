@@ -1,7 +1,9 @@
 """Read-only obstacle snapshots and explicitly armed dual RTDE output."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
+import signal
 import threading
 import time
 from urllib.error import HTTPError, URLError
@@ -17,6 +19,37 @@ from obstacle_validation.core import vector
 
 
 EXECUTE_ACK = "I_UNDERSTAND_DUAL_UR7E_WILL_MOVE"
+
+
+@contextmanager
+def replay_shutdown():
+    """Unwind hardware owners on SIGTERM/SIGINT; protect cleanup from repeats.
+
+    Signal handlers belong to the main thread. Embedded callers on other
+    threads keep their application's signal policy.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield lambda: None
+        return
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous = {number: signal.getsignal(number) for number in signals}
+
+    def begin_cleanup():
+        # Ctrl+C/kill must not interrupt camera.stop() or thread.join().
+        for item in signals:
+            signal.signal(item, signal.SIG_IGN)
+
+    def terminate(number, frame):
+        begin_cleanup()
+        raise SystemExit(128 + number)
+
+    try:
+        for number in signals:
+            signal.signal(number, terminate)
+        yield begin_cleanup
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
 
 
 def timed_call(stats, name, function, *args, **kwargs):

@@ -81,16 +81,18 @@ python -m obstacle_validation.action_stream \
   --dataset outputs/obstacle_validation/my_episode_lerobot
 ```
 
-接收端需要旧式 `selection.json`，可在[实时标注页](../real_scripts/README.md#双视角人工-obb--体素验证)生成：
+接收端直接使用[RGB 标注页](BATCH_OBSTACLE_ANNOTATION.md#捕获当前相机)保存的 `annotations.json`，
+按 front/side 对应框筛选实时体素，无需生成 `selection.json`：
 
 ```bash
 python -m obstacle_validation.stream_replay \
-  --manual-selection outputs/manual_obstacles/CAPTURE_ID/selection.json \
+  --manual-annotations outputs/manual_obstacles/CAPTURE_ID/annotations.json \
   --output outputs/obstacle_validation/stream_run
 ```
 
 接收端**默认虚拟执行**。实机加 `--execute --execute-ack I_UNDERSTAND_DUAL_UR7E_WILL_MOVE`；
-去掉 `--manual-selection` 为 baseline。发送端等当前块执行确认后才发送下一块。
+去掉 `--manual-annotations` 为 baseline，不会自动加载最新标注。`--annotations` 是同义参数；
+旧 `--manual-selection` 仍兼容选择文件及 RGB 标注文件。发送端等当前块执行确认后才发送下一块。
 跨机时两端设置一致的 `--host` / `--port`；断线后不会自动重放。
 
 ## 参数和日志
@@ -116,3 +118,9 @@ python -m obstacle_validation.stream_replay \
 
 默认不加载 LingBot，关闭 robot mask；内嵌回放关闭 ESDF 和网页。
 需要看地图时单独启动[障碍可视化](../real_scripts/README.md)，并通过外部检测模式复用该进程，避免相机冲突。
+
+## 停止回放
+
+两个回放入口均支持 Ctrl+C 或 `kill PID`（SIGTERM）：停止执行并等待内嵌采集线程释放相机和连接，
+清理期间重复发送这两种信号不会中断释放。关闭失败会报错；SDK 若卡住，进程会保持等待，不会超时放弃相机线程。
+`kill -9`（SIGKILL）无法执行清理。外部检测模式的相机由检测进程持有，停止回放不会关闭该进程。

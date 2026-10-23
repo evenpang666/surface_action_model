@@ -21,6 +21,14 @@ def latest_annotation_path(output_dir):
     return max(candidates, key=lambda path: (path.parent.stat().st_mtime_ns, path.parent.name), default=None)
 
 
+def scoped_native_view(snapshot, scope):
+    """Keep captured Voxblox cells and scalar channels within the selected scope."""
+    frozen = snapshot.get("_voxblox_view")
+    if frozen is None:
+        return {}
+    return {"voxblox_view": frozen.materialize(scope=scope)}
+
+
 def timestamp_capture_directory(output_dir):
     """Reserve a readable local capture time, including timezone and microseconds."""
     root = Path(output_dir)
@@ -441,7 +449,8 @@ class ManualSelectionStore:
                 return {**base, "state": "applied", "frame": snapshot["frame"],
                         "annotation_frame": self.annotation_path.parent.name,
                         "scope_policy": self.annotation_filter.scope_policy,
-                        "voxel_count": selected["occupancy_map"]["occupied_voxels"], "obbs": boxes}
+                        "voxel_count": selected["occupancy_map"]["occupied_voxels"], "obbs": boxes,
+                        **scoped_native_view(snapshot, self.annotation_filter.scope)}
             annotations = self.annotations
             capture_id = self.capture_id
             captured = self.snapshot
@@ -478,12 +487,19 @@ class ManualSelectionStore:
                 "annotation_frame": captured["frame"],
                 "obbs": [{"center": box.center.tolist(), "axes": box.rotation.tolist(),
                           "half_sizes": (box.extents / 2).tolist(), "corners": box.corners.tolist(),
-                          "voxel_count": box.point_count} for box in boxes]}
+                          "voxel_count": box.point_count} for box in boxes],
+                **scoped_native_view(snapshot, scope)}
 
     def scene_payload(self):
         with self.lock:
             if self.scene is None:
                 raise ValueError("Capture a frame on the manual annotation page first")
-            return {**self.scene, "manual_selection": self.result,
+            native = {}
+            if self.result is not None and "_voxblox_view" in self.snapshot:
+                grid = ObservationGrid(self.snapshot["occupancy_map"])
+                view = scoped_native_view(self.snapshot, self.cell_scope.mask_for(grid))
+                if view:
+                    native["manual_voxblox_view"] = view["voxblox_view"]
+            return {**self.scene, **native, "manual_selection": self.result,
                     "manual_revision": self.revision,
                     "status": f"人工标注冻结帧 {self.snapshot['frame']}（非实时）"}

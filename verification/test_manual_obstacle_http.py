@@ -284,6 +284,23 @@ def test_manual_http_capture_select_and_scene_config(monkeypatch, tmp_path, scen
                         assert field["esdf_enabled"]
                         assert field["esdf"]["surface"]["shown"] > 0
                         assert field["esdf"]["field"]["shown"] > 0
+                        scoped = rendered["viewer_filter"]["voxblox_view"]
+                        assert scoped["frame"] == field["frame"]
+                        assert scoped["capture_timestamp_ns"] == field["capture_timestamp_ns"]
+                        assert scoped["axes"] == field["axes"]
+                        assert scoped["resolution_m"] == field["resolution_m"]
+                        assert scoped["surface"]["shown"] > 0
+                        from safety_module.occupancy import ObservationGrid
+                        from safety_module.voxel_selection import VoxelSelectionScope
+                        grid = ObservationGrid(filtered["occupancy_map"])
+                        scope = VoxelSelectionScope(grid, result["voxel_ids"]).mask_for(grid)
+                        for groups in (scoped, scoped["esdf"]):
+                            for name in ("surface", "field"):
+                                group = groups[name]
+                                ids, inside = grid.indices(group["centers"])
+                                assert inside.all() and scope[ids].all()
+                                assert all(size == field["resolution_m"] for size in group["sizes_m"])
+                        assert preview["manual_voxblox_view"]["surface"]["shown"] > 0
                     else:
                         assert "octomap_view" not in rendered
                     assert rendered["viewer_filter"]["state"] == "applied"

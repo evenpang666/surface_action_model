@@ -139,8 +139,8 @@ tsdf.style.value='boxes';
 traces=await draw();
 assert.equal(traces.some(t=>t.type==='mesh3d'),false);
 vm.runInContext('filterVoxels=true',context);
-await draw();
-assert.equal(tsdf.style.disabled,true);
+traces=await draw();
+assert.equal(traces.some(t=>t.type==='mesh3d'),false);
 console.log('Voxblox viewer: native TSDF metre/weight colors, shared geometry, field toggle, compatibility and filtered display passed.');
 
 vm.runInContext('filterVoxels=false',context);
@@ -174,7 +174,36 @@ traces=await draw();
 assert.equal(traces.find(t=>t.type==='mesh3d').colorbar.title.text,'源 TSDF 权重');
 vm.runInContext('filterVoxels=true',context);
 traces=await draw();
-assert.equal(tsdf.field.disabled,true);
+// While a filtered response is pending, never draw the unfiltered field.
+assert.equal(traces.some(t=>t.type==='mesh3d'),false);
+context.snapshot.viewer_filter.voxblox_view={...context.snapshot.voxblox_view,
+  surface:tsdfGroup([.1,0,.5],-.01,7),
+  esdf:{surface:tsdfGroup([.1,0,.5],.015,7),
+    field:{count:0,shown:0,sampled:false,centers:[],sizes_m:[],distances_m:[],weights:[]}}};
+traces=await draw();
+assert.equal(tsdf.field.disabled,false);
+assert.equal(tsdf.style.disabled,false);
+assert.equal(tsdf.color.disabled,false);
+assert.equal(tsdf.free.disabled,false);
+mesh=traces.find(t=>t.type==='mesh3d');
+assert.equal(mesh.name,'Voxblox ESDF 表面体素');
+assert.equal(mesh.customdata[0][0],.015);
+assert.equal(mesh.customdata[0][1],7);
+assert.equal(mesh.customdata[0][2],20);
+assert.ok(Math.abs(Math.min(...mesh.x)-.09)<1e-12);
+assert.ok(!traces.some(t=>t.name==='体素框'));
+tsdf.field.value='tsdf';tsdf.color.value='distance';
+traces=await draw();
+mesh=traces.find(t=>t.type==='mesh3d');
+assert.equal(mesh.name,'Voxblox TSDF 表面体素');
+assert.equal(mesh.intensity[0],-.01);
+assert.ok(tsdf.status.textContent.includes('原生体素'));
+vm.runInContext('showVoxels=false',context);
+traces=await draw();
+assert.equal(traces.some(t=>t.type==='mesh3d'),false);
+vm.runInContext('showVoxels=true',context);
+context.snapshot.viewer_filter={state:'annotation_invalid',error:'test'};
+traces=await draw();
 assert.equal(traces.some(t=>t.type==='mesh3d'),false);
 vm.runInContext('filterVoxels=false',context);
 delete context.snapshot.voxblox_view.esdf;
@@ -188,7 +217,7 @@ const ellipsoids=vm.runInContext('ellipsoidViewer',context);
 assert.equal(ellipsoids.groups(),'');
 const body=(key,arm)=>({key,arm,link:2,center:[2,3,.5],radii:[.1,.2,.3],
   axes:[[0,-1,0],[1,0,0],[0,0,1]]});
-context.snapshot.ellipsoid_view={scope:'selected_cells',robot:[body('left',0),body('right',1)],
+context.snapshot.ellipsoid_view={scope:'all_cells',robot:[body('left',0),body('right',1)],
   obstacles:[body('obstacle',-1)],messages:[]};
 vm.runInContext('filterVoxels=false;showRobot=false;showVoxels=false',context);
 traces=await draw();
@@ -211,11 +240,8 @@ ellipsoids.style.value='wire';
 traces=await draw();
 assert.equal(traces.find(t=>t.name==='左臂椭球').type,'scatter3d');
 assert.ok(traces.find(t=>t.name==='左臂椭球').x.includes(null));
-// B changes voxel display only; the ellipsoid set is always selected-only.
+// A toggle must wait for overlay data matching the requested scope.
 vm.runInContext('filterVoxels=true',context);
-traces=await draw();
-assert.equal(traces.filter(t=>/椭球$/.test(t.name)).length,3);
-context.snapshot.ellipsoid_view.scope='all_occupied';
 traces=await draw();
 assert.equal(traces.some(t=>/椭球$/.test(t.name)),false);
 context.snapshot.ellipsoid_view.scope='selected_cells';
@@ -230,3 +256,28 @@ traces=await draw();
 assert.equal(traces.some(t=>/椭球$/.test(t.name)),false);
 assert.ok(ellipsoids.status.textContent.includes('test failure'));
 console.log('Ellipsoid viewer: exact rotated axes, independent toggles, mesh/wire, scope changes and failures passed.');
+
+// Frozen capture previews use their own native scope without changing the
+// exported selection or the unfiltered capture's distance field.
+const frozenContext=vm.createContext({document:context.document,Plotly:context.Plotly,
+  location:{search:'?manual=1'},URLSearchParams,AbortController,
+  performance:context.performance,fetch:context.fetch,setTimeout:()=>0});
+vm.runInContext(helper,frozenContext);
+for(const script of ['voxblox_viewer.js','ellipsoid_viewer.js'])
+  vm.runInContext(await readFile(new URL('../real_scripts/'+script,import.meta.url),'utf8'),frozenContext);
+vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],frozenContext);
+frozenContext.snapshot={...context.snapshot,manual_selection:{frame:1,voxel_count:1,objects:[],
+  centers:[[.1,0,.5]],axes:[[1,0,0],[0,1,0],[0,0,1]],resolution_m:.02},
+  manual_voxblox_view:{...context.snapshot.voxblox_view,
+    surface:tsdfGroup([.1,0,.5],-.005,9)}};
+vm.runInContext('filterVoxels=true',frozenContext);
+await vm.runInContext('draw(snapshot)',frozenContext);
+mesh=draws.at(-1).traces.find(t=>t.type==='mesh3d');
+assert.equal(mesh.name,'Voxblox TSDF 表面体素');
+assert.equal(mesh.intensity[0],-.005);
+assert.equal(mesh.customdata[0][1],9);
+assert.ok(Math.abs(Math.min(...mesh.x)-.09)<1e-12);
+vm.runInContext('filterVoxels=false',frozenContext);
+await vm.runInContext('draw(snapshot)',frozenContext);
+assert.equal(draws.at(-1).traces.find(t=>t.type==='mesh3d').intensity[0],.01);
+console.log('Frozen Voxblox preview: native scoped cells, distances and source weights preserved.');

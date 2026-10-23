@@ -1,4 +1,4 @@
-"""Socket action replay: baseline without a selection, ellipsoid avoidance with one."""
+"""Socket action replay: baseline without labels, ellipsoid avoidance with RGB annotations."""
 import argparse
 from contextlib import ExitStack
 import json
@@ -14,8 +14,9 @@ import yaml
 from obstacle_validation.action_stream import ProtocolError, receive_session
 from obstacle_validation.ellipsoid_mcbf import EllipsoidMCBF, EllipsoidMCBFConfig
 from obstacle_validation.lerobot_replay import LiveSceneReader, DualGripperCommander
+from obstacle_validation.manual_annotation_filter import ManualAnnotationFilter
 from obstacle_validation.manual_voxel_filter import ManualVoxelFilter
-from obstacle_validation.runtime import DualCommander, EXECUTE_ACK, snapshot_state
+from obstacle_validation.runtime import DualCommander, EXECUTE_ACK, snapshot_state, replay_shutdown
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler
 from real_scripts.replay_voxblox import ReplayVoxbloxSource
 from safety_module.dual_camera_calibration import validate_calibration_identity
@@ -44,7 +45,7 @@ class ReplayExecutor:
 
     @property
     def baseline(self):
-        return self.args.manual_selection is None
+        return self.args.manual_annotations is None and self.args.manual_selection is None
 
     def _write_report(self):
         (self.args.output/"report.json").write_text(json.dumps(self.report, indent=2, ensure_ascii=False))
@@ -78,7 +79,14 @@ class ReplayExecutor:
             if args.execute and not all(sampler.tcp_transform_verified.values()):
                 raise RuntimeError("Physical replay requires verified active TCPs")
             self.digest = sampler.calibration_digest
-            manual = ManualVoxelFilter(args.manual_selection)
+            if args.manual_annotations:
+                manual = ManualAnnotationFilter(args.manual_annotations, path)
+            else:
+                # Existing command lines may pass annotations.json through the old option.
+                saved_path = Path(args.manual_selection)
+                saved = json.loads(saved_path.read_text(encoding="utf-8")) if saved_path.is_file() else {}
+                manual = (ManualAnnotationFilter(saved_path, path)
+                          if "annotations" in saved or "boxes" in saved else ManualVoxelFilter(saved_path))
             if args.obstacle_source == "auto" and args.obstacle_url is None:
                 provider = ReplayVoxbloxSource(path, manual, startup_timeout_s=args.voxblox_startup_timeout,
                                               robot_mask=args.robot_mask)
@@ -115,6 +123,7 @@ class ReplayExecutor:
         self.acceleration = args.acceleration*self.period**2 if args.acceleration else np.inf
         self.report.update(status="ready", total_actions=self.total, period_s=self.period,
                            manual_selection=None if manual is None else str(manual.path), recorded_initial_state=initial.tolist(),
+                           manual_annotations=(str(manual.path) if isinstance(manual, ManualAnnotationFilter) else None),
                            initial_qpos=self.q.tolist(), restore_policy="recorded_initial_state",
                            restore_controller="interpolation", restore_collision_checks=False,
                            obstacle_source="disabled" if self.baseline else "embedded_voxblox" if provider else "external")
@@ -286,8 +295,12 @@ def parser():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8877)
     p.add_argument("--project-config", type=Path, default=DEFAULT_PROJECT_CONFIG)
-    p.add_argument("--manual-selection", type=Path,
-                   help="With a selection: ellipsoid avoidance; omitted: baseline without perception or optimization")
+    manual = p.add_mutually_exclusive_group()
+    manual.add_argument("--manual-annotations", "--annotations", type=Path,
+                        help="annotations.json: filter live voxels by matching front/side RGB boxes; "
+                             "without annotations or selection: baseline without perception or optimization")
+    manual.add_argument("--manual-selection", type=Path,
+                        help="Compatibility: selection.json for saved cell scope, or annotations.json for RGB box filtering")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--execute", action="store_true")
     p.add_argument("--execute-ack", default="")
@@ -314,6 +327,11 @@ def parser():
 
 
 def run(args):
+    with replay_shutdown() as begin_cleanup:
+        return _run(args, begin_cleanup)
+
+
+def _run(args, begin_cleanup):
     if args.execute and args.execute_ack != EXECUTE_ACK:
         raise ValueError(f"Physical execution requires --execute-ack {EXECUTE_ACK}")
     for name in ("speed", "acceleration", "arrival_tolerance", "final_tolerance",
@@ -331,8 +349,11 @@ def run(args):
             connection = cleanup.enter_context(socket.create_connection((args.host, args.port), timeout=args.socket_timeout))
             connection.settimeout(args.socket_timeout)
             executor = ReplayExecutor(args, cleanup, connection)
-            result = receive_session(connection, executor.execute_chunk, start_session=executor.start)
-            executor.report.update(result, status="completed")
+            try:
+                result = receive_session(connection, executor.execute_chunk, start_session=executor.start)
+                executor.report.update(result, status="completed")
+            finally:
+                begin_cleanup()
     except BaseException as exc:
         if executor is not None:
             executor.report.update(completed=False, status="error", error=f"{type(exc).__name__}: {exc}")

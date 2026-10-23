@@ -29,7 +29,7 @@ from obstacle_validation.gripper_output import RobotiqTargetWriter, DualGripperC
 from obstacle_validation.quest3_schema import NAMES, _joint_order
 from obstacle_validation.runtime import (EXECUTE_ACK, CapturedFrameObservation, DualCommander, LatestSnapshotCache,
                                          boxes_from_json, read_snapshot, snapshot_state, timed_call,
-                                         validate_obstacle_snapshot)
+                                         validate_obstacle_snapshot, replay_shutdown)
 from obstacle_validation.manual_voxel_filter import ManualVoxelFilter
 from obstacle_validation.manual_annotation_filter import ManualAnnotationFilter
 from real_scripts.dual_ur7e_surface import DualUR7eSurfacePointSampler
@@ -420,11 +420,14 @@ def _read_checked(commander, *, live, url, age, calibration_digest, snapshot_rea
 def run_replay(args) -> dict:
     # Acquisition can start before the main replay loop, including in virtual
     # mode. Release it on every initialization error as well as normal exit.
-    with ExitStack() as cleanup:
-        return _run_replay(args, cleanup)
+    with replay_shutdown() as begin_cleanup, ExitStack() as cleanup:
+        try:
+            return _run_replay(args, cleanup, begin_cleanup)
+        finally:
+            begin_cleanup()
 
 
-def _run_replay(args, cleanup) -> dict:
+def _run_replay(args, cleanup, begin_cleanup) -> dict:
     annotation_path = getattr(args, "manual_annotations", None)
     if args.mode == "avoid" and not (args.manual_selection or annotation_path):
         annotation_path = args.manual_annotations = latest_manual_annotations()
@@ -1035,6 +1038,7 @@ def _run_replay(args, cleanup) -> dict:
                 gripper_hold_on_error = f"failed: {type(hold_exc).__name__}: {hold_exc}"
         raise
     finally:
+        begin_cleanup()
         try:
             if commander:
                 commander.close()

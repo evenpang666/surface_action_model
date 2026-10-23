@@ -2,6 +2,7 @@
 
 import json
 import time
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 
 from obstacle_validation import manual_annotation_filter as module
 from obstacle_validation import lerobot_replay as replay
+from obstacle_validation import stream_replay as stream
 from real_scripts import replay_voxblox as embedded
 from real_scripts.real_robot_adapter import CameraCalibration
 from real_scripts.manual_obstacle_selection import ManualSelectionStore
@@ -258,6 +260,63 @@ def test_baseline_rejects_annotations_before_dataset_or_hardware(tmp_path):
                                        "--manual-annotations", str(tmp_path / "annotations.json"), "--output", str(tmp_path / "run")])
     with pytest.raises(ValueError, match="only used with --mode avoid"):
         replay.run_replay(args)
+
+
+@pytest.mark.parametrize("option", ["--manual-annotations", "--annotations", "--manual-selection"])
+@pytest.mark.parametrize("source", ["auto", "external"])
+def test_stream_replay_uses_rgb_annotations_without_selection(annotated, monkeypatch, option, source):
+    a = annotated
+    a.row.update(schema="dual_rgb_paired_obb_v3", visibility={"1": {"front": True, "side": True}})
+    a.path.write_text(json.dumps(a.row))
+    events = []
+    a.grid.update(timestamp_ns=time.monotonic_ns(), raw_hits=[[-.05, .05, 1.05], [.15, .05, 1.05]],
+                  free_ids=np.empty(0, np.int64))
+    original = snapshot(a.grid)
+    original.update(qpos={"left": [0.] * 6, "right": [0.] * 6},
+                    gripper_position={"left": 0., "right": 0.})
+
+    class Provider:
+        def __init__(self, config, manual, **kwargs):
+            assert isinstance(manual, module.ManualAnnotationFilter)
+            assert config == DEFAULT_PROJECT_CONFIG
+            events.append("provider")
+
+    class Scene:
+        def __init__(self, url, age, manual, **kwargs):
+            assert isinstance(manual, module.ManualAnnotationFilter)
+            assert (kwargs["provider"] is not None) == (source == "auto")
+            self.manual = manual
+
+        def read(self, **kwargs):
+            result = self.manual(original)
+            assert result["occupancy_map"]["occupied_voxels"] == 1
+            assert result["obstacle_scope"] == "manual_rgb_annotations_v1"
+            events.append("filtered")
+            return result
+
+        def start(self, value):
+            events.append("started")
+
+        def close(self):
+            events.append("closed")
+
+    monkeypatch.setattr(stream, "ReplayVoxbloxSource", Provider)
+    monkeypatch.setattr(stream, "LiveSceneReader", Scene)
+    monkeypatch.setattr(stream, "DualUR7eSurfacePointSampler",
+                        lambda **kwargs: SimpleNamespace(calibration_digest=a.shared.digest))
+    monkeypatch.setattr(stream, "EllipsoidMCBF", lambda *args, **kwargs: object())
+    args = stream.parser().parse_args([option, str(a.path), "--obstacle-source", source,
+                                      "--output", str(a.path.parent / "stream_run")])
+    with ExitStack() as cleanup:
+        executor = stream.ReplayExecutor(args, cleanup, connection=None)
+        assert not executor.baseline
+        executor.start({"initial_state": [0.] * 14, "period_s": .05, "total_actions": 1})
+        assert executor.report["manual_annotations"] == str(a.path)
+        assert executor.report["mode"] == "avoid"
+        assert executor.controller is not None
+    assert events == (["provider"] if source == "auto" else []) + ["filtered", "started", "closed"]
+    assert not (a.path.parent / "selection.json").exists()
+    assert not (a.path.parent / "occupancy_map.json").exists()
 
 
 def test_paired_v3_all_visible_labels_remain_usable_for_voxel_intersection(annotated):

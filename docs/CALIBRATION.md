@@ -11,7 +11,10 @@ python real_scripts/read_dual_active_tcp_calibration.py
 ```
 
 部署配置：`configs/ur7e_dual_quest3.yaml`。
-汇总文件：`configs/hardware/calibration/dual_arm_camera_transforms.yaml`；四份源标定在同目录。
+默认直接读取相邻项目的 `../quest3_collect/config/calibration/`：
+汇总文件为 `dual_arm_camera_transforms.yaml`，四份源标定在同目录。
+项目配置和 hardware YAML 均指向该目录；hardware YAML 中的相对路径以该 YAML 所在目录为基准。
+更新标定后需重启检测进程，才能重新加载矩阵和 SHA256。
 TCP 测量默认写入 `outputs/calibration/dual_flange_to_active_tcp.json`，
 核验后手动更新项目配置的 `robot.flange_to_active_tcp`，不会自动安装。
 
@@ -27,6 +30,14 @@ marker 52 mm、`DICT_5X5_100`；必须与实际印刷板一致。
 ```bash
 mkdir -p outputs/calibration/dual_session
 cp configs/hardware/hardware_dual_teleop.yaml outputs/calibration/dual_session/hardware.yaml
+```
+
+复制后，先将会话 `hardware.yaml` 中的 `dual_calibration` 改为
+`calibration/dual_arm_camera_transforms.yaml`，将各臂的 `front_calibration` / `side_calibration`
+改为 `calibration/left_base_to_front_camera.yaml` 等对应文件名，确保采集结果写入新会话目录。
+然后执行：
+
+```bash
 PYTHONPATH=../quest3_collect python -m quest3_robot_data.calibrate_dual_camera_charuco \
   --config outputs/calibration/dual_session/hardware.yaml \
   --squares-x 11 --squares-y 8 --square-size-m 0.070 --marker-size-m 0.052 \

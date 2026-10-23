@@ -54,4 +54,4 @@ python real_scripts/batch_obstacle_annotation.py --task-dir /path/to/task
 - 旧深度像素框 `dual_depth_obb_annotation_v1` 不能当作 RGB 标注续写，需另存数据重新标注。
 
 [训练数据导出](QUEST3_DEPTH_ALIGNMENT.md#四视角-lerobot-训练数据导出) ·
-[生成旧式 selection.json](../real_scripts/README.md#双视角人工-obb--体素验证)。
+[使用 annotations.json 回放避障](MODEL_FREE_OBSTACLE_VALIDATION.md)。
