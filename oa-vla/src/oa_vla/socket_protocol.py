@@ -16,6 +16,7 @@ MAX_MESSAGE = 32 * 1024 * 1024
 MAX_PIXELS = 4096 * 4096
 DELTA_LAYOUT = "interleaved_joint_delta_gripper_target"
 ABSOLUTE_LAYOUT = "absolute_q12_gripper2"
+LIBERO_LAYOUT = "libero_osc_pose"
 
 
 class ProtocolError(RuntimeError):

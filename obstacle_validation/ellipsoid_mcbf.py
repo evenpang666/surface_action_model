@@ -1,4 +1,7 @@
-"""Whole-body ellipsoid MCBF for goal-seeking replay, in joint coordinates.
+"""Whole-body ellipsoid MCBF for goal-seeking replay, in grouped coordinates.
+
+Default groups are the two UR arms' joint angles. An explicit robot adapter can
+provide other control coordinates (e.g. Panda normalized OSC) and derivatives.
 
 Feasible nominal steps pass through unchanged. Only distance violations
 activate the QP; its objective remains the original action. Per-arm forward
@@ -60,13 +63,19 @@ class EllipsoidMCBFConfig:
 
 class EllipsoidMCBF:
     def __init__(self, sampler, *, margin, alpha=1., inter_arm_margin, period,
-                 optimization_space="joint", config=None):
+                 optimization_space="joint", config=None, robot=None, joint_groups=(6, 6), grip_dim=2):
         if optimization_space not in ("joint", "ee"):
             raise ValueError("Unknown optimization space")
         if (not np.isfinite([margin, inter_arm_margin, period]).all()
                 or margin < 0 or inter_arm_margin < 0 or period <= 0):
             raise ValueError("Invalid clearance or control period")
-        self.robot = RobotEllipsoids(sampler)
+        self.groups = tuple(joint_groups)
+        if not self.groups or any(type(n) is not int or n < 1 for n in self.groups) or grip_dim < 1:
+            raise ValueError("Invalid control groups/gripper dimension")
+        self.dof, self.grip_dim = sum(self.groups), grip_dim
+        if optimization_space == "ee" and (self.groups != (6, 6) or robot is not None):
+            raise ValueError("EE metric is only defined for the dual UR sampler")
+        self.robot = RobotEllipsoids(sampler) if robot is None else robot
         self.sampler, self.margin, self.period = sampler, margin, period
         self.inter_arm_margin = inter_arm_margin
         self.optimization_space = optimization_space
@@ -76,7 +85,7 @@ class EllipsoidMCBF:
         self.obstacles, self.velocities = [], np.empty((0, 3))
         self.capture_time = None
         self.normals = {}
-        self.direction = np.zeros(12)
+        self.direction = np.zeros(self.dof)
         self.guide_key = None
         self.guide_at = -np.inf
         self.last_goal = None
@@ -86,14 +95,15 @@ class EllipsoidMCBF:
         self.stagnant_steps = 0
         self.penalty_scale = 1.
         self.relaxation_level = 0
-        self.metric = np.eye(12)
+        self.metric = np.eye(self.dof)
         self.virtual_reference = np.empty(0)
         self.runtime_stats = {"qp_solve_calls": 0, "stage_counts": {}, "stage_s": {}}
 
     def update_scene(self, boxes):
         if boxes is self.boxes:
             return
-        stamp = (getattr(boxes, "source_snapshot", None) or {}).get("host_timestamp_ns")
+        source = getattr(boxes, "source_snapshot", None) or {}
+        stamp = source.get("motion_timestamp_ns", source.get("host_timestamp_ns"))
         old, old_velocity, old_stamp = self.obstacles, self.velocities, self.capture_time
         signature = tuple((np.r_[b.center, b.axes.ravel(), b.half_sizes].tobytes(),
                            None if getattr(b, "ellipsoid_shape", None) is None else
@@ -196,7 +206,7 @@ class EllipsoidMCBF:
     def _guidance(self, q, grip, goal, focus, row, lower, upper):
         cfg = self.config
         g = row["gradient"]
-        projector = np.eye(12)-np.outer(g, g)/max(g @ g, 1e-18)
+        projector = np.eye(self.dof)-np.outer(g, g)/max(g @ g, 1e-18)
         now = time.monotonic()
         if (self.guide_key == row["key"] and now-self.guide_at < cfg.guidance_refresh_s
                 and np.linalg.norm(self.direction) > 1e-8):
@@ -264,7 +274,7 @@ class EllipsoidMCBF:
                 best = cost, initial/np.linalg.norm(initial)
             if attempted >= 2 and time.perf_counter()-started >= cfg.guidance_budget_s:
                 break
-        direction = np.zeros(12) if best is None else best[1]
+        direction = np.zeros(self.dof) if best is None else best[1]
         self.direction, self.guide_key, self.guide_at = direction, row["key"], now
         return direction, {"cached": False, "candidate_count": attempted,
                            "cost": None if best is None else float(best[0])}
@@ -274,10 +284,10 @@ class EllipsoidMCBF:
         cfg = self.config
         count, guide_count = len(rhs), int(guide is not None)
         controls = matrix.shape[1]
-        virtuals = controls-12
+        virtuals = controls-self.dof
         slack_count = count if relaxed else 0
         size = controls+slack_count+guide_count
-        h = self.metric+np.eye(12)*cfg.smoothness_weight
+        h = self.metric+np.eye(self.dof)*cfg.smoothness_weight
         linear = -self.metric @ reference-cfg.smoothness_weight*previous
         h += cfg.goal_progress_weight*(progress.T @ progress)
         linear -= cfg.goal_progress_weight*progress.T @ (progress @ reference)
@@ -292,10 +302,10 @@ class EllipsoidMCBF:
                 row[:, controls:controls+count] = np.eye(count)
             rows.append(row); lo.extend(rhs); hi.extend([np.inf]*count)
         if guide is not None:
-            row = np.zeros((1, size)); row[0, :12] = guide[0]; row[0, -1] = 1
+            row = np.zeros((1, size)); row[0, :self.dof] = guide[0]; row[0, -1] = 1
             rows.append(row); lo.append(guide[1]); hi.append(np.inf)
         if len(progress):
-            row = np.zeros((len(progress), size)); row[:, :12] = progress
+            row = np.zeros((len(progress), size)); row[:, :self.dof] = progress
             rows.append(row); lo.extend(np.zeros(len(progress))); hi.extend(progress_upper)
         rows.append(np.eye(size))
         direction_limit = cfg.virtual_direction_step_rad/np.sqrt(2.)
@@ -320,24 +330,24 @@ class EllipsoidMCBF:
              acceleration_step=np.inf):
         began = time.perf_counter()
         q, grip, actions = (np.asarray(x, float) for x in (q, grip, actions))
-        if (q.shape != (12,) or grip.shape != (2,) or actions.ndim != 2 or actions.shape[1] != 14
+        if (q.shape != (self.dof,) or grip.shape != (self.grip_dim,) or actions.ndim != 2 or actions.shape[1] != (self.dof+self.grip_dim)
                 or not len(actions) or not all(np.isfinite(x).all() for x in (q, grip, actions))
-                or np.any((actions[:, 12:] < 0) | (actions[:, 12:] > 1))):
-            raise ValueError("Expected finite dual-arm states and absolute 14-D actions")
-        lower, upper = np.broadcast_to(lower, (12,)), np.broadcast_to(upper, (12,))
+                or np.any((actions[:, self.dof:] < 0) | (actions[:, self.dof:] > 1))):
+            raise ValueError("Expected finite grouped controls and controls plus gripper targets")
+        lower, upper = np.broadcast_to(lower, (self.dof,)), np.broadcast_to(upper, (self.dof,))
         if (not np.isfinite(lower).all() or not np.isfinite(upper).all()
                 or np.any(lower > upper) or np.isnan(max_step) or max_step <= 0):
             raise ValueError("Invalid joint bounds or step")
         action = actions[0]
         cfg = self.config
         if (self.goal_reference is None
-                or np.max(np.abs(action[:12]-self.goal_reference)) > cfg.goal_change_tolerance_rad):
+                or np.max(np.abs(action[:self.dof]-self.goal_reference)) > cfg.goal_change_tolerance_rad):
             self.best_goal_error, self.stagnant_steps = np.inf, 0
             self.relaxation_level = 0
-            self.goal_reference, self.goal_start = action[:12].copy(), q.copy()
+            self.goal_reference, self.goal_start = action[:self.dof].copy(), q.copy()
             self.guide_key = None
             self.direction[:] = 0
-        error = float(np.linalg.norm(action[:12]-q))
+        error = float(np.linalg.norm(action[:self.dof]-q))
         if error < self.best_goal_error-.002:
             self.best_goal_error, self.stagnant_steps = error, 0
         else:
@@ -346,14 +356,14 @@ class EllipsoidMCBF:
                                                         cfg.max_relaxation_level))
         self.relaxation_level = relaxation_level
         self.penalty_scale = 10.**(-relaxation_level)
-        self.metric = np.eye(12)
+        self.metric = np.eye(self.dof)
         if self.optimization_space == "ee":
             from obstacle_validation.cartesian_chunk import CartesianChunkQP
-            tcp = CartesianChunkQP(self.sampler, action[None, :12], q, np.zeros(12), np.ones(1)).jacobian(q)
+            tcp = CartesianChunkQP(self.sampler, action[None, :self.dof], q, np.zeros(self.dof), np.ones(1)).jacobian(q)
             self.metric += tcp.T @ np.diag(np.tile([100.,100.,100.,1.,1.,1.], 2)) @ tcp
         step = min(max_step, cfg.max_control_step_rad)
-        previous = np.zeros(12) if previous_delta is None else np.asarray(previous_delta, float)
-        if previous.shape != (12,) or not np.isfinite(previous).all():
+        previous = np.zeros(self.dof) if previous_delta is None else np.asarray(previous_delta, float)
+        if previous.shape != (self.dof,) or not np.isfinite(previous).all():
             raise ValueError("Invalid previous joint increment")
         if np.isnan(acceleration_step) or acceleration_step <= 0:
             raise ValueError("Acceleration increment must be positive")
@@ -362,12 +372,14 @@ class EllipsoidMCBF:
             low, high = np.maximum(low, previous-acceleration_step), np.minimum(high, previous+acceleration_step)
         if np.any(low > high):
             raise ValueError("Measured state and rate bounds have no feasible joint step")
-        nominal = np.clip(action[:12]-q, low, high)
-        goal_error = action[:12]-q
+        nominal = np.clip(action[:self.dof]-q, low, high)
+        goal_error = action[:self.dof]-q
         # A zero target delta has no preferred detour direction. Do not invent
         # guidance for it, but leave every joint free for distance constraints.
-        guide_arms = np.max(np.abs(goal_error.reshape(2, 6)), axis=1) > cfg.goal_change_tolerance_rad
-        guidance_movable = np.repeat(guide_arms, 6)
+        offsets = np.r_[0, np.cumsum(self.groups)]
+        guide_arms = [np.max(np.abs(goal_error[a:b])) > cfg.goal_change_tolerance_rad
+                      for a, b in zip(offsets[:-1], offsets[1:])]
+        guidance_movable = np.repeat(guide_arms, self.groups)
         # Old motion must not pull a stationary/reversed target away just
         # because an unrelated distance constraint activates the QP.
         objective_previous = np.where(nominal*previous > 0,
@@ -376,19 +388,19 @@ class EllipsoidMCBF:
         # Keep the intended segment direction across feedback retries. Using
         # the changing error vector would forbid necessary lateral detours
         # around a convex obstacle, even though the path never goes backward.
-        segment = action[:12]-self.goal_start
-        for arm in range(2):
-            indices = slice(6*arm, 6*arm+6)
+        segment = action[:self.dof]-self.goal_start
+        for start, stop in zip(offsets[:-1], offsets[1:]):
+            indices = slice(start, stop)
             norm = np.linalg.norm(segment[indices])
             if norm > cfg.goal_change_tolerance_rad:
-                row = np.zeros(12); row[indices] = segment[indices]/norm
+                row = np.zeros(self.dof); row[indices] = segment[indices]/norm
                 progress.append(row)
                 progress_upper.append(max(float(row @ goal_error), 0.))
-        progress = np.asarray(progress).reshape(-1, 12)
+        progress = np.asarray(progress).reshape(-1, self.dof)
         progress_upper = np.asarray(progress_upper)
         self.update_scene(boxes)
         bodies, dc, ds = self.robot.differential(q, grip)
-        grip_bodies = self.robot.bodies(q, action[12:])
+        grip_bodies = self.robot.bodies(q, action[self.dof:])
         pairs = self._pairs(bodies, dc, ds, step, grip_bodies)
         environment = [r for r in pairs if r["environment"]]
         dynamic = any(r["distance"] < .35 and r["velocity"] > cfg.closing_speed_m_s for r in environment)
@@ -407,7 +419,7 @@ class EllipsoidMCBF:
                           +row["velocity"]*self.period-row["drift"])
         # Candidate proximity is broad phase, not permission to modify an
         # action. Test the bounded nominal step, including gripper geometry.
-        predicted = self.robot.bodies(q+nominal, action[12:]) if pairs else []
+        predicted = self.robot.bodies(q+nominal, action[self.dof:]) if pairs else []
         for row in pairs:
             other = self.obstacles[row["j"]] if row["environment"] else predicted[row["j"]]
             # Evaluate exactly the SAME virtual plane as the current CBF and
@@ -421,10 +433,10 @@ class EllipsoidMCBF:
                 row["rhs"] = max(row["rhs"], row["gradient"] @ nominal+row["margin"]-predicted_gap)
         # One VLSA sphere state per pair, with two independent tangent controls.
         # Their increments update only the separating plane, not robot joints.
-        matrix = np.zeros((len(pairs), 12+2*len(pairs)))
+        matrix = np.zeros((len(pairs), self.dof+2*len(pairs)))
         for index, row in enumerate(pairs):
-            matrix[index, :12] = row["gradient"]
-            matrix[index, 12+2*index:14+2*index] = row["geometry"].direction_gradient
+            matrix[index, :self.dof] = row["gradient"]
+            matrix[index, self.dof+2*index:self.dof+2+2*index] = row["geometry"].direction_gradient
         # The virtual plane must keep seeking a separating direction even
         # when its current h is positive. A zero nominal direction can leave
         # the plane on the wrong side after passing an obstacle and cause a
@@ -454,9 +466,9 @@ class EllipsoidMCBF:
         reference, guide, geodesic = nominal.copy(), None, None
         if blocking and not relaxation_level:
             focus = min(blocking, key=lambda r: r["distance"]-r["margin"])
-            if self.last_goal is not None and np.linalg.norm(action[:12]-self.last_goal) > .3:
+            if self.last_goal is not None and np.linalg.norm(action[:self.dof]-self.last_goal) > .3:
                 self.guide_key = None
-            direction, geodesic = self._guidance(q, grip, action[:12], focus["i"], focus, lower, upper)
+            direction, geodesic = self._guidance(q, grip, action[:self.dof], focus["i"], focus, lower, upper)
             direction = direction*guidance_movable
             norm = np.linalg.norm(direction)
             if norm > 1e-8 and np.all(progress @ direction >= -1e-8):
@@ -469,7 +481,7 @@ class EllipsoidMCBF:
                 geodesic = {**geodesic, "rejected": "opposes_goal_or_has_no_goal_direction"}
                 self.direction[:] = 0
                 self.guide_key = None
-        self.last_goal = action[:12].copy()
+        self.last_goal = action[:self.dof].copy()
         calls = self.runtime_stats["qp_solve_calls"]
         relaxed, fallback = False, None
         if not triggered:
@@ -498,21 +510,21 @@ class EllipsoidMCBF:
             def objective(x):
                 violations = np.maximum(rhs-matrix @ x, 0.)
                 weight = cfg.collision_slack_weight*self.penalty_scale
-                tracking = x[:12]-reference
+                tracking = x[:self.dof]-reference
                 forward_error = progress @ tracking
-                guide_error = max(guide[1]-guide[0] @ x[:12], 0.) if guide is not None else 0.
+                guide_error = max(guide[1]-guide[0] @ x[:self.dof], 0.) if guide is not None else 0.
                 value = (.5*tracking @ self.metric @ tracking
-                         +.5*cfg.smoothness_weight*np.sum((x[:12]-objective_previous)**2)
+                         +.5*cfg.smoothness_weight*np.sum((x[:self.dof]-objective_previous)**2)
                          +.5*cfg.goal_progress_weight*(forward_error @ forward_error)
                          +.5*weight*(violations @ violations)+.5*cfg.guidance_weight*guide_error**2
-                         +.5*cfg.virtual_direction_weight*np.sum((x[12:]-self.virtual_reference)**2))
-                gradient = np.r_[self.metric @ tracking+cfg.smoothness_weight*(x[:12]-objective_previous)
+                         +.5*cfg.virtual_direction_weight*np.sum((x[self.dof:]-self.virtual_reference)**2))
+                gradient = np.r_[self.metric @ tracking+cfg.smoothness_weight*(x[:self.dof]-objective_previous)
                                   +cfg.goal_progress_weight*progress.T @ forward_error,
-                                  cfg.virtual_direction_weight*(x[12:]-self.virtual_reference)]-weight*matrix.T @ violations
+                                  cfg.virtual_direction_weight*(x[self.dof:]-self.virtual_reference)]-weight*matrix.T @ violations
                 if guide is not None:
-                    gradient[:12] -= cfg.guidance_weight*guide_error*guide[0]
+                    gradient[:self.dof] -= cfg.guidance_weight*guide_error*guide[0]
                 return value, gradient
-            virtuals = matrix.shape[1]-12
+            virtuals = matrix.shape[1]-self.dof
             limit = cfg.virtual_direction_step_rad/np.sqrt(2.)
             control_low, control_high = np.r_[low, np.full(virtuals, -limit)], np.r_[high, np.full(virtuals, limit)]
             augmented_progress = np.pad(progress, ((0, 0), (0, virtuals)))
@@ -520,12 +532,12 @@ class EllipsoidMCBF:
                               bounds=list(zip(control_low, control_high)),
                               constraints=[LinearConstraint(augmented_progress, 0., progress_upper)] if len(progress) else (),
                               options={"maxiter": 100, "ftol": 1e-10})
-            if (not np.isfinite(result.x).all() or np.any(progress @ result.x[:12] < -1e-8)
-                    or np.any(progress @ result.x[:12] > progress_upper+1e-8)):
+            if (not np.isfinite(result.x).all() or np.any(progress @ result.x[:self.dof] < -1e-8)
+                    or np.any(progress @ result.x[:self.dof] > progress_upper+1e-8)):
                 raise RuntimeError("Ellipsoid optimization cannot preserve forward goal progress")
             delta, fallback = result.x, "bounded_penalty_optimizer"
         controls = delta.copy()
-        delta = controls[:12].copy()
+        delta = controls[:self.dof].copy()
         delta = np.clip(delta, low, high)
         # OSQP's feasibility tolerance also applies to hard progress rows.
         # Repair only numerical residuals; a materially backward solution
@@ -539,13 +551,13 @@ class EllipsoidMCBF:
                 delta += row*correction
         if np.any(delta < low-1e-8) or np.any(delta > high+1e-8):
             raise RuntimeError("Forward progress conflicts with joint/rate bounds")
-        controls[:12] = delta
+        controls[:self.dof] = delta
         violations = np.maximum(rhs-matrix @ controls, 0.)
         maximum_slack = float(violations.max(initial=0.))
-        post_bodies = self.robot.bodies(q+delta, action[12:]) if triggered else predicted
+        post_bodies = self.robot.bodies(q+delta, action[self.dof:]) if triggered else predicted
         for index, row in enumerate(pairs):
             geometry = row["geometry"]
-            direction_delta = controls[12+2*index:14+2*index]
+            direction_delta = controls[self.dof+2*index:self.dof+2+2*index]
             normal = geometry.normal+geometry.tangent_basis @ direction_delta
             normal /= np.linalg.norm(normal)
             self.normals[row["key"]] = normal
@@ -584,21 +596,21 @@ class EllipsoidMCBF:
                          "predicted_distance_m": r["predicted_distance"], "margin_m": r["margin"]}
                          for r in violated],
                      "barrier_model": "vlsa_relative_centers_support_plane",
-                     "virtual_direction_variables": matrix.shape[1]-12,
-                     "virtual_direction_delta": controls[12:].tolist(),
+                     "virtual_direction_variables": matrix.shape[1]-self.dof,
+                     "virtual_direction_delta": controls[self.dof:].tolist(),
                      "adaptive_stage": stage, "geodesic": geodesic,
                      "detour_direction": self.direction.tolist(), "avoidance_bypassed": False,
                      "constraint_pairs": len(pairs), "robot_ellipsoids": len(bodies),
                      "obstacle_ellipsoids": len(self.obstacles), "gripper_variables": 0,
                      "minimum_predicted_barrier_after_m": min((r["predicted_barrier_after"] for r in pairs), default=float("inf")),
                      "post_optimization_checks": True, "sweep_validation_enabled": False}
-        waypoint = np.r_[q+delta, action[12:]]
+        waypoint = np.r_[q+delta, action[self.dof:]]
         info = {"success": True, "controller": "ellipsoid_mcbf", "mode": "ellipsoid_mcbf_feedback",
-                "horizon": 1, "optimization_space": self.optimization_space, "joint_variables": 12, "ee_variables": 0,
+                "horizon": 1, "optimization_space": self.optimization_space, "joint_variables": self.dof, "ee_variables": 0,
                 "gripper_variables": 0, "waypoints": [waypoint.tolist()],
                 "same_arm_avoidance": False,
                 "barrier_model": "vlsa_relative_centers_support_plane",
-                "virtual_direction_variables": matrix.shape[1]-12,
+                "virtual_direction_variables": matrix.shape[1]-self.dof,
                 "steps": [step_info], "waypoint_steps": [step_info], "waypoint_action_indices": [0],
                 "triggered_action_indices": [0] if triggered else [],
                 "modified_action_indices": [0] if np.max(np.abs(delta-nominal)) > 1e-8 else [],

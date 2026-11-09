@@ -1,6 +1,7 @@
 """Dataset discovery, normalization and distributed helpers local to OA-VLA."""
 
 import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +29,10 @@ def resolve_shards(paths):
 
 def normalization_stats(paths):
     states, actions, contract, periods = [], [], None, []
-    layouts, sources = [], []
+    layouts, sources, profiles = [], [], []
     for path in paths:
         with open_shard(path) as data:
+            profiles.append(json.loads(str(data["runtime_profile_json"].item())) if "runtime_profile_json" in data else None)
             qpos = np.asarray(data["qpos"], np.float32)
             frames = np.asarray(data["sample_frame_indices"], np.int64)
             chunks = np.asarray(data["action_chunks"], np.float32)
@@ -82,6 +84,18 @@ def normalization_stats(paths):
                 "qpos_mean": states.mean(0).tolist(), "qpos_std": states.std(0).clip(1e-6).tolist(),
                 "action_mean": actions.mean(0).tolist(), "action_std": actions.std(0).clip(1e-6).tolist(),
                 "action_period_s": float(np.median(periods)) if periods else None}
+    if any(profile is not None for profile in profiles):
+        if any(profile != profiles[0] for profile in profiles):
+            raise ValueError("Dataset shards must share an explicit runtime profile")
+        profile = profiles[0]
+        if (profile.get("action_semantics") != "libero_osc_pose" or contract[1:] != (7, 8)
+                or profile.get("state_semantics") != "libero_eef_axis_angle_gripper"
+                or profile.get("image_convention") != "opencv_top_left"
+                or set(profile.get("camera_names", {})) != {"front", "side", "right_wrist", "left_wrist"}
+                or len(set(profile["camera_names"].values())) != 4
+                or not periods or not np.isclose(np.median(periods), .05)):
+            raise ValueError("Invalid Panda/LIBERO runtime profile")
+        metadata.update(profile)
     return metadata, contract
 
 

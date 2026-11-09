@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 
-from .socket_protocol import (PROTOCOL, VIEWS, DELTA_LAYOUT, ABSOLUTE_LAYOUT, ProtocolError,
+from .socket_protocol import (PROTOCOL, VIEWS, DELTA_LAYOUT, ABSOLUTE_LAYOUT, LIBERO_LAYOUT, ProtocolError,
                               send_message, receive_message, decode_rgb, validate_context)
 
 
@@ -22,6 +22,8 @@ def policy_metadata(policy, *, action_semantics=None, action_source=None, action
                     detection_box_format="cxcywh_angle_deg_original_pixels", pair_id_scope="current_prediction",
                     state_dim=config.state_dim, action_dim=config.logical_action_dim, action_horizon=config.action_horizon,
                     detection_trained=bool(saved.get("detection_trained", False)))
+    for key in ("state_semantics", "camera_names", "image_convention"):
+        metadata[key] = saved.get(key)
     for name, explicit in (("action_semantics", action_semantics), ("action_source", action_source),
                            ("action_period_s", action_period)):
         recorded = saved.get(name)
@@ -113,7 +115,7 @@ def main(argv=None):
     parser.add_argument("--visibility-threshold", type=float, default=.5)
     parser.add_argument("--tokenizer-model", type=Path)
     parser.add_argument("--timeout", type=float, default=30.)
-    parser.add_argument("--action-semantics", choices=(DELTA_LAYOUT, ABSOLUTE_LAYOUT), help="Explicit contract for exports lacking action metadata")
+    parser.add_argument("--action-semantics", choices=(DELTA_LAYOUT, ABSOLUTE_LAYOUT, LIBERO_LAYOUT), help="Explicit contract for exports lacking action metadata")
     parser.add_argument("--action-source", choices=("commanded", "executed"))
     parser.add_argument("--action-period", type=float)
     args = parser.parse_args(argv)

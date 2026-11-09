@@ -80,7 +80,7 @@ def main(argv=None):
         if args.config and OAVLAConfig.load(args.config) != config:
             raise ValueError("Resume model configuration differs from --config")
         previous = json.loads((args.resume / "metadata.json").read_text())
-        for key in ("action_semantics", "action_source", "action_layout"):
+        for key in ("action_semantics", "action_source", "action_layout", "state_semantics", "camera_names", "image_convention"):
             if previous.get(key) is not None and stats.get(key) is not None and previous[key] != stats[key]:
                 raise ValueError(f"Resume {key} differs from dataset")
             if stats.get(key) is None:

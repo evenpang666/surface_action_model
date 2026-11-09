@@ -130,6 +130,11 @@ python scripts/run_oa_vla_avoidance.py --host 127.0.0.1 --port 8000 \
 
 ## 代码与文档入口
 
+LIBERO-Safety 的单臂仿真实验见 [本地模型推理与安全层接入](docs/LIBERO_SAFETY_LOCAL.md)；
+官方数据下载、动作单位转换、上传、原生 LeRobot π₀.₅ Slurm 训练及当前 OA-VLA 联合训练见
+[集群训练指南](docs/LIBERO_SAFETY_CLUSTER_TRAINING.md)。Panda profile 与双 UR7e profile 使用相同模型/协议实现，
+状态和动作契约分别校验，现有双臂权重不能直接截断为单臂策略。
+
 | 入口 | 用途 |
 | --- | --- |
 | [oa-vla/](oa-vla/README.md) | 可独立安装的模型、标注、训练、权重迁移和推理 API |

@@ -1,0 +1,18 @@
+# Simulator/client environment only. Install the benchmark's robosuite fork separately.
+numpy>=1.26,<2
+scipy>=1.11,<1.15
+mujoco==3.8.1
+numba>=0.59
+torch>=2.7,<3
+Pillow>=10
+opencv-python>=4.8,<4.12
+PyYAML>=6
+msgpack>=1,<2
+bddl==1.0.1
+gym==0.25.2
+matplotlib>=3.7
+cloudpickle>=2.1
+easydict>=1.9
+wand
+scikit-image
+imageio[ffmpeg]
