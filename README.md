@@ -13,7 +13,7 @@
 
 项目展示名称统一为 **oavla**；现有目录、安装包和命令沿用 `oa-vla`，Python 导入名为 `oa_vla`。下列命令除特别说明外，均在仓库根目录执行。
 
-LIBERO-Safety 实验入口：[双卡离线训练](#libero-safety双卡离线训练lerobot-060) ·
+LIBERO-Safety 实验入口：[双卡离线训练](#libero-safety双卡离线训练lerobot) ·
 [部署与独立测试](#libero-safetysocket-部署独立测试与论文指标)。
 
 ## 快速开始：本机 socket 测试
@@ -88,41 +88,50 @@ oa-vla-train --dataset /data/rgb_action --output /models/oavla \
 训练导出包含 `config.json`、`model.safetensors`、`metadata.json`、`processor.json` 和 tokenizer，
 同时保存归一化参数、检测训练状态、动作布局、来源与周期。旧版权重需先按 [迁移说明](oa-vla/README.md#转换之前的模型) 转换，再训练新增模块。
 
-## LIBERO-Safety：双卡离线训练（LeRobot 0.6.0）
+## LIBERO-Safety：双卡离线训练（LeRobot）
 
-以下三份命令分别训练 **π0.5、GR00T N1.7、LingBot-VA**。在集群已分配的**单节点两张 GPU**
-上执行，每次运行一种模型；每卡 batch size 为 1，共训练 10,000 个优化步，每 2,000 步保存。
-这是 DDP，每卡保留一份模型，不会把两卡显存合成一份。π0.5 使用全量微调，GR00T 冻结视觉/语言
-骨干、训练 projector/action head，LingBot-VA 使用 LoRA；相同步数不代表相同可训练参数量或计算量。
-显存不足时需要另行调整微调范围或使用分片方案。
+目标模型为 **π0.5、GR00T N1.7、LingBot-VLA 2.0**，统一要求使用 LeRobot 训练框架。
+下方三份命令均运行 LeRobot 的 `lerobot-train`，在集群分配的**单节点两张 GPU**上执行，
+每次运行一种模型；每卡 batch size 为 1，共训练 10,000 个优化步，每 2,000 步保存。
+π0.5、GR00T 保留原有 LeRobot 0.6.0 命令；LingBot-VLA 2.0 使用已内置该模型的官方源码版本，
+不能直接放进 0.6.0/0.6.1 的发布包环境中运行。
 
-本节按 [LeRobot v0.6.0 训练配置](https://github.com/huggingface/lerobot/blob/v0.6.0/src/lerobot/configs/train.py)
-编写，关闭仿真评测的参数为 `--env_eval_freq=0`。
+π0.5 使用全量微调，GR00T 冻结视觉/语言骨干、训练 projector/action head，二者使用 DDP，
+每卡保留一份模型。LingBot-VLA 2.0 使用全量微调及双卡 FSDP2 分片，并保持 FP32 参数、BF16 计算。
+相同步数不代表相同可训练参数量或计算量；仅知道双卡不能保证显存足够。
+
+前两份命令按 [LeRobot v0.6.0 训练配置](https://github.com/huggingface/lerobot/blob/v0.6.0/src/lerobot/configs/train.py)
+编写。第三份命令及安装方式单独标注源码提交；不要混用新旧版本的分布式和日志参数。
+关闭仿真评测均使用 `--env_eval_freq=0`。
 旧 [集群指南](docs/LIBERO_SAFETY_CLUSTER_TRAINING.md) 和 `scripts/cluster/train_libero_safety_pi05.slurm`
 中的 v0.4.4 / 四卡设置属于旧版流程，0.6.0 双卡训练以本节为准。
 
 ### 环境、离线资产与路径
 
-训练使用单独的 Python 3.12+ 环境，LeRobot 固定为 `0.6.0`，与下节 NumPy<2 的仿真环境分开。
-已有环境应确认安装了对应 extra：π0.5 为 `training,pi`，GR00T 为 `training,groot`，
-LingBot-VA 为 `training,lingbot_va,peft`。例如，在已备齐依赖 wheel 的离线节点安装 LingBot-VA：
+训练使用单独的 Python 3.12+ 环境，与下节 NumPy<2 的仿真环境分开。
+π0.5、GR00T 的以下命令固定 LeRobot `0.6.0`；LingBot-VLA 2.0 的独立环境按其小节安装。
+已有环境应确认安装了对应 extra：π0.5 为 `training,pi`，GR00T 为 `training,groot`。
+例如，在已备齐依赖 wheel 的离线节点安装 π0.5 训练环境：
 
 ```bash
 python -m pip install --no-index --find-links=/data/wheelhouse \
-  'lerobot[training,lingbot_va,peft]==0.6.0'
+  'lerobot[training,pi]==0.6.0'
 python -c 'from importlib.metadata import version; assert version("lerobot") == "0.6.0"; print(version("lerobot"))'
 ```
 
-`/data/wheelhouse` 替换为本地依赖目录；另外两种模型在各自环境中替换 extra。
-以下路径沿用已有集群目录。GR00T、LingBot-VA 和缓存目录是约定示例，执行前改成实际本地位置。
+`/data/wheelhouse` 替换为本地依赖目录；GR00T 在自己的环境中替换 extra。
+新版源码中 LingBot-VLA 2.0 的 extra 是 `lingbot_vla_v2`，不能用 `lingbot_va` 代替。
+以下路径沿用已有集群目录。GR00T、LingBot-VLA 2.0 和缓存目录是约定示例，执行前改成实际本地位置。
 
 ```bash
 export RAW_DATASET_ROOT=/seu_nvme/home/dishimin/230259982/MyDatasets/libero_safety_raw
 export DATASET_ROOT=/seu_nvme/home/dishimin/230259982/MyDatasets/libero_safety
 export PI05_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/pi05_base
 export GROOT_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/GR00T-N1.7-3B
-export LINGBOT_VA_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/lingbot_va_base
-export WAN_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/lingbot-va-base
+export LINGBOT_VLA2_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/lingbot_vla_v2_base
+export QWEN3_MODEL_DIR=/seu_nvme/home/dishimin/230259982/MyModels/Qwen3-VL-4B-Instruct
+export LINGBOT_TEACHER_DIR=/seu_nvme/home/dishimin/230259982/MyModels/lingbot-vla-v2-6b
+export MOGE2_FILE=/seu_nvme/home/dishimin/230259982/MyModels/moge-2-vitb-normal/model.pt
 export OUTPUT_BASE=/seu_nvme/home/dishimin/230259982/outputs
 
 # 必须指向已预先拷入完整模型/分词器缓存的位置，不要切到空缓存。
@@ -141,11 +150,12 @@ export LIBERO_OUTPUT_FEATURES='{"action":{"type":"ACTION","shape":[7]}}'
 | --- | --- |
 | π0.5 | `PI05_MODEL_DIR` 是带 `type=pi05` 的 LeRobot checkpoint；还需缓存 `google/paligemma-3b-pt-224` 的 tokenizer |
 | GR00T | `GROOT_MODEL_DIR` 是完整 NVIDIA `GR00T-N1.7-3B` 快照，保留权重、`config.json`、`processor_config.json`、`statistics.json` 等；还需在 `HF_HOME` 中缓存 `nvidia/Cosmos-Reason2-2B` 的 processor/tokenizer。N1.5 不适用本命令 |
-| LingBot-VA | `LINGBOT_VA_MODEL_DIR` 是 `lerobot/lingbot_va_base` 的完整 LeRobot 格式快照；`WAN_MODEL_DIR` 是配套 Wan 资产目录，包含 `vae/`、`text_encoder/`、`tokenizer/`，仅 DiT 权重不够 |
+| LingBot-VLA 2.0 | `LINGBOT_VLA2_MODEL_DIR` 是完整 `lerobot/lingbot_vla_v2_base` 快照，配置中 `type=lingbot_vla_v2`；Qwen3-VL-4B-Instruct 提供本地 config/processor/tokenizer。保留基础 checkpoint 的蒸馏训练还需要 MoGe-2、LingBot-Depth 和 DINO-Video teacher/config，路径在下方显式设置；不使用 Wan 组件 |
 
 若使用 Slurm，将公共环境变量和下方**一种**训练命令放进作业脚本；资源头可使用
 `#SBATCH --nodes=1`、`#SBATCH --ntasks=1`、`#SBATCH --gres=gpu:2`，分区、CPU、内存和时间按集群修改。
-激活训练环境后直接运行一次 `accelerate launch`；不要启动两份相同 launcher。
+π0.5、GR00T 激活各自环境后运行一次 `accelerate launch`；LingBot-VLA 2.0 在其环境运行一次
+`torchrun`，后者同样启动 LeRobot 训练脚本。不要启动两份相同 launcher。
 保留调度器设置的 `CUDA_VISIBLE_DEVICES`。
 
 ### 数据准备：从 raw 派生 v3 数据
@@ -222,56 +232,103 @@ accelerate launch --multi_gpu --num_processes=2 --num_machines=1 \
   --output_dir="$OUTPUT_DIR" --job_name=gr00t_libero_safety_10k
 ```
 
-### LingBot-VA 训练命令
+### LingBot-VLA 2.0 训练命令（官方 LeRobot 源码集成）
 
-使用视频与动作联合训练的 **LingBot-VA**，LeRobot policy 名为 `lingbot_va`。
-训练必须用 `attn_mode=flex`；推理才使用 `torch`。下面从无 adapter 的基础 checkpoint 创建新 LoRA，
-通过顶层 `--peft.*` 设置；`--policy.use_peft=true` 表示加载已有 adapter，不能单独用于创建新 adapter。
-LoRA 作用于 attention 的 q/k/v/out 投影。参见
-[LingBot-VA 0.6.0 接口](https://github.com/huggingface/lerobot/blob/v0.6.0/docs/source/lingbot_va.mdx)
-及 [PEFT 配置](https://github.com/huggingface/lerobot/blob/v0.6.0/src/lerobot/configs/default.py)。
+[LeRobot 官方文档](https://huggingface.co/docs/lerobot/lingbot_vla_v2) 已提供原生
+`lingbot_vla_v2` policy、processors 和训练支持，无需本仓库另写模型适配层。
+**v0.6.0/0.6.1 正式发布标签未包含它，但当前源码已包含**；不能仅凭安装包显示的版本判断某个
+源码 checkout 是否具有该功能。本节固定已核对的官方提交
+[`81b8c5bfdd5591ec59e512cfc7ac6db8151c70ee`](https://github.com/huggingface/lerobot/tree/81b8c5bfdd5591ec59e512cfc7ac6db8151c70ee)
+（该提交的包版本为 0.7.1），避免将浮动 main 的参数误用于旧发布包。
+
+在联网准备机取好该提交的完整源码、匹配的依赖 wheel、`lerobot/lingbot_vla_v2_base`、Qwen3-VL
+及教师资产，拷入集群。激活新的 Python 3.12+ 训练环境，在离线节点安装：
 
 ```bash
-export MODEL_DIR="$LINGBOT_VA_MODEL_DIR"
-export OUTPUT_DIR="$OUTPUT_BASE/lingbot_va_libero_safety_10k"
+export LEROBOT_VLA2_SOURCE=/seu_nvme/home/dishimin/230259982/MyCode/lerobot_lingbot_vla_v2
+test "$(git -C "$LEROBOT_VLA2_SOURCE" rev-parse HEAD)" = 81b8c5bfdd5591ec59e512cfc7ac6db8151c70ee
+python -m pip install --no-index --find-links=/data/wheelhouse \
+  -e "${LEROBOT_VLA2_SOURCE}[training,lingbot_vla_v2]"
+python -c 'from lerobot.policies.lingbot_vla_v2.configuration_lingbot_vla_v2 import LingbotVLAV2Config; print(LingbotVLAV2Config.__name__)'
+```
 
-accelerate launch --multi_gpu --num_processes=2 --num_machines=1 \
-  --mixed_precision=bf16 --dynamo_backend=no "$(command -v lerobot-train)" \
+这里使用 LeRobot 已移植的实现，不安装 Robbyant 独立训练仓库的 requirements。
+官方集成默认采用 SDPA，无需沿用旧 LingBot-VA 的 `attn_mode=flex` 或 Wan 组件。
+本节保留 base checkpoint 的 dual-query 蒸馏配置，以下代码只改教师文件位置，保留其余结构与损失权重。
+`LINGBOT_TEACHER_DIR` 中应含 `depth/model.pt`、`dino_video/teacher_step_10000.pth`、
+`dino_video/config.yaml`；`MOGE2_FILE` 指向另行准备的 MoGe-2 权重。
+
+```bash
+export LINGBOT_ALIGN_PARAMS="$(python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+model_dir = Path(os.environ["LINGBOT_VLA2_MODEL_DIR"])
+config = json.loads((model_dir / "config.json").read_text())
+assert config.get("type") == "lingbot_vla_v2", "需要 LeRobot 格式的 LingBot-VLA 2.0 checkpoint"
+params = config.get("align_params")
+assert isinstance(params, dict) and params, "需要带完整蒸馏配置的 base checkpoint"
+root = Path(os.environ["LINGBOT_TEACHER_DIR"])
+files = {
+    ("depth", "moge_path"): Path(os.environ["MOGE2_FILE"]),
+    ("depth", "morgbd_path"): root / "depth/model.pt",
+    ("video", "ckpt_path"): root / "dino_video/teacher_step_10000.pth",
+    ("video", "config_path"): root / "dino_video/config.yaml",
+}
+for (section, key), path in files.items():
+    assert path.is_file(), f"缺少离线教师文件：{path}"
+    params[section][key] = str(path.resolve())
+print(json.dumps(params))
+PY
+)"
+```
+
+同一规范化数据仍为 8 维状态、7 维动作。下面显式将状态前 6 维 EEF 位姿映射到 `end.position`，
+后 2 维夹爪状态映射到 `effector.position`；动作前 6 维 OSC delta 与最后 1 维夹爪分别映射到对应槽。
+其余 canonical 维度补零并掩码；槽映射只搬运数值，不改变旋转表示或动作单位。
+数据已是 OSC delta，故关闭额外 state-relative 转换。
+
+```bash
+export MODEL_DIR="$LINGBOT_VLA2_MODEL_DIR"
+export OUTPUT_DIR="$OUTPUT_BASE/lingbot_vla_v2_libero_safety_10k"
+
+torchrun --standalone --nnodes=1 --nproc_per_node=2 "$(command -v lerobot-train)" \
   --dataset.repo_id=local/libero_safety --dataset.root="$DATASET_ROOT" \
   --dataset.video_backend=pyav \
   --policy.path="$MODEL_DIR" \
   --policy.input_features="$LIBERO_INPUT_FEATURES" \
   --policy.output_features="$LIBERO_OUTPUT_FEATURES" \
-  --policy.device=cuda --policy.dtype=bfloat16 --policy.attn_mode=flex \
-  --policy.wan_pretrained_path="$WAN_MODEL_DIR" --policy.text_encoder_device=cpu \
-  --policy.obs_cam_keys='["observation.images.image","observation.images.image2"]' \
-  --policy.camera_layout=width_concat --policy.height=128 --policy.width=128 \
-  --policy.used_action_channel_ids='[0,1,2,3,4,5,6]' \
-  --policy.frame_chunk_size=4 --policy.action_per_frame=4 \
-  --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"IDENTITY","ACTION":"QUANTILES"}' \
-  --policy.use_peft=false --policy.push_to_hub=false \
-  --peft.method_type=LORA --peft.r=16 --peft.lora_alpha=32 \
-  --peft.target_modules='["to_q","to_k","to_v","to_out.0"]' \
+  --policy.tokenizer_path="$QWEN3_MODEL_DIR" \
+  --policy.state_slots='{"end.position":{"origin_keys":[{"observation.state":{"start":0,"end":6}}]},"effector.position":{"origin_keys":[{"observation.state":{"start":6,"end":8}}]}}' \
+  --policy.action_slots='{"end.position":{"origin_keys":[{"action":{"start":0,"end":6}}]},"effector.position":{"origin_keys":[{"action":{"start":6,"end":7}}]}}' \
+  --policy.align_params="$LINGBOT_ALIGN_PARAMS" \
+  --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"MEAN_STD","ACTION":"MEAN_STD"}' \
+  --policy.device=cuda --policy.dtype=float32 \
+  --policy.gradient_checkpointing=true --policy.train_expert_only=false \
+  --policy.use_relative_actions=false --policy.push_to_hub=false \
+  --policy.chunk_size=50 --policy.n_action_steps=50 \
+  --parallelism.dp_shard=2 --accelerator.mixed_precision=bf16 \
   --batch_size=1 --num_workers=4 --steps=10000 --seed=1000 \
-  --env_eval_freq=0 --save_freq=2000 --log_freq=100 --wandb.enable=false \
-  --output_dir="$OUTPUT_DIR" --job_name=lingbot_va_libero_safety_10k
+  --env_eval_freq=0 --save_freq=2000 --log_freq=100 --trackio.enable=false \
+  --output_dir="$OUTPUT_DIR" --job_name=lingbot_vla_v2_libero_safety_10k
 ```
 
-这里使用单臂 LIBERO 的 7 个动作通道，不适用于 RoboTwin 双臂 checkpoint。
-`frame_chunk_size=4`、`action_per_frame=4` 派生出 16 步动作块及每相机 16 帧训练窗口；
-`chunk_size/n_action_steps` 是派生属性，不像 π0.5 那样直接设置。
-`ACTION=QUANTILES` 让训练动作和输出反归一化使用同一组新数据统计量。
-LoRA 导出需要保留原始基础模型、Wan 资产和 `adapter_config.json` 中可解析的本地基础模型路径。
+此处 `torchrun` 启动的是 **LeRobot 训练脚本**。新源码使用 `--parallelism.*`、
+`--accelerator.*` 和 `--trackio.*`；前两份 0.6.0 命令仍使用各自版本的参数。
+FP32 权重及优化器状态需要较多显存，分片后也不能保证两张 24 GB 卡足够；若改为 expert-only
+或 LoRA，需作为不同微调设置记录。不要为省显存直接把 FP32 参数改成 BF16 参数更新。
 
-三者最终产物均在各自输出目录的 `checkpoints/last/pretrained_model/`；输出目录请使用新目录。
-上述命令已按 0.6.0 接口核对，尚未在用户集群或其真实权重、数据上完成训练验证。
+三者最终产物在各自输出目录的 `checkpoints/last/pretrained_model/`；输出目录请使用新目录。
+以上是官方接口及配置层面的核对，尚未在用户集群或其真实权重、数据上完成训练验证。
 
 ## LIBERO-Safety：socket 部署、独立测试与论文指标
 
 训练对象是上节的 VLA；VLSA、VLPSA、OA-VLA 是下节评测的方法/安全层，分别记录结果。
 当前共享 TCP 服务适配器支持 **原生 LeRobot π0.5** 和 **Panda OA-VLA**。
-GR00T、LingBot-VA 的训练命令不意味着已接入本项目的安全层 socket 评测；二者仍需策略服务适配，
-尤其 LingBot-VA 必须正确管理每个 episode 的时序缓存，不能直接套用 π0.5 的服务实现。
+GR00T、LingBot-VLA 2.0 尚未接入本项目的安全层 socket 评测，二者仍需本项目的策略服务适配。
+官方 LeRobot 已支持 LingBot-VLA 2.0 训练/推理，但本项目仍须将各自 processors、动作映射和
+episode reset 接到共享 TCP 协议，不能直接套用仅支持 π0.5 的服务实现。
 `lerobot-eval --env.type=libero` 的标准 LIBERO 测试也不能替代 LIBERO-Safety 的安全指标。
 
 ### 推理机器：启动模型服务
@@ -415,7 +472,8 @@ python scripts/run_oa_vla_avoidance.py --host 127.0.0.1 --port 8000 \
 ## 代码与文档入口
 
 LIBERO-Safety 的单臂仿真实验见 [本地模型推理与安全层接入](docs/LIBERO_SAFETY_LOCAL.md)；
-LeRobot 0.6.0 的 π0.5 / GR00T / LingBot-VA 训练见本页双卡离线训练一节。
+LeRobot 0.6.0 的 π0.5 / GR00T 训练命令，以及固定官方源码提交的 LingBot-VLA 2.0 训练命令，
+见本页双卡离线训练一节。
 官方数据下载、上传、旧版 LeRobot 0.4.4 Slurm 流程及当前 OA-VLA 联合训练见
 [集群训练指南](docs/LIBERO_SAFETY_CLUSTER_TRAINING.md)。Panda profile 与双 UR7e profile 使用相同模型/协议实现，
 状态和动作契约分别校验，现有双臂权重不能直接截断为单臂策略。
