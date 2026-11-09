@@ -1,5 +1,9 @@
 # LIBERO-Safety 本地推理
 
+VLSA / VLPSA / OA-VLA 三方法独立 socket 对照及 SR、SSR、CR、Steps 输出见
+[三方法测试](LIBERO_SAFETY_METHOD_COMPARISON.md)。该入口采用共享标签深度感知协议；
+本文下面仍描述 OA-VLA 原始配对 OBB/Voxblox 链路。
+
 本入口复用当前真机的 OA-VLA TCP 协议、`DynamicOBBFilter`、Voxblox、双框交集、透明障碍补全和
 `EllipsoidMCBF`。每次只执行动作块的第一条，推进一个 20 Hz 仿真 tick，再获取新图像。
 入口仅创建仿真环境，不加载 UR 控制或 RealSense 设备。

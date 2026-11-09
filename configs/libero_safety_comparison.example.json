@@ -1,0 +1,10 @@
+[
+  {
+    "suite": "obstacle_avoidance",
+    "level": 0,
+    "task": 0,
+    "episodes": [0, 1, 2],
+    "obstacles": ["bottle_of_perfume_1", "white_place_box_1"],
+    "grasp_objects": []
+  }
+]
